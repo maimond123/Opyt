@@ -1,0 +1,139 @@
+# pyproject.toml — packaging so OPYT installs with a MACHINE-INDEPENDENT command.
+#
+# Before this, registering the MCP meant writing `<some-venv>/python <abs>/server.py` into
+# each client's config — a path that only works on the author's machine. The console scripts
+# below (opyt-mcp / opyt-install-client / opyt-keys) give every install a stable command on
+# PATH, which is the foundation for distributing to a stranger.
+#
+# Two install modes both work:
+#   - editable-from-clone: `pip install -e . --config-settings editable_mode=compat`
+#   - self-contained artifacts: `python -m build` — bundles the Python packages below PLUS the
+#     sanitized config template (settings.example.yaml) so a stranger needs no repo checkout.
+#     config + mcp_server carry __init__.py so the flat layout ships as real packages, not
+#     editable-only namespaces.
+#     NEVER `pip wheel .` for a release: setuptools reuses a stale gitignored `build/lib/`, and
+#     on 2026-08-29 that put 7 DELETED modules into the wheel — two of them modules `.guards.py`
+#     forbids importing. `python -m build` copies to a temp dir and builds the wheel from the
+#     sdist, so `build/` cannot enter. See docs/plans/2026-08-29-pypi-alpha-release-recipe.md.
+#
+# Known v1 limitation: the flat layout installs generic top-level names (config, pipeline,
+# mcp_server) — fine in a dedicated opyt venv/uvx env, but a src-layout refactor is the proper
+# long-term fix.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opyt"
+version = "0.1.0a3"
+description = "OPYT — a local-first knowledge base served over an MCP server, installable on any MCP client."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "David Maimon" }]
+keywords = ["mcp", "knowledge-base", "claude", "rag", "local-first", "obsidian"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Topic :: Text Processing :: Indexing",
+]
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "fastmcp>=3.0.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0.1",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "browser-cookie3>=0.19.0",
+    # cryptography arrives transitively via browser-cookie3. Its macOS wheels went arm64-ONLY at
+    # 49.0.0 (universal2 stopped at 48.0.1), so on an Intel Mac anything newer has no wheel and
+    # pip falls back to a source build needing a Rust toolchain and system OpenSSL. Capping it
+    # keeps `uvx --from opyt` compiler-free on x86_64. Measured 2026-08-29.
+    "cryptography<49; platform_system == 'Darwin' and platform_machine == 'x86_64'",
+    # Floor is 0.15.0, not 0.7.0: `curl_cffi>=0.7.0` resolved to the YANKED 0.7.2 ("serious bugs")
+    # on a cold cache. 0.15.0 is the oldest version this repo has actually run.
+    "curl_cffi>=0.15.0",
+    "trafilatura>=2.0.0",
+    "html2text>=2024.2.0",
+    "feedparser>=6.0.0",
+    "beautifulsoup4>=4.12.0",
+    "yt-dlp>=2025.1.1",
+    # PDF full-text extraction (pipeline/kb/ingest_papers.py). Load-bearing, and missing here
+    # until 2026-08-07 — reachable from nothing else declared above. It is imported lazily behind
+    # a fail-safe that degrades to abstract-only, which is correct design and is exactly why its
+    # absence was invisible: a stranger's install ingested every paper abstract-only, forever,
+    # with no error. Declare anything a fail-safe hides.
+    # (pdfplumber sat beside it as a fallback until 2026-08-27. It was absent from the AUTHOR's
+    # venv too, so the fallback had never once run anywhere; when finally measured it was strictly
+    # worse than pypdf on every document. Deleted with the fallback stage.)
+    "pypdf>=4.0.0",
+    # Transitives we actually import by name, so they are ours to pin rather than inherit:
+    # htmldate via trafilatura, urllib3 via requests. Each resolves today only because an
+    # upstream happens to require it — a promise upstream made to itself.
+    "htmldate>=1.8.0",
+    "urllib3>=1.26.0",
+    # trafilatura's justext rescue path does `from lxml.html.clean import Cleaner`, and lxml 5.0
+    # moved that module into a separate distribution. Nothing here imports lxml by name, so this
+    # is a transitive nobody declared -- and it fails at IMPORT, not at use, so a clean install
+    # cannot even collect three test modules. Same rule as pypdf above: declare anything an
+    # upstream's optional path hides. Measured on a clean 3.11 venv, 2026-08-31.
+    "lxml_html_clean>=0.4.0",
+]
+
+[project.optional-dependencies]
+# The SERVER half — `service/`, the process that hosts one person's export for another to query
+# over HTTPS (docs/plans/2026-08-26-foreign-kb-service-phase3.md). Optional, and it must stay
+# optional: installing OPYT to READ a knowledge base must never pull in a web framework to serve
+# one. `service*` is also absent from the packages-find list below, so it does not enter the
+# client wheel at all — a server is deployed from a checkout with `pip install -e ".[server]"`.
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+]
+
+# The test runner. Declared because it was reachable from nothing: `scripts/setup.sh` installs
+# `-e .` and stops, so a contributor who follows the documented bootstrap could install the
+# package and then not run the suite. The author's pytest came from a global anaconda install,
+# which is exactly the kind of machine-specific dependency this repo's Distributable invariant
+# forbids. CI cannot paper over it either -- a runner has to install pytest from somewhere, and
+# it must be the same somewhere a contributor uses.
+test = [
+    "pytest>=8.0",
+    # `tests/service/` imports the FastAPI app, so the server extra's dependencies are test
+    # dependencies too. Referenced rather than re-listed: two copies of the same pins would be a
+    # second source of truth that drifts.
+    "opyt[server]",
+]
+
+[project.urls]
+Homepage = "https://github.com/maimond123/Opyt"
+Repository = "https://github.com/maimond123/Opyt"
+
+[project.scripts]
+opyt-mcp = "mcp_server.server:main"
+opyt-install-client = "opyt_core.install_client:main"
+opyt-keys = "opyt_core.keys:main"
+opyt-redeem = "opyt_core.redeem:main"
+opyt-push = "opyt_core.push:main"
+# `opyt-footer` and `opyt-cursor-hook` were REMOVED 2026-08-12. Both pointed into
+# statusline/, and both existed only to open the browser dashboard — the footer as a Claude Code
+# PostToolUse hook, the Cursor one as an afterMCPExecution hook. The dashboard is deleted, so
+# both entry points named modules that no longer exist. They had also been INERT since
+# 2026-08-07: opyt_core/frontend_map.py had no viewable row left, so every invocation exited
+# quietly. Do not re-add an entry point for a UI that is not there.
+
+[tool.setuptools.packages.find]
+# `gui*` and `statusline*` both dropped 2026-08-12. gui/ (React + the SQLite indexer) is deleted;
+# statusline/ held only the two dashboard hooks and became an empty package marker once they went.
+include = ["opyt_core*", "mcp_server*", "pipeline*", "config"]
+
+# Ship ONLY the sanitized templates (resolved at REPO_ROOT/config/...). The author's
+# real settings.yaml / taxonomy.json are gitignored + untracked, so they never reach the
+# wheel/sdist; bootstrap seeds a fresh ~/.opyt from settings.example.yaml.
+[tool.setuptools.package-data]
+config = ["*.example.yaml", "*.example.json"]

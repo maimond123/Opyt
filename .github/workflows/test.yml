@@ -1,0 +1,65 @@
+# Run the suite on a machine that is not the author's.
+#
+# WHAT THIS CHECKS THAT A LOCAL RUN CANNOT. Two things, and neither is "did the tests pass" --
+# the author already knows that before pushing.
+#
+#   1. The declared Python floor. pyproject says `requires-python = ">=3.10"` and the suite has
+#      only ever run on 3.12. The floor is a claim until a 3.10 job proves it.
+#   2. The PUBLIC tree. This file ships (it is not in .publicignore), so the same workflow runs
+#      in the stripped repo, where entire files are absent by design. That tree has broken
+#      before -- excluding .guards.py failed 6 tests there while main stayed green -- and it was
+#      caught only by extracting the tree and running pytest by hand. This does that on push.
+#
+# NOT here, deliberately: guard.py and prose_sweep.py (they run at pre-commit locally, and
+# .guards.py is excluded from the public tree, so the step would be a no-op there); macOS
+# runners (10x the metered minutes, and the whole point is the machine that is NOT the author's);
+# lint or format gates (this repo has adopted no formatter, and CI must not introduce a standard
+# the code has never been held to).
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A rapid series of pushes cancels its own stale runs instead of queueing a full matrix for
+# each. This repo is private for now, where Actions minutes are metered, and the author commits
+# in bursts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The suite is ~4 minutes. GitHub's default is SIX HOURS, so one hung job would spend a
+    # fifth of a month's free minutes before anyone noticed.
+    timeout-minutes: 20
+    strategy:
+      # Without this, a 3.10 failure cancels the 3.12 job and the log cannot answer the only
+      # question worth asking: is this version-specific, or is it broken everywhere?
+      fail-fast: false
+      matrix:
+        # The floor claim and what the author actually runs. 3.11 sits between them and carries
+        # almost no information; 3.13 waits until curl_cffi and yt-dlp are confirmed to publish
+        # wheels for it, because a missing wheel is a red X that is not this code's fault.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The same command a contributor runs. `[test]` exists so pytest is declared rather than
+      # inherited from whatever happens to be on the machine -- see the extra's comment in
+      # pyproject.toml.
+      - run: pip install -e ".[test]"
+
+      # No OPYT_HOME, no API keys, no settings.yaml. Measured 2026-08-31: the suite passes under
+      # exactly these conditions (2399 passed), and the live-LLM tests carry skipif-on-no-key, so
+      # a runner never spends money.
+      - run: pytest tests/ -q

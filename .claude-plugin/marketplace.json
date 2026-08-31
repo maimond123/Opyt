@@ -1,0 +1,11 @@
+{
+  "name": "opyt",
+  "owner": { "name": "David Maimon" },
+  "plugins": [
+    {
+      "name": "opyt",
+      "source": "./plugin",
+      "description": "OPYT — local-first knowledge base over MCP: search a corpus of writing by people you have chosen to trust."
+    }
+  ]
+}

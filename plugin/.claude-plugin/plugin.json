@@ -1,0 +1,7 @@
+{
+  "name": "opyt",
+  "version": "0.1.0",
+  "description": "OPYT — a local-first knowledge base over MCP. Grows and searches a corpus of writing by people you have chosen to trust.",
+  "author": { "name": "David Maimon" },
+  "keywords": ["mcp", "knowledge-base", "rag", "local-first", "obsidian"]
+}

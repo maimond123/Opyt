@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "Opyt": {
+      "command": "uvx",
+      "args": ["--from", "opyt==0.1.0a3", "opyt-mcp"]
+    }
+  }
+}

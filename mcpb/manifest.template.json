@@ -1,0 +1,35 @@
+{
+  "manifest_version": "0.2",
+  "name": "opyt",
+  "display_name": "Opyt",
+  "version": "__OPYT_VERSION__",
+  "description": "A local-first knowledge base over MCP. Grows and searches a corpus of writing by people you have chosen to trust.",
+  "author": {
+    "name": "David Maimon"
+  },
+  "homepage": "https://github.com/maimond123/Opyt",
+  "license": "MIT",
+  "icon": "icon.png",
+  "keywords": [
+    "mcp",
+    "knowledge-base",
+    "rag",
+    "local-first",
+    "research"
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "bin/launch.sh",
+    "mcp_config": {
+      "command": "/bin/sh",
+      "args": [
+        "${__dirname}/bin/launch.sh"
+      ]
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ]
+  }
+}
