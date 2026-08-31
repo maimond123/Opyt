@@ -25,7 +25,7 @@ you what it *says*, along with whether the stored copy is complete or a paywall 
 
 Registering this by hand meant editing `~/.claude.json` with **an absolute path to a specific
 venv** — which only works on the machine it was written on. The plugin removes that: the MCP
-server runs via **`uvx --from opyt==0.1.0a3 opyt-mcp`** (no pre-install — uvx fetches OPYT from
+server runs via **`uvx --from opyt==0.1.0a4 opyt-mcp`** (no pre-install — uvx fetches OPYT from
 PyPI into an ephemeral env).
 
 ## Install
@@ -36,10 +36,10 @@ PyPI into an ephemeral env).
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-`.mcp.json` runs `uvx --from opyt==0.1.0a3 opyt-mcp`, so `uv` fetches OPYT from PyPI into an
+`.mcp.json` runs `uvx --from opyt==0.1.0a4 opyt-mcp`, so `uv` fetches OPYT from PyPI into an
 ephemeral environment. Nothing to pre-install, no GitHub account, and no SSH key.
 
-The version is pinned because `0.1.0a3` is a pre-release. Drop the pin to a bare `opyt` when a
+The version is pinned because `0.1.0a4` is a pre-release. Drop the pin to a bare `opyt` when a
 stable release exists.
 
 First launch downloads ~96 packages, which takes roughly 40 seconds. It looks like a hang. It
@@ -86,7 +86,7 @@ through OpenRouter, so it wants that one key too; `mode="bm25"` stays keyless.
 **(Optional) Install the package** to put the `opyt-keys` credential CLI on your PATH:
 
 ```bash
-uv tool install opyt==0.1.0a3     # adds opyt-keys to your PATH (pipx works too)
+uv tool install opyt==0.1.0a4     # adds opyt-keys to your PATH (pipx works too)
 ```
 
 The MCP tools work without this — it only lights up the `opyt-keys` CLI.
@@ -109,9 +109,12 @@ Substack sessions. Measured on a cold install: seven rails fire, all seven decli
 
 ## Notes / known edges
 
-- **Installed from PyPI, pinned to a pre-release.** `opyt==0.1.0a3`, published 2026-08-30. The
-  pin is what makes the install reproducible: `uvx` resolves the exact version and caches it, so
-  a later release never changes what an existing install runs.
+- **Installed from PyPI, pinned to a pre-release.** `opyt==0.1.0a4`. The pin is what makes the
+  install reproducible: `uvx` resolves the exact version and caches it, so a later release never
+  changes what an existing install runs. The pin must be bumped in the same commit as
+  `pyproject.toml`, or it names a version PyPI does not have and the install fails outright --
+  which is exactly what happened between 2026-08-30 and 2026-08-31, when this file claimed
+  `0.1.0a4` was published and only `0.1.0a1` ever had been.
 
 - **A pre-release does not gate itself here.** pip and uv skip pre-releases only when a stable
   version also exists. While every published version is a pre-release, a bare `uvx --from opyt opyt-mcp`

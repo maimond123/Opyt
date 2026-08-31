@@ -49,21 +49,21 @@ Every bookmark, follow and subscription was you deciding whose thinking is worth
 # once per machine, if you do not already have uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-claude mcp add Opyt -- uvx --from opyt==0.1.0a3 opyt-mcp
+claude mcp add Opyt -- uvx --from opyt==0.1.0a4 opyt-mcp
 ```
 </details>
 
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Without a terminal: download [`opyt-0.1.0a3.mcpb`](https://github.com/maimond123/Opyt/releases/latest), double-click it, and review the install screen Desktop shows you. The bundle carries its own Python and every package it needs, so it wants no `uv`, makes no network call at launch, and starts in about eleven seconds. That is why it is a 198 MB download.
+Without a terminal: download [`opyt-0.1.0a4.mcpb`](https://github.com/maimond123/Opyt/releases/latest), double-click it, and review the install screen Desktop shows you. The bundle carries its own Python and every package it needs, so it wants no `uv`, makes no network call at launch, and starts in about eleven seconds. That is why it is a 198 MB download.
 
 Or from a terminal:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # absolute path: uv edited your shell profile, not this shell
-~/.local/bin/uvx --from opyt==0.1.0a3 opyt-install-client --claude-desktop
+~/.local/bin/uvx --from opyt==0.1.0a4 opyt-install-client --claude-desktop
 ```
 </details>
 
@@ -72,7 +72,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-~/.local/bin/uvx --from opyt==0.1.0a3 opyt-install-client --cursor
+~/.local/bin/uvx --from opyt==0.1.0a4 opyt-install-client --cursor
 ```
 
 This merges Opyt into `~/.cursor/mcp.json` beside whatever servers are already there, and copies the old file aside first. Running it twice changes nothing, and `--uninstall` removes the entry and leaves the rest.
@@ -83,7 +83,7 @@ This merges Opyt into `~/.cursor/mcp.json` beside whatever servers are already t
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-~/.local/bin/uvx --from opyt==0.1.0a3 opyt-install-client --windsurf
+~/.local/bin/uvx --from opyt==0.1.0a4 opyt-install-client --windsurf
 ```
 
 Merges into `~/.codeium/windsurf/mcp_config.json`, backing up the old file first.
@@ -99,7 +99,7 @@ Install `uv`, run `which uvx` to get its absolute path, and add this to whatever
   "mcpServers": {
     "Opyt": {
       "command": "/Users/you/.local/bin/uvx",
-      "args": ["--from", "opyt==0.1.0a3", "opyt-mcp"]
+      "args": ["--from", "opyt==0.1.0a4", "opyt-mcp"]
     }
   }
 }
@@ -116,7 +116,7 @@ Paste this into the client you want Opyt in:
 > Install the Opyt MCP server for this client, from useopyt.com/docs.html.
 </details>
 
-> `0.1.0a3` is a pre-release, so the version is pinned explicitly. Drop the pin once a stable release exists.
+> `0.1.0a4` is a pre-release, so the version is pinned explicitly. Drop the pin once a stable release exists.
 >
 > Opyt does not run at claude.ai. Your client starts Opyt as a process on your own machine and pipes to it, and a browser tab cannot start a process on your machine. Claude Desktop is the same account and the same models, and takes one double-click.
 

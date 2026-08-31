@@ -26,7 +26,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opyt"
-version = "0.1.0a3"
+version = "0.1.0a4"
 description = "A knowledge base built from the people you already read, served to your AI client over MCP."
 readme = "README.md"
 requires-python = ">=3.10"
