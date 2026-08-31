@@ -15,7 +15,7 @@
 
 ---
 
-**A local-first knowledge base built from the people you already read, served to your AI client over MCP.**
+**A knowledge base built from the people you already read, served to your AI client over MCP.**
 
 Every bookmark, follow and subscription was you deciding whose thinking is worth your time. Opyt pulls the full public archive of those people from X, Substack, GitHub, their own blogs and arXiv, and turns it into one SQLite file your assistant can search, read and count over. There is no new app and no chat UI. Your client calls the tools; your client's model does the reasoning, on the subscription you already pay for.
 

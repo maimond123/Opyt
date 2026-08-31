@@ -27,11 +27,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "opyt"
 version = "0.1.0a3"
-description = "OPYT — a local-first knowledge base served over an MCP server, installable on any MCP client."
+description = "A knowledge base built from the people you already read, served to your AI client over MCP."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "David Maimon" }]
-keywords = ["mcp", "knowledge-base", "claude", "rag", "local-first", "obsidian"]
+keywords = ["mcp", "knowledge-base", "claude", "rag"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",

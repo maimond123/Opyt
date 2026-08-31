@@ -3,7 +3,7 @@
   "name": "opyt",
   "display_name": "Opyt",
   "version": "__OPYT_VERSION__",
-  "description": "A local-first knowledge base over MCP. Grows and searches a corpus of writing by people you have chosen to trust.",
+  "description": "A knowledge base built from the people you already read, served to your AI client over MCP.",
   "author": {
     "name": "David Maimon"
   },
@@ -14,7 +14,6 @@
     "mcp",
     "knowledge-base",
     "rag",
-    "local-first",
     "research"
   ],
   "server": {
