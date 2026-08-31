@@ -56,7 +56,7 @@ claude mcp add Opyt -- uvx --from opyt==0.1.0a4 opyt-mcp
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Without a terminal: download [`opyt-0.1.0a4.mcpb`](https://github.com/maimond123/Opyt/releases/latest), double-click it, and review the install screen Desktop shows you. The bundle carries its own Python and every package it needs, so it wants no `uv`, makes no network call at launch, and starts in about eleven seconds. That is why it is a 198 MB download.
+Without a terminal: download [`opyt-0.1.0a4.mcpb`](https://github.com/maimond123/Opyt/releases), double-click it, and review the install screen Desktop shows you. The bundle carries its own Python and every package it needs, so it wants no `uv`, makes no network call at launch, and starts in about eleven seconds. That is why it is a 198 MB download.
 
 Or from a terminal:
 
