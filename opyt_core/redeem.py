@@ -1,16 +1,21 @@
 """
 opyt_core/redeem.py — `opyt-redeem`: a grant code in, a queryable peer out.
 
-The reader's entire setup is this one command. It exchanges the one-time code for a reader
-token at `POST /v1/redeem` and writes the peer row the `kb=` entry points read — which is why
-Phase 2 deliberately shipped no `peers` MCP tool: registering somebody's knowledge base is a
-thing a person does once with a code, not a tool a host model can call.
+The OPERATOR rail, and no longer the reader's only path. It exchanges the one-time code for a
+reader token at `POST /v1/redeem` and writes the peer row the `kb=` entry points read.
+`mcp_server/share_tools.accept` does the same thing from an assistant and is what a person
+actually reaches — R2's frictionless constraint rules out a shell on the reader's side, and
+`accept` is single-phase for the same reason a preview cannot exist here: a grant code buys one
+reader token and checking it would spend it. This command stays because a terminal is sometimes
+the only thing available.
 
-The peer name DEFAULTS TO THE OWNER'S, and that default is a contract, not a convenience:
-search notices tell the host to pass `kb='<owner>'` back to `open()` (the envelope crosses the
-service verbatim, so the name in it is the owner's), and the default is what makes that hint
-resolve on this install. `--name` still overrides it for the reader who already has a peer by
-that name.
+THE NAME IS THE READER'S TO PICK, and after R4 nothing breaks if two readers pick differently.
+It used to be a contract: the envelope crossed the service verbatim carrying the OWNER's name,
+so search notices told the host to pass `kb='<owner>'` back to `open()` and only a peer under
+exactly that string made the hint resolve. Every request now sends `as_kb`, so the service
+labels the answer with whatever THIS install calls the peer, and the name in the URL is an
+opaque routing key nobody types. `suggested_name` from the redeem response is a starting point —
+what the owner called themselves — and `--name` overrides it.
 """
 from __future__ import annotations
 
@@ -47,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("url", help="the service, e.g. https://api.useopyt.com")
     ap.add_argument("code", help="the one-time grant code the owner sent you")
     ap.add_argument("--name", help="what kb= will call this knowledge base "
-                                   "(default: the owner's name — see the module docstring)")
+                                   "(default: the name the owner registered under)")
     ap.add_argument("--label", help="a display label for search notices (default: none)")
     args = ap.parse_args(argv)
 
@@ -65,10 +70,15 @@ def main(argv: list[str] | None = None) -> int:
 
     body = r.json()
     owner, token = body["owner"], body["token"]
-    name = args.name or owner
-    peers.add(name, f"{url}/v1/kb/{owner}", args.label, token=token)
+    asked = args.name or body.get("suggested_name") or owner
+    name = peers.add(asked, f"{url}/v1/kb/{owner}", args.label, token=token)
 
     print(f"Registered '{name}' -> {url}/v1/kb/{owner}")
+    if name != asked:
+        # `add` never overwrites a row it did not recognise, because the token in it is the only
+        # copy in existence. So the reader gets a working name and is told which, rather than a
+        # prompt or a silently destroyed credential.
+        print(f"('{asked}' was already another knowledge base on this install.)")
     print(f"Search it with kb='{name}' from any MCP client on this install.")
     if body.get("notice"):
         print(body["notice"])

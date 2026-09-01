@@ -8,11 +8,13 @@ served file must be byte-identical after a full session of reads.
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
 from pipeline.kb import peers
-from service import uploads
+from service import store, uploads
+from tests.service.conftest import query_vector
 
 
 def _sha(path):
@@ -31,6 +33,24 @@ def test_a_completed_upload_is_served_immediately_and_peers_points_at_it(svc):
     r = svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"},
                         headers=svc.reader_hdr)
     assert r.status_code == 200 and r.json()["hits"]
+
+
+def test_a_stale_registry_row_is_repaired_rather_than_suffixed(svc, monkeypatch, tmp_path):
+    """On a READER's install `peers.add` auto-suffixes, because two people can both be called
+    `alex` and overwriting the first one destroys the only copy of their token. Here there is no
+    second knowledge base: `export_path` derives the location FROM the name, so a row naming a
+    different file means the exports directory moved. Suffixing that would register the new
+    export as `david-2` while `app.py`'s `open_peer('david')` kept resolving — and serving — the
+    file at the old path, silently and forever."""
+    moved = tmp_path / "moved-exports"
+    monkeypatch.setattr(uploads, "exports_dir", lambda: moved)
+
+    rx = uploads.Receiver(svc.owner)
+    rx.write(svc.export.read_bytes())
+    rx.commit()
+
+    assert peers.get(f"{svc.owner}-2") is None
+    assert peers.get(svc.owner)["location"] == str(moved / f"{svc.owner}.db")
 
 
 def test_an_upload_killed_mid_body_leaves_the_previous_export_intact(svc):
@@ -116,6 +136,68 @@ def test_the_served_file_is_byte_identical_after_a_session_of_reads(svc, emb):
                     headers=svc.reader_hdr)
 
     assert _sha(served) == before
+
+
+# ── the two limits ───────────────────────────────────────────────────────────────
+#
+# They argue from different things and answer differently, which is why they are two numbers and
+# two status codes. The cap is about LATENCY — every search scans the whole vector column on one
+# shared core, so one oversized export slows every other owner's readers, and that is real at one
+# honest publisher. The floor is a fail-safe fix: a disk that filled mid-upload short-wrote, and
+# `commit` then replaced the served file with a truncated database.
+
+def test_an_export_over_the_cap_is_refused_and_the_old_one_still_answers(svc, monkeypatch, emb):
+    """The previously served export must keep answering. `abort` touches only the temp file, so
+    the refusal costs the owner nothing they already had."""
+    monkeypatch.setattr(uploads, "MAX_EXPORT_BYTES", 1024)
+    served = _sha(uploads.export_path(svc.owner))
+
+    r = svc.client.post(f"/v1/upload/{svc.owner}", content=b"x" * 2048, headers=svc.owner_hdr)
+    assert r.status_code == 413
+    assert "slows down every other reader" in r.json()["detail"]
+
+    assert _sha(uploads.export_path(svc.owner)) == served
+    body = {"query": "agent framework", "query_vector": query_vector(emb, "agent framework")}
+    assert svc.client.post(f"/v1/kb/{svc.owner}/search", json=body,
+                           headers=svc.reader_hdr).json()["hits"]
+
+
+def test_one_byte_over_is_over(svc, monkeypatch):
+    """The comparison is on what ARRIVED, not on `Content-Length` — that header is the client's
+    claim about the body, and this service is the trust boundary."""
+    monkeypatch.setattr(uploads, "MAX_EXPORT_BYTES", 1024)
+    at = svc.client.post(f"/v1/upload/{svc.owner}", content=b"x" * 1024, headers=svc.owner_hdr)
+    assert at.status_code == 200
+
+    over = svc.client.post(f"/v1/upload/{svc.owner}", content=b"x" * 1025, headers=svc.owner_hdr)
+    assert over.status_code == 413
+
+
+def test_a_full_disk_refuses_before_writing_anything(svc, monkeypatch):
+    """507, and NOTHING is written — not even the temp file. This is the fail-safe bug the floor
+    exists for: without it the short write reaches `commit`, which `os.replace`s a truncated
+    SQLite file into place and serves it. Partial state, served."""
+    served = _sha(uploads.export_path(svc.owner))
+    monkeypatch.setattr(uploads.shutil, "disk_usage",
+                        lambda p: SimpleNamespace(total=0, used=0, free=1024))
+
+    r = svc.client.post(f"/v1/upload/{svc.owner}", content=b"x" * 16, headers=svc.owner_hdr)
+    assert r.status_code == 507
+    assert "still being served" in r.json()["detail"]
+
+    tmp = uploads.export_path(svc.owner).with_suffix(".db.uploading")
+    assert not tmp.exists()
+    assert _sha(uploads.export_path(svc.owner)) == served
+
+
+def test_a_refused_upload_does_not_move_the_accounting(svc, monkeypatch):
+    """`record_upload` runs after `commit` returns, so a refusal cannot claim bytes the service
+    is not holding. Otherwise the number an operator acts on would count uploads that failed."""
+    before = store.stored_bytes()
+    monkeypatch.setattr(uploads, "MAX_EXPORT_BYTES", 1024)
+    assert svc.client.post(f"/v1/upload/{svc.owner}", content=b"x" * 4096,
+                           headers=svc.owner_hdr).status_code == 413
+    assert store.stored_bytes() == before
 
 
 def test_an_owner_cannot_upload_to_a_name_that_is_not_theirs(svc):

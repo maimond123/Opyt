@@ -13,6 +13,13 @@ The meta is cached per process — the MCP server is plain in-process stdio, so 
 session — and a stale entry (the owner re-embedded at a new width and re-uploaded) surfaces as
 a 400 naming dimensions, which drops the cache entry and retries once with fresh meta.
 
+EVERY REQUEST CARRIES `as_kb` — the name THIS install registered the peer under (R4). The
+service routes on an opaque key in the URL path and labels the envelope with whatever this
+field says, so hit cards, the trace, aggregate's keys and the `foreign_kb` notice's *"pass
+kb='…' back to open()"* all come back naming a peer this install can actually resolve. Nothing
+downstream rewrites a string, and the routing key never has to be memorable or unique to a
+person — which is what removed the permanent name claim.
+
 Every transport failure becomes `peers.PeerUnavailable` with the cause in the message, so the
 tool layer answers a dead service the way it answers a missing file: an empty envelope and a
 sentence (P3).
@@ -54,8 +61,15 @@ def error_detail(r) -> str:
 def _call(row: dict, path: str, payload: dict | None = None, *, method: str = "post") -> dict:
     """One HTTP exchange with the service, from a peer registry row.
 
-    401 gets its own sentence: the token was revoked (a server-side row delete, effective
-    immediately), and the fix — a new grant code from the owner — is named rather than implied.
+    Two statuses get their own sentence, because both describe a state on the OWNER's side and
+    the generic "the service answered N" reads as an outage a reader should retry. 401: the token
+    was revoked (a server-side row delete, effective immediately) — which is also what an owner
+    UNPUBLISHING looks like from here, since that cuts tokens before deleting the export. 404: the
+    owner granted this token but their export has not landed on the service yet — ordinary now
+    that `share` hands back an invite immediately and pushes detached, so the link is live for the
+    minute or two the upload takes. Both name the fix rather than implying it, and neither is a
+    reason to retry the way the generic sentence reads.
+
     Everything else that is not a 2xx becomes `PeerUnavailable` with the cause in the message,
     except a 400, which stays inspectable for `search`'s stale-meta retry."""
     url = f"{row['location']}/{path}"
@@ -72,6 +86,11 @@ def _call(row: dict, path: str, payload: dict | None = None, *, method: str = "p
         raise peers.PeerUnavailable(
             "the service refused this install's token — it was revoked, or was never granted. "
             "Ask the owner for a new grant code and redeem it to restore access.")
+    if r.status_code == 404:
+        raise peers.PeerUnavailable(
+            "this knowledge base has not arrived on the service yet — its owner shared it, and "
+            "the copy usually lands within a minute or two of them doing so. Nothing is wrong "
+            "with this install; try again shortly.")
     if r.status_code == 400:
         raise _BadRequest(error_detail(r))
     if not 200 <= r.status_code < 300:
@@ -110,7 +129,8 @@ def search(row: dict, query: str, *, k: int, mode: str, **filters) -> dict:
         else _query_vector(row, query)
     if notice is not None:
         mode = "bm25"   # the arm that needs no vectors; `notice` says why the other is gone
-    payload = {"query": query, "k": k, "mode": mode, "query_vector": vector, **filters}
+    payload = {"query": query, "k": k, "mode": mode, "query_vector": vector,
+               "as_kb": row["name"], **filters}
     try:
         envelope = _call(row, "search", payload)
     except _BadRequest as e:
@@ -122,7 +142,8 @@ def search(row: dict, query: str, *, k: int, mode: str, **filters) -> dict:
         vector, notice = _query_vector(row, query)
         if notice is not None:
             mode = "bm25"
-        payload = {"query": query, "k": k, "mode": mode, "query_vector": vector, **filters}
+        payload = {"query": query, "k": k, "mode": mode, "query_vector": vector,
+                   "as_kb": row["name"], **filters}
         envelope = _call(row, "search", payload)
     if notice is not None:
         envelope.setdefault("notices", []).append(notice)
@@ -130,8 +151,8 @@ def search(row: dict, query: str, *, k: int, mode: str, **filters) -> dict:
 
 
 def open_atom(row: dict, atom_id: str) -> dict:
-    return _call(row, "open", {"atom_id": atom_id})
+    return _call(row, "open", {"atom_id": atom_id, "as_kb": row["name"]})
 
 
 def aggregate(row: dict, scope: dict | None) -> dict:
-    return _call(row, "aggregate", {"scope": scope})
+    return _call(row, "aggregate", {"scope": scope, "as_kb": row["name"]})

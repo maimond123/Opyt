@@ -19,10 +19,18 @@ namespacing client adds its own prefix (Claude Code renders `mcp__Opyt__search`)
 The contract for you (the host): search returns ROUTING, never a content claim. Before
 asserting what a source SAYS, call `open(atom_id)` and read its raw. A description/snippet is
 a signpost, not a citation.
+
+Two notices ride `search`'s envelope from here rather than from `opyt_core`, because both are
+about the SESSION or the install and `opyt_core` stays free of both: Frontier's queue push
+(session-latched, local reads only) and R2's reciprocal share-back offer (latched on disk, per
+peer, foreign reads only). They are mutually exclusive by construction — one fires on your own
+store, the other on somebody else's.
 """
 from __future__ import annotations
 
+import re
 from collections import deque
+from pathlib import Path
 
 # ── session state ────────────────────────────────────────────────────────────────
 # Session-scoped: one process per client session (server.py::main, STDIO), so module
@@ -42,6 +50,50 @@ def _reset_session() -> None:
     _FRONTIER_NOTICED = False
     _OPENED.clear()
     _RECENT.clear()
+
+
+def _offer_marker(kb_name: str) -> Path:
+    """Where the reciprocal offer for one peer is latched. Resolved at call time so it honors
+    `$OPYT_HOME`; slugified because a peer name is a string a person chose and becomes a filename
+    here. Two names that slugify alike share one latch, which costs at most a missed offer — the
+    safe direction, since R2 says once and never repeated."""
+    from opyt_core.paths import opyt_path
+    slug = re.sub(r"[^a-z0-9]+", "-", kb_name.lower()).strip("-") or "peer"
+    return opyt_path("share_offers", slug)
+
+
+def _attach_reciprocal_offer(out: dict, kb_name: str) -> None:
+    """Offer to share back, ONCE per peer, after their first read that actually returned
+    something (R2).
+
+    R2 rejected mutual-by-construction on a conversion argument: requiring someone to publish
+    before they can read excludes anyone with an empty knowledge base, which is most new
+    installs. So sharing is one-directional and the second direction is an OFFER, made at the one
+    moment it is earned — the reader has just seen that this works, on their own question.
+
+    THE LATCH IS ON DISK, not in the session. R2 says once, never repeated, and a session-scoped
+    flag re-offers on every new session, which is a nag with extra steps. One marker per peer, so
+    a second person's knowledge base gets its own first offer.
+
+    Empty hits do not count: an offer riding a search that found nothing is asking for a favour
+    on the strength of a disappointment.
+
+    Layered HERE rather than in `opyt_core/kb.py` for the same reason the session counters are —
+    `opyt_core` stays session-free and knows nothing about markers. Wrapped bare: a marker that
+    cannot be written must never break a search (fail-safe)."""
+    try:
+        marker = _offer_marker(kb_name)
+        if marker.exists():
+            return
+        out["notices"].append({
+            "code": "reciprocal_offer", "kb": kb_name,
+            "message": f"That answer came from {kb_name}'s knowledge base. If the user has one of "
+                       f"their own, ask whether they want to share it back — the `share` tool "
+                       f"returns a link they can send. Ask once; do not raise it again."})
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except Exception:
+        pass
 
 
 def _attach_frontier_notice(out: dict) -> None:
@@ -215,8 +267,11 @@ def register_atoms_tools(mcp) -> None:
                            f"atom and read its raw text before asserting what a source says."})
         # Frontier's queue is the READER's own staged artifacts. Riding it on a foreign result
         # would tell them their own backlog grew because they looked at somebody else's KB.
-        if out["trace"].get("kb", "me") == "me":
+        answered_by = out["trace"].get("kb", "me")
+        if answered_by == "me":
             _attach_frontier_notice(out)
+        elif out["hits"]:
+            _attach_reciprocal_offer(out, answered_by)
         return out
 
     @mcp.tool()

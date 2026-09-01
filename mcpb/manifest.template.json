@@ -3,7 +3,7 @@
   "name": "opyt",
   "display_name": "Opyt",
   "version": "__OPYT_VERSION__",
-  "description": "A knowledge base built from the people you already read, served to your AI client over MCP.",
+  "description": "A knowledge base that grows from your attention across the platforms you already use, served to your AI client over MCP.",
   "author": {
     "name": "David Maimon"
   },

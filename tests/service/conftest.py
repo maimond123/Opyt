@@ -62,9 +62,10 @@ def service_home(tmp_path, monkeypatch, export_file):
 def svc(service_home, export_file):
     """A service with one owner token, one uploaded export, and one redeemed reader token.
 
-    The first owner token is minted directly against `service.db` and there is deliberately no
-    endpoint that does it: an endpoint that hands out owner tokens is an endpoint that hands out
-    the right to publish, and the operator standing the service up is the only party who has it.
+    The owner token is minted directly against `service.db` rather than through
+    `POST /v1/register`, because these fixtures need a KNOWN routing key: `OWNER` is what every
+    URL in these tests is built from, and register assigns an opaque one. `test_register.py`
+    exercises the self-service path against the same app.
     """
     client = TestClient(app)
     owner_token = store.mint_token(OWNER, "owner", label=LABEL)

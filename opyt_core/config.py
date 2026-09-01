@@ -140,22 +140,37 @@ def merge_provider_routing(base: dict | None = None) -> dict:
 # 8 of the 28 exist there — this key is the only record of the other 20.
 
 
-def service_url() -> str | None:
-    """The service `opyt-push` uploads this install's export to (settings.yaml `service_url`).
+# Where an owner publishes when they have not said otherwise. A DEFAULT and not a constant:
+# `settings.yaml`'s `service_url` still wins, which is what keeps a self-hosted service and the
+# test suite possible. It exists because sharing must not begin with editing a config file — the
+# address of the one hosted service is not a decision anybody wants to make.
+DEFAULT_SERVICE_URL = "https://api.useopyt.com"
+
+
+def service_url() -> str:
+    """The service this install publishes its export to — `settings.yaml`'s `service_url`, or
+    `DEFAULT_SERVICE_URL`.
 
     CONFIG, NOT A CREDENTIAL, and the split is deliberate: the address of the host an owner
     publishes to is not secret and belongs beside the rest of their settings, while the token that
-    proves they may publish there lives in ~/.opyt/.env like every other credential. Nothing
-    reads this but `push`; a READER never sets it, because their peer row already carries the
-    full URL the grant code resolved to.
+    proves they may publish there lives in ~/.opyt/.env like every other credential.
 
-    Fail-safe: an unreadable config is a missing key, and `push` says which key is missing and
-    which file to put it in."""
+    ⚠️A READER READS THIS TOO, which is easy to miss because the name says publishes.
+    `share_tools.accept` calls it for every invite that names useopyt.com or names no host at all
+    (a bare pasted code), and only an invite pointing at a self-hosted service bypasses it. So
+    this value decides where the redeem POST goes and what URL lands in the peer row — a reader
+    who set it has repointed every ordinary invite they accept.
+
+    Fail-safe: an unreadable config is the default, never an error. Publishing is now something a
+    person asks for in chat, so there is nowhere to report "your config file is malformed" that
+    would not be worse than publishing to the address they meant anyway."""
     try:
         val = settings().get("service_url")
     except Exception:
-        return None
-    return val.strip() if isinstance(val, str) and val.strip() else None
+        return DEFAULT_SERVICE_URL
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return DEFAULT_SERVICE_URL
 
 
 def cookie_browser() -> str | None:

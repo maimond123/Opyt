@@ -6,17 +6,21 @@ base is served and where its export file sits — and a knowledge-base store tha
 bearer-token material is one backup or one accidental `build_export` away from leaking it. Two
 files, two sentences, no overlap.
 
-Four tables and nothing else:
+Five tables and nothing else:
 
   • `tokens` — a credential's HASH, never the credential. A row is what makes a request
     possible, so REVOCATION IS A ROW DELETE and takes effect on the very next request. There is
     no refresh cycle, no expiry to tune, and no window during which a revoked reader still works,
     because this service keeps state and a token is a row in it.
-  • `owner_claims` — one row per published NAME, held forever. The name is an address: it is the
-    served file (`exports/<owner>.db`) and the `kb=` every reader saved, so it maps to exactly
-    one publishing token and is never released — not even when that token is revoked, because a
-    re-claimed name would answer those readers with somebody else's atoms. Rotation repoints the
-    claim (`mint_token(..., reclaim=True)`); nothing deletes it.
+  • `owner_claims` — one row per published ROUTING KEY, held forever. The key is an address: it
+    is the served file (`exports/<owner>.db`) and the path segment every reader's peer row points
+    at, so it maps to exactly one publishing token and is never released — not even when that
+    token is revoked, because a re-claimed key would answer those readers with somebody else's
+    atoms. Rotation repoints the claim (`mint_token(..., reclaim=True)`); nothing deletes it.
+    Since R4 the key is ASSIGNED rather than chosen, so a permanent claim costs nobody anything.
+  • `owner_uploads` — one row per knowledge base: how many bytes it stores and since when.
+    Written from the FIRST upload because neither fact can be backfilled, and self-service
+    publishing (R5) removed the human who used to know both.
   • `grant_codes` — one-time exchange codes. The owner mints one and sends it however they like;
     it buys exactly one reader token and then it is dead. What crosses a chat window is therefore
     not a standing credential.
@@ -84,11 +88,17 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_owner ON tokens(owner);
 
--- A NAME IS CLAIMED FOREVER (2026-08-28). Nothing in `tokens` stops two owner tokens sharing a
--- name, and the served file is `exports/<owner>.db` — so a second 'dave' would silently replace
--- the first dave's knowledge base, and every reader's saved peer row would start answering with
--- the second dave's atoms, with no error at any layer. Releasing a name when its last token is
--- revoked reopens the same hole one step later, so the claim outlives the token.
+-- A ROUTING KEY IS CLAIMED FOREVER (2026-08-28). Nothing in `tokens` stops two owner tokens
+-- sharing a key, and the served file is `exports/<owner>.db` — so a second token for one key
+-- would silently replace that knowledge base, and every reader's saved peer row would start
+-- answering with somebody else's atoms, with no error at any layer. Releasing a key when its
+-- last token is revoked reopens the same hole one step later, so the claim outlives the token.
+--
+-- Permanent, and after R4 no longer a one-way DOOR. The key used to be the name a reader typed,
+-- so a claim locked up a memorable public string (`karpathy`) that could never be released.
+-- `register_owner` now assigns `secrets.token_hex(6)`, which nobody wants and nobody competes
+-- for, and `NameClaimed` became that function's collision signal rather than a refusal a person
+-- ever meets.
 CREATE TABLE IF NOT EXISTS owner_claims (
   owner        TEXT PRIMARY KEY,
   token_sha256 TEXT NOT NULL,     -- the one token allowed to publish under this name
@@ -99,6 +109,31 @@ CREATE TABLE IF NOT EXISTS owner_claims (
 -- owner token's name is claimed" is structural rather than operational.
 INSERT OR IGNORE INTO owner_claims (owner, token_sha256)
   SELECT owner, token_sha256 FROM tokens WHERE role = 'owner' ORDER BY created_at;
+
+-- HOW MUCH DISK EACH KNOWLEDGE BASE COSTS, and since when. A TABLE and not two columns on
+-- `owner_claims`, per the rule above: `_DDL` runs `CREATE TABLE IF NOT EXISTS` on every connect,
+-- so a column added to an existing table silently never appears.
+--
+-- Recorded from the FIRST upload because neither fact can be backfilled. `first_published_at` is
+-- gone the moment it is not written, and `bytes` after the fact is a directory listing that says
+-- nothing about who published when. Self-service publishing (R5) is what makes them necessary:
+-- under invitation David was the admission check and knew every owner personally; nothing is now,
+-- so "see who is eating the disk" has to be a query, and it is what the removal workflow reads.
+-- They are also the prerequisites for pricing, which is why they cost nothing now and cannot be
+-- recovered later.
+CREATE TABLE IF NOT EXISTS owner_uploads (
+  owner              TEXT PRIMARY KEY,
+  bytes              INTEGER NOT NULL DEFAULT 0,   -- the SERVED export's size; 0 = unpublished
+  -- R3's demand term: total reads at the moment of that upload. A WATERMARK on a monotonic
+  -- counter, which is what makes the push gate genuinely self-quieting — a read makes demand
+  -- true, the push consumes it by moving this, and it goes false again. `usage_daily` is
+  -- day-granular by construction (the timestamp is not a column, deliberately), so comparing
+  -- against a DATE instead would leave demand true for the rest of the calendar day and re-push
+  -- on every session that ingested anything.
+  reads_at_upload    INTEGER NOT NULL DEFAULT 0,
+  first_published_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_published_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 CREATE TABLE IF NOT EXISTS grant_codes (
   code_sha256 TEXT PRIMARY KEY,
@@ -216,6 +251,36 @@ def mint_token(owner: str, role: str, *, label: str | None = None,
     return token
 
 
+def register_owner(label: str | None = None) -> tuple[str, str]:
+    """A brand-new knowledge base: `(routing_key, owner_token)`. The token is returned once.
+
+    R4 is what makes this safe to expose. The routing key used to be the name a reader typed, so
+    handing one out was handing out a permanent claim on a public name — `karpathy`,
+    `anthropic` — never released, since `_claim_name` does not release. It is now an assigned
+    address that appears in a URL path and a filename and nowhere a person reads, so there is no
+    namespace to squat and no one-way door to open. `secrets.token_hex(6)` satisfies `_OWNER`
+    (lowercase hex, leading digit or letter) and can never be `"me"`, which `peers` reserves.
+
+    R5a: no rate limit, no identity, no verification. The safety this used to have came from a
+    HUMAN — an owner token meant David running `mint_token` on the box, so eighty owners cost him
+    eighty interventions — and R5 deleted that human deliberately. Every candidate replacement
+    (per-IP limits, email, OAuth) is a weaker imitation of the same gate, buying a property whose
+    absence is bounded, cheap and reversible: disk is buyable, an export is a projection its
+    owner rebuilds in ~11 s, and removal is one shell command on the box.
+
+    THE CLAIM MACHINERY IS NOT DEAD CODE — it is the collision detector this loop reads.
+    `NameClaimed` from a 48-bit key is a birthday collision, so the loop retries with a fresh
+    one; `claim_holder` still guards the upload against a second owner token for the same name.
+    Deleting either would reopen that hole for nothing."""
+    for _ in range(5):
+        key = secrets.token_hex(6)
+        try:
+            return key, mint_token(key, "owner", label=label)
+        except NameClaimed:
+            continue
+    raise NameClaimed("could not assign a free knowledge-base key")
+
+
 def claim_holder(owner: str) -> str | None:
     """The hash of the one token allowed to publish under this name — what the upload boundary
     compares against. None only for a name no owner token has ever been minted for; the seed in
@@ -227,6 +292,29 @@ def claim_holder(owner: str) -> str | None:
     finally:
         conn.close()
     return row["token_sha256"] if row is not None else None
+
+
+def owner_label(owner: str) -> str | None:
+    """The display name on this knowledge base's OWN token, or None — what `redeem` hands a new
+    reader as `suggested_name`.
+
+    R4 split the routing key from the display name, so the key in the URL is opaque and says
+    nothing a reader would want to type. This is the other half: the owner named themselves once,
+    when they registered, and every reader starts from that name rather than from `a3f9c2e1`.
+    A SUGGESTION and never a routing fact — `peers.add` may suffix it, and two owners are free to
+    pick the same one, because after R4 nothing about serving depends on it being unique.
+
+    Reads the owner token rather than `owner_claims` or the peers registry: the claim holds a
+    hash and no label, and the registry row does not exist until the first publish, which is
+    exactly the moment a reader may already be redeeming."""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT label FROM tokens WHERE owner = ? AND role = 'owner' "
+            "ORDER BY created_at LIMIT 1", (owner,)).fetchone()
+    finally:
+        conn.close()
+    return row["label"] if row is not None else None
 
 
 def resolve_token(token: str) -> dict | None:
@@ -270,6 +358,121 @@ def revoke(owner: str, token_sha256: str) -> bool:
     finally:
         conn.close()
     return n > 0
+
+
+def revoke_all_readers(owner: str) -> int:
+    """Delete every READER token for `owner`; returns how many went. The owner's OWN token stays.
+
+    ONE statement rather than a loop over `list_tokens`: a grant redeemed between the enumeration
+    and the deletes would survive the revocation, and "stop sharing" must not have a window.
+
+    The owner token is left because nothing would re-upload without a person asking it to, and
+    taking it would turn re-sharing into a re-mint — an operator step on a path that is meant to
+    be self-service. There is also no reader left to silently regain access, since this statement
+    just removed them all."""
+    conn = connect()
+    try:
+        n = conn.execute("DELETE FROM tokens WHERE owner = ? AND role = 'reader'",
+                         (owner,)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return n
+
+
+# ── what each knowledge base costs ───────────────────────────────────────────────
+
+def record_upload(owner: str, size: int) -> None:
+    """This owner now stores `size` bytes. Called AFTER the upload commits, so the number always
+    describes a file that is actually being served.
+
+    `bytes` is REPLACED, not summed: an export is a full replace, so there is one file per owner
+    and its size is the whole cost. `first_published_at` is written once and never touched again
+    — that is the un-backfillable half, and an upsert that refreshed it would erase it on the
+    second push.
+
+    `reads_at_upload` moves here, and that move is what CONSUMES R3's demand term: everything
+    read before this upload was served by it, so it is no longer a reason to publish again."""
+    conn = connect()
+    try:
+        reads = conn.execute("SELECT COALESCE(SUM(n), 0) FROM usage_daily WHERE owner = ?",
+                             (owner,)).fetchone()[0]
+        conn.execute(
+            "INSERT INTO owner_uploads (owner, bytes, reads_at_upload) VALUES (?, ?, ?) "
+            "ON CONFLICT(owner) DO UPDATE SET bytes = excluded.bytes, "
+            "reads_at_upload = excluded.reads_at_upload, "
+            "last_published_at = datetime('now')", (owner, size, reads))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_upload(owner: str) -> None:
+    """This owner stores nothing now — the unpublish half of `record_upload`.
+
+    ZEROES the bytes and KEEPS the row. Deleting it would take `first_published_at` with it,
+    which is the fact that cannot be recovered; leaving the bytes would make `stored_bytes_total`
+    a number that only ever climbs, and a disk-usage metric that never falls is not one.
+    `last_published_at` does not move: unpublishing is not publishing, and R3's push gate reads
+    that column to decide whether a first push ever happened."""
+    conn = connect()
+    try:
+        conn.execute("UPDATE owner_uploads SET bytes = 0 WHERE owner = ?", (owner,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def publish_demand(owner: str) -> dict:
+    """`{last_upload_at, reads_since_last_upload}` — everything R3's push gate needs to decide.
+
+    Both terms are required to trigger a push, and this answers the DEMAND half plus the
+    first-publish bypass. The CHANGE half is a question about the owner's own store, which this
+    service has no view of and should not.
+
+    `last_upload_at` is NULL for a knowledge base nobody has published yet. The rail treats that
+    as "publish", which is the retry net for a first push that died: without it, a failed first
+    publish is permanent, because demand can never become true against an export that does not
+    exist. An UNPUBLISHED knowledge base is not that case — `clear_upload` keeps the date, so the
+    rail sees published-and-unread and stays quiet rather than silently re-publishing something
+    its owner just stopped sharing.
+
+    Demand is `total reads − reads at the last upload`, not "reads since a date". `usage_daily`
+    is day-granular by construction — the timestamp is deliberately not a column — so a date
+    comparison counts reads that happened BEFORE the push as reasons to push again, for the rest
+    of the calendar day. That is not a bounded over-count: it fires on the ordinary pattern of one
+    reader plus several ingesting sessions in a day, which is precisely what the gate exists to
+    stop. Two monotonic counters compared exactly have no granularity at all."""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT last_published_at, reads_at_upload FROM owner_uploads WHERE owner = ?",
+            (owner,)).fetchone()
+        last = row["last_published_at"] if row is not None and row["last_published_at"] else None
+        reads = 0
+        if last is not None:
+            total = conn.execute("SELECT COALESCE(SUM(n), 0) FROM usage_daily WHERE owner = ?",
+                                 (owner,)).fetchone()[0]
+            reads = max(0, total - row["reads_at_upload"])
+    finally:
+        conn.close()
+    return {"last_upload_at": last, "reads_since_last_upload": reads}
+
+
+def stored_bytes() -> list[dict]:
+    """`{owner, bytes, owner_since, last_published_at}` per knowledge base, largest first — what
+    an operator reads to find who is eating the disk, and what R5a's after-the-fact removal
+    workflow acts on. Keyed by the ROUTING key and carrying no label: after R4 that key is an
+    opaque address, so this says what is stored and never who stored it."""
+    conn = connect()
+    try:
+        return [{"owner": r["owner"], "bytes": r["bytes"], "owner_since": r["first_published_at"],
+                 "last_published_at": r["last_published_at"]}
+                for r in conn.execute(
+                    "SELECT owner, bytes, first_published_at, last_published_at "
+                    "FROM owner_uploads ORDER BY bytes DESC, owner")]
+    finally:
+        conn.close()
 
 
 # ── grant codes ──────────────────────────────────────────────────────────────────
@@ -391,9 +594,11 @@ def stats_rollup() -> dict:
         searches, zeroes = conn.execute(
             "SELECT COALESCE(SUM(n), 0), COALESCE(SUM(zero_results), 0) FROM usage_daily "
             "WHERE tool = 'search'").fetchone()
+        stored = conn.execute("SELECT COALESCE(SUM(bytes), 0) FROM owner_uploads").fetchone()[0]
     finally:
         conn.close()
     return {
+        "stored_bytes_total": stored,
         "reads_total": total,
         "reads_30d": recent,
         "reads_by_tool": by_tool,

@@ -31,17 +31,6 @@ from pipeline.kb.ingest_common import store_atom
 from pipeline.kb.raw_store import write_snapshot
 
 
-def _forget(name: str) -> bool:
-    """Delete a peer row, reporting whether one was there. Was `peers.remove`, deleted 2026-08-28
-    for having no production caller — nothing revokes a peer through the registry."""
-    conn = schema.connect()
-    try:
-        n = conn.execute("DELETE FROM peers WHERE name = ?", (name,)).rowcount
-        conn.commit()
-    finally:
-        conn.close()
-    return n > 0
-
 # Disjoint on every axis a hit is identified by — id, author, topic and vocabulary — so no
 # assertion below can pass by accident on a store it did not mean to read.
 LOCAL_A = "x:local1"
@@ -117,8 +106,8 @@ def test_registry_round_trip(two_kbs, tmp_path):
     assert len(peers.list_peers()) == 1
     assert peers.list_peers()[0]["label"] == "Renamed"
 
-    assert _forget("peer") is True
-    assert _forget("peer") is False               # revocation is just a row delete
+    assert peers.remove("peer") is True
+    assert peers.remove("peer") is False          # revocation is just a row delete
     assert peers.list_peers() == []
 
 
@@ -152,6 +141,62 @@ def test_the_reader_token_round_trips(two_kbs):
 
 def test_get_is_none_for_a_name_nobody_registered(two_kbs):
     assert peers.get("nobody-registered-this") is None
+
+
+# ── 1a. two knowledge bases wanting one name ─────────────────────────────────────
+#
+# `peers.token` is the ONLY copy of a reader bearer token in existence — the service keeps just
+# its sha256 and hands the clear text over once, at redemption. So the blind upsert `add` used to
+# do did not merely drop a row, it destroyed an unrecoverable credential, restorable only by a
+# fresh grant code from that owner. `location` is what tells a re-registration apart from a
+# collision, and these tests pin that distinction.
+
+def test_re_registering_the_same_kb_replaces_its_token_and_label(two_kbs):
+    """The case the old upsert existed FOR, and it still works: same name, same location means
+    the same knowledge base registered again — a revoked token being replaced by a fresh grant.
+    One row, new credential."""
+    where = "https://api.example.com/v1/kb/david"
+    assert peers.add("alex", where, "Alex's KB", token="tok-abc") == "alex"
+    assert peers.add("alex", where, "Alex renamed", token="tok-def") == "alex"
+
+    assert [p["name"] for p in peers.list_peers() if p["name"].startswith("alex")] == ["alex"]
+    assert peers.get("alex")["token"] == "tok-def"
+    assert peers.get("alex")["label"] == "Alex renamed"
+
+
+def test_a_second_kb_under_a_taken_name_is_suffixed_and_the_first_is_untouched(two_kbs):
+    """Two different people both called `alex`. The first one's token must survive, because
+    nothing else holds a copy of it."""
+    peers.add("alex", "https://one.example.com/v1/kb/a1", "First Alex", token="tok-first")
+    landed = peers.add("alex", "https://two.example.com/v1/kb/a2", "Second Alex",
+                       token="tok-second")
+
+    assert landed == "alex-2"
+    assert peers.get("alex")["token"] == "tok-first"
+    assert peers.get("alex")["location"] == "https://one.example.com/v1/kb/a1"
+    assert peers.get("alex-2")["token"] == "tok-second"
+
+
+def test_the_returned_name_is_the_one_get_resolves(two_kbs):
+    """The return value is the whole reporting channel — `add` never prompts, so a caller that
+    ignored it would tell the reader to use a name that resolves to somebody else's KB."""
+    for i in range(3):
+        landed = peers.add("alex", f"https://h{i}.example.com/v1/kb/a", token=f"t{i}")
+        assert peers.get(landed)["token"] == f"t{i}"
+    assert [p["name"] for p in peers.list_peers() if p["name"].startswith("alex")] == [
+        "alex", "alex-2", "alex-3"]
+
+
+def test_re_registering_an_already_suffixed_kb_lands_back_on_its_own_row(two_kbs):
+    """The suffix rule is applied at EVERY candidate, not just the first. Otherwise a re-redeem
+    of the second Alex walks past `alex-2` and mints `alex-3`, then `alex-4` — a new row per
+    attempt, with the reader's working name silently going stale."""
+    peers.add("alex", "https://one.example.com/v1/kb/a1", token="tok-first")
+    peers.add("alex", "https://two.example.com/v1/kb/a2", token="tok-second")
+
+    assert peers.add("alex", "https://two.example.com/v1/kb/a2", token="tok-fresh") == "alex-2"
+    assert peers.get("alex-2")["token"] == "tok-fresh"
+    assert peers.get("alex-3") is None
 
 
 def test_open_peer_refuses_a_remote_row(two_kbs):

@@ -25,7 +25,7 @@ from tests.service.conftest import query_vector
 # identical local call, which is precisely what this file exists to catch.
 
 
-def _local(owner, spec, vector=None):
+def _local(owner, spec, vector=None, as_kb=None):
     """The same call a reader makes against a peer sitting on their own disk."""
     embedder = None
     if vector is not None:
@@ -34,7 +34,7 @@ def _local(owner, spec, vector=None):
             embedder = PrecomputedEmbedder(conn, vector)
         finally:
             conn.close()
-    return kb_entry.run_kb_search(**spec, kb=owner, embedder=embedder)
+    return kb_entry.run_kb_search(**spec, kb=owner, as_kb=as_kb, embedder=embedder)
 
 
 @pytest.mark.parametrize("spec", _QUERIES, ids=lambda s: json.dumps(s, sort_keys=True))
@@ -48,6 +48,40 @@ def test_the_hop_changes_nothing_about_a_search(svc, emb, spec):
                           headers=svc.reader_hdr)
     assert got.status_code == 200, got.text
     assert got.json() == _local(svc.owner, spec, vector)
+
+
+@pytest.mark.parametrize("spec", _QUERIES, ids=lambda s: json.dumps(s, sort_keys=True))
+def test_as_kb_relabels_the_envelope_and_changes_nothing_else(svc, emb, spec):
+    """R4, held to the same standard as the hop itself: `as_kb` is LABELING, so an answer sent
+    with one must equal the in-process answer computed with the same label — every hit, score,
+    notice and trace field, not just the `kb` keys. A field that quietly took a different path
+    when a label was present would be the split leaking into routing."""
+    vector = query_vector(emb, spec["query"])
+    got = svc.client.post(f"/v1/kb/{svc.owner}/search",
+                          json={**spec, "query_vector": vector, "as_kb": "leo"},
+                          headers=svc.reader_hdr)
+    assert got.status_code == 200, got.text
+    assert got.json() == _local(svc.owner, spec, vector, as_kb="leo")
+
+
+def test_the_routing_key_still_selects_the_store_a_label_never_does(svc, emb):
+    """The other half of "labeling-only": `as_kb` must not be able to reach a store. A label
+    naming a knowledge base that does not exist changes only what the answer is called."""
+    body = {"query": "agent framework", "query_vector": query_vector(emb, "agent framework"),
+            "as_kb": "a-name-nobody-published"}
+    got = svc.client.post(f"/v1/kb/{svc.owner}/search", json=body,
+                          headers=svc.reader_hdr).json()
+    assert got["hits"], "the store the URL named must still have answered"
+    assert {h["kb"] for h in got["hits"]} == {"a-name-nobody-published"}
+
+
+def test_an_absent_as_kb_falls_back_to_the_routing_key(svc, emb):
+    """A pre-R4 client sends no label. It gets today's behaviour rather than a null `kb` field,
+    which is what lets the wire protocol change land on its own."""
+    body = {"query": "agent framework", "query_vector": query_vector(emb, "agent framework")}
+    got = svc.client.post(f"/v1/kb/{svc.owner}/search", json=body,
+                          headers=svc.reader_hdr).json()
+    assert {h["kb"] for h in got["hits"]} == {svc.owner}
 
 
 def test_the_hop_changes_nothing_when_the_reader_sends_no_vector(svc):

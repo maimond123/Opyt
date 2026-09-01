@@ -2,7 +2,7 @@
 
 # Opyt
 
-**Your attention, made queryable.**
+**Your attention is the context your AI is missing.**
 
 [![License](https://img.shields.io/github/license/maimond123/Opyt)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/opyt?color=%2334D058&label=pypi)](https://pypi.org/project/opyt/)
@@ -15,7 +15,7 @@
 
 ---
 
-**A knowledge base built from the people you already read, served to your AI client over MCP.**
+**A knowledge base that grows from your attention across the platforms you already use, served to your AI client over MCP.**
 
 Every bookmark, follow and subscription was you deciding whose thinking is worth your time. Opyt pulls the full public archive of those people from X, Substack, GitHub, their own blogs and arXiv, and turns it into one SQLite file your assistant can search, read and count over. There is no new app and no chat UI. Your client calls the tools; your client's model does the reasoning, on the subscription you already pay for.
 
@@ -122,7 +122,7 @@ Paste this into the client you want Opyt in:
 
 ### 2. Say `onboard`
 
-Restart your client. Opyt appears as nine tools. Then:
+Restart your client. Opyt appears as twelve tools. Then:
 
 ```
 you › onboard
@@ -160,7 +160,7 @@ Confirm the ones you want and Opyt pulls each person's whole archive: their X po
 
 ## The tools
 
-Nine tools. Every argument, its type and default, what each call returns and what it costs are in the [full reference](https://useopyt.com/docs.html). The docstring on each tool in `mcp_server/` is the authoritative version of the same thing.
+Twelve tools. Every argument, its type and default, what each call returns and what it costs are in the [full reference](https://useopyt.com/docs.html). The docstring on each tool in `mcp_server/` is the authoritative version of the same thing.
 
 | Tool | Effect | What it does |
 |---|---|---|
@@ -171,10 +171,13 @@ Nine tools. Every argument, its type and default, what each call returns and wha
 | [`open`](#find-something) | read-only · free | The full stored text of one atom, plus its live source URL. |
 | [`aggregate`](#count-what-you-actually-read) | read-only · free | Counts across the whole store rather than a sample: by topic, author, kind, date. |
 | [`sitting`](#read-a-topic-end-to-end) | writes · spends | Reads every atom on one topic end to end, in publication order, through a lens. |
-| [`frontier`](#catch-up-on-what-arrived) | read-only · free | The ranked review queue of what your standing questions found. |
+| [`frontier`](#catch-up-on-what-arrived) | writes · free | The ranked review queue of what your standing questions found. |
 | [`hopper`](#keep-something) | two-phase · spends | Takes any URL, works out what it is, and saves it as an atom. |
+| [`share`](#share-a-knowledge-base) | two-phase · publishes | Shows you what is in your store, then hands you a link that lets someone search it. |
+| [`accept`](#share-a-knowledge-base) | single-phase · writes | Registers a knowledge base somebody shared with you, from the link they sent. |
+| [`unshare`](#share-a-knowledge-base) | two-phase · deletes | Cuts off one reader, or every reader plus the served copy. |
 
-The server owns only the last segment of each name. A client that namespaces adds its own prefix, so `search` reaches Claude Code as `mcp__Opyt__search`. All nine return a JSON object.
+The server owns only the last segment of each name. A client that namespaces adds its own prefix, so `search` reaches Claude Code as `mcp__Opyt__search`. All twelve return a JSON object.
 
 `search`, `open` and `aggregate` are the LLM-free retrieval core: they return data and your host model does the reasoning. They are also the only three that take `kb=`, which reads [a knowledge base someone shared with you](#share-a-knowledge-base).
 
@@ -360,15 +363,45 @@ claude › Two of them have. Ana read the framework and its repo in March,
          Nothing on this in yours.
 ```
 
-It only goes one way. Their store opens read-only, and what gets recorded is that you searched, never what you searched for.
+Getting there is two sentences and no terminal. On your side:
 
-An owner publishes with `opyt-push`, which is a full replace: an export is a projection of a store, not a log of changes to one, so the newest upload wins. A reader runs `opyt-redeem <url> <code>` once and sets nothing else.
+```
+you › share my knowledge base with Leo.
+
+⚙ share()
+
+claude › 2,876 atoms, mostly papers and X posts, from March 2024 to yesterday.
+         The top authors are @karpathy, @hypersoren and @swyx. Sharing sends
+         all of it, it lasts until you revoke it, and it stays current on its
+         own. Go ahead?
+
+you › yes
+
+⚙ share(confirm=True, as_name="David", for_whom="Leo")
+
+claude › Send Leo this: https://useopyt.com/invite#Kq7f...
+```
+
+On theirs:
+
+```
+you › someone sent me this: https://useopyt.com/invite#Kq7f...
+
+⚙ accept("https://useopyt.com/invite#Kq7f...")
+
+claude › Registered. Ask me anything and I can search David's reading too,
+         with kb="David".
+```
+
+Publishing is self-service: no invitation and no account. The served copy refreshes itself when somebody has read it since your last push *and* your store has changed since then, so an unchanged store never re-uploads and a knowledge base nobody reads costs nothing. `unshare(reader="Leo")` cuts off one person and leaves the copy serving; `unshare()` cuts off everyone and deletes it.
+
+Under it, a push is a full replace: an export is a projection of a store, not a log of changes to one, so the newest upload wins. `opyt-push` and `opyt-redeem <url> <code>` are the same two acts from a terminal, kept as operator rails.
 
 ---
 
 ## Design principles
 
-Three constraints hold across the whole codebase, enforced by an AST-based guard (`scripts/guard.py`) that runs in pre-commit and CI.
+Three constraints hold across the whole codebase, enforced by an AST-based guard (`scripts/guard.py`) that runs in pre-commit.
 
 - **Distributable.** Nothing may assume a specific machine. Paths are derived at runtime from `sys.executable` and `Path(__file__)`, never hardcoded.
 - **Client-agnostic.** The core and every knowledge tool run on any MCP client, not just Claude Code. Claude-Code-specific behavior is opt-in and never load-bearing.

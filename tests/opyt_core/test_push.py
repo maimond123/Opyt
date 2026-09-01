@@ -8,60 +8,17 @@ command needs is named — by name, and by where it is set — when it is absent
 from __future__ import annotations
 
 import hashlib
-import os
 import sqlite3
-from contextlib import contextmanager
 from types import SimpleNamespace
-
-import pytest
 
 from opyt_core import config, push
 from opyt_core.paths import opyt_path
 from pipeline.kb import schema
 from service import uploads
 from tests.kb.test_export import _add
+from tests.opyt_core.conftest import URL
 
-URL = "https://svc.test"
 NEW = "github:pushed/after-the-seed"
-
-
-@pytest.fixture()
-def cli(svc, tmp_path, monkeypatch, emb):
-    """push's transport pointed at the real service, with the two homes SEPARATED the way a real
-    publish has them: the OWNER's home holds the live store the export is projected from and the
-    settings file naming the service, and anything crossing the shim runs under the SERVICE's,
-    which holds `service.db`, `exports/` and the peers registry."""
-    owner_home = tmp_path / "live"          # the store `export_file` seeded
-    service_home = str(svc.home)
-    monkeypatch.setenv("OPYT_HOME", str(owner_home))
-    monkeypatch.setenv("OPYT_SERVICE_TOKEN", svc.owner_token)
-    # What an owner's settings.yaml looks like once they add the key: the shipped template, plus
-    # the one line. Written under the owner's home, which is where `config_path()` looks.
-    template = (config.REPO_ROOT / "config" / "settings.example.yaml").read_text()
-    settings = owner_home / "settings.yaml"
-    settings.write_text(f"{template}\nservice_url: {URL}\n")
-
-    @contextmanager
-    def on_service():
-        os.environ["OPYT_HOME"] = service_home
-        try:
-            yield
-        finally:
-            os.environ["OPYT_HOME"] = str(owner_home)
-
-    def _shim(verb):
-        def call(url, **kw):
-            kw.pop("timeout", None)   # meaningless in-process; TestClient deprecates it per-request
-            if "data" in kw:          # httpx names the raw body `content`; requests names it `data`
-                kw["content"] = kw.pop("data")
-            with on_service():
-                return verb(url, **kw)
-        return call
-
-    monkeypatch.setattr(push, "requests", SimpleNamespace(
-        get=_shim(svc.client.get), post=_shim(svc.client.post)))
-    return SimpleNamespace(svc=svc, on_service=on_service, home=owner_home,
-                           settings=settings, template=template, emb=emb)
 
 
 def _ingest_one_more(emb) -> None:
@@ -74,9 +31,9 @@ def _ingest_one_more(emb) -> None:
     conn.close()
 
 
-def _served_ids(cli) -> set[str]:
-    with cli.on_service():
-        served = uploads.export_path(cli.svc.owner)
+def _served_ids(publisher) -> set[str]:
+    with publisher.on_service():
+        served = uploads.export_path(publisher.svc.owner)
         conn = sqlite3.connect(f"file:{served}?mode=ro", uri=True)
     try:
         return {r[0] for r in conn.execute("SELECT atom_id FROM atoms")}
@@ -84,24 +41,24 @@ def _served_ids(cli) -> set[str]:
         conn.close()
 
 
-def _served_sha(cli) -> str:
-    with cli.on_service():
-        return hashlib.sha256(uploads.export_path(cli.svc.owner).read_bytes()).hexdigest()
+def _served_sha(publisher) -> str:
+    with publisher.on_service():
+        return hashlib.sha256(uploads.export_path(publisher.svc.owner).read_bytes()).hexdigest()
 
 
-def test_push_replaces_what_the_service_serves(cli, capsys):
-    assert NEW not in _served_ids(cli)      # the seeded upload predates this atom
-    _ingest_one_more(cli.emb)
+def test_push_replaces_what_the_service_serves(publisher, capsys):
+    assert NEW not in _served_ids(publisher)      # the seeded upload predates this atom
+    _ingest_one_more(publisher.emb)
 
     assert push.main([]) == 0
 
-    assert NEW in _served_ids(cli)
+    assert NEW in _served_ids(publisher)
     out = capsys.readouterr().out
-    assert _served_sha(cli)[:12] in out     # what arrived hashes to what was sent
+    assert _served_sha(publisher)[:12] in out     # what arrived hashes to what was sent
     assert not opyt_path("tmp", "export-push.db").exists()
 
 
-def test_a_sha_mismatch_fails_loudly(cli, capsys, monkeypatch):
+def test_a_sha_mismatch_fails_loudly(publisher, capsys, monkeypatch):
     """The bytes that arrived are not the bytes that were sent. The exit code is the whole point
     — a publish that half-worked must not look like one that worked."""
     real_post = push.requests.post
@@ -115,19 +72,22 @@ def test_a_sha_mismatch_fails_loudly(cli, capsys, monkeypatch):
 
     assert push.main([]) == 1
     err = capsys.readouterr().err
-    assert "0" * 64 in err and _served_sha(cli)[:12] in err
+    assert "0" * 64 in err and _served_sha(publisher)[:12] in err
     assert not opyt_path("tmp", "export-push.db").exists()   # the finally runs on this path too
 
 
-def test_a_missing_token_names_the_env_var(cli, capsys, monkeypatch):
+def test_a_missing_token_names_the_env_var(publisher, capsys, monkeypatch):
     monkeypatch.setattr(push, "get_credential", lambda service: None)
     assert push.main([]) == 1
     err = capsys.readouterr().err
     assert "OPYT_SERVICE_TOKEN" in err and "opyt-keys" in err
 
 
-def test_a_missing_service_url_names_the_config_key(cli, capsys):
-    cli.settings.write_text(cli.template)   # the same file, without the one line
-    assert push.main([]) == 1
-    err = capsys.readouterr().err
-    assert "service_url" in err and str(cli.settings) in err
+def test_an_unset_service_url_falls_back_to_the_hosted_service(publisher):
+    """Sharing must not begin with editing a config file, so `service_url` has a default rather
+    than an error. The key still WINS when it is set — which is what keeps a self-hosted service
+    and this whole fixture possible."""
+    assert config.service_url() == URL
+
+    publisher.settings.write_text(publisher.template)   # the same file, without the one line
+    assert config.service_url() == config.DEFAULT_SERVICE_URL

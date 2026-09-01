@@ -7,14 +7,20 @@ hand when the mark changes.
 THE MARK IS NOT DEFINED HERE. Upstream is the live site: the `.tile` SVG in useopyt.com's
 markup plus the `.tile-*` rules in its style.css, transcribed once more in
 website/favicon.svg, which is what a browser that supports SVG favicons actually renders.
-Those three numbers below are a transcription of it:
+The chevron and the cursor below are a transcription of it:
 
-    <rect width=64 height=64 fill=#0b0b0b/>                     sharp-cornered terminal tile
     <path d="M18 16 L36 32 L18 48" stroke=#fff stroke-width=7/> the chevron: butt caps, miter join
     <rect x=40 y=41 width=11 height=7 fill=#dd3418/>            the block cursor, in the accent
+    <rect width=64 height=64 fill=#000000/>                     sharp-cornered terminal tile
 
-If the site's mark changes, change it in the site's markup, in website/favicon.svg and
-here, then re-run. Do not invent one.
+The tile background is a deliberate divergence, not a transcription. On the site
+`.tile-bg` is `currentColor`, so the tile inverts with the page theme: #141414 on light,
+#ececec on dark. A raster cannot invert, so it has to pick one form. It renders the dark
+tile at PURE BLACK, darker than the site's #141414, so the mark reads as fully black on the
+X avatar and the Claude Desktop extension icon.
+
+If the chevron or the cursor changes, change it in the site's markup, in
+website/favicon.svg and here, then re-run. Do not invent one.
 
 Why this is Python and not an SVG the build rasterizes: no SVG rasterizer on this machine draws
 a stroked <path> correctly — ImageMagick's internal renderer silently dropped the chevron and
@@ -32,7 +38,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-BG, GLYPH, ACCENT = (11, 11, 11, 255), (255, 255, 255, 255), (221, 52, 24, 255)
+BG, GLYPH, ACCENT = (0, 0, 0, 255), (255, 255, 255, 255), (221, 52, 24, 255)
 P0, P1, P2 = (18.0, 16.0), (36.0, 32.0), (18.0, 48.0)     # the chevron's three points
 STROKE = 7.0
 CURSOR = (40.0, 41.0, 51.0, 48.0)                          # x0, y0, x1, y1

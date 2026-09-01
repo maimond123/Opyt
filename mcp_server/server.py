@@ -104,6 +104,13 @@ def _setup_client_mcp() -> FastMCP:
     except Exception as _e:
         print(f"[sitting_tools] registration skipped: {_e}", flush=True)
 
+    # SHARE / ACCEPT / UNSHARE — knowledge-base sharing, the four moments a person touches.
+    try:
+        from mcp_server.share_tools import register_share_tools
+        register_share_tools(mcp)
+    except Exception as _e:
+        print(f"[share_tools] registration skipped: {_e}", flush=True)
+
     return mcp
 
 
@@ -174,6 +181,15 @@ def main() -> None:
     try:
         from pipeline.kb.probe_catchup import spawn_candidate_probe
         spawn_candidate_probe()
+    except Exception:
+        pass  # ditto
+
+    # Push catch-up — keeps the SERVED copy of this knowledge base current. The only rail here
+    # that buys nothing: it no-ops without an `OPYT_SERVICE_TOKEN`, and even with one it pushes
+    # only when somebody has read since the last push AND the store has changed since it.
+    try:
+        from pipeline.kb.push_catchup import spawn_push_catchup
+        spawn_push_catchup()
     except Exception:
         pass  # ditto
 

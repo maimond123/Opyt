@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from service import store
+from tests.service.conftest import LABEL
 
 
 def test_a_read_with_no_token_is_refused(svc):
@@ -91,6 +92,28 @@ def test_a_grant_code_can_be_redeemed_exactly_once(svc):
 
     second = svc.client.post("/v1/redeem", json={"code": code, "install_id": "b"})
     assert second.status_code == 404
+
+
+def test_redeem_hands_back_the_owners_display_name_to_register_under(svc):
+    """R4's other half. `owner` is the routing key — after R5 an opaque hex string — so a client
+    that registered the peer under it would leave the reader typing `kb='a3f9c2e1'`. The owner
+    named themselves once, on their own token, and every reader starts from that."""
+    code = svc.client.post("/v1/grant", json={}, headers=svc.owner_hdr).json()["code"]
+    body = svc.client.post("/v1/redeem", json={"code": code, "install_id": "a"}).json()
+
+    assert body["suggested_name"] == LABEL
+    assert body["owner"] == svc.owner
+
+
+def test_an_owner_who_registered_without_a_label_suggests_nothing(svc):
+    """Null rather than an invented name: `opyt-redeem` falls back to the routing key, which is
+    at least a string that resolves. Guessing one here would put a name in the reader's registry
+    that the owner never chose."""
+    hdr = {"Authorization": f"Bearer {store.mint_token('nameless', 'owner')}"}
+    code = svc.client.post("/v1/grant", json={}, headers=hdr).json()["code"]
+    body = svc.client.post("/v1/redeem", json={"code": code, "install_id": "a"}).json()
+
+    assert body["suggested_name"] is None
 
 
 def test_two_simultaneous_redeems_of_one_code_produce_exactly_one_token(svc):

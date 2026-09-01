@@ -96,6 +96,25 @@ def _remote_row(kb: str | None) -> dict | None:
     return None
 
 
+def _label_as(kb_name: str, as_kb: str | None) -> str:
+    """What the envelope CALLS the store that answered — the display half of R4's split.
+
+    `kb=` is the ROUTING key: it picked the store, and by the time this runs that decision is
+    made and unchangeable. `as_kb` decides only the string every `kb` field carries back, which
+    matters because the envelope crosses the wire verbatim. A served knowledge base is routed by
+    an opaque key, so without this the reader reads hit cards saying `kb: "a3f9c2e1"` and a
+    `foreign_kb` notice telling them to pass that back to `open()` — while their own install
+    knows the peer as `alex`. The service labels the envelope with the reader's own name for it
+    instead, so no layer downstream rewrites strings inside prose.
+
+    `LOCAL_KB` is refused rather than honoured. `as_kb` arrives in an HTTP body from a reader, so
+    it is untrusted input, and every `kb_name == LOCAL_KB` test downstream reads as "this is my
+    own store" — `kb_open`'s `raw_path` would hand a reader a path on the SERVER's filesystem.
+    Refusing it here keeps those tests store-truth without threading a second flag through three
+    entry points. A real client cannot send it anyway: `peers.add` will not register that name."""
+    return as_kb if as_kb and as_kb != LOCAL_KB else kb_name
+
+
 def _kb_phrase(kb_name: str, kb_label: str | None) -> str:
     """How a notice names the store it is describing. The local store is "this knowledge base" —
     the reader has exactly one and no ambiguity. A peer gets its label, because on a foreign read
@@ -410,7 +429,7 @@ def run_kb_search(query: str, tags: list[str] | None = None, what_kind: str | No
                   who: str | None = None, date_from: str | None = None,
                   date_to: str | None = None, entry_mode: str | list[str] | None = None,
                   k: int = 8, mode: str = "hybrid", kb: str | None = None,
-                  embedder=None) -> dict:
+                  as_kb: str | None = None, embedder=None) -> dict:
     """Enforced-hybrid retrieval over atoms → `{hits, notices, insights, trace, frontier_atoms}`.
 
     `hits` are ranked routing cards (matched-chunk snippet + pointer), never a content claim —
@@ -448,6 +467,10 @@ def run_kb_search(query: str, tags: list[str] | None = None, what_kind: str | No
     peer's, read-only. Every hit carries the `kb` it came from — always, local ones included, so a
     host never has to infer provenance from a missing key.
 
+    `as_kb` renames that store IN THE ENVELOPE and nowhere else — see `_label_as`. Supplied by
+    one caller, a reader reading a SERVED knowledge base, so the routing key can be opaque while
+    the answer comes back labelled with whatever that reader's install calls it.
+
     `embedder` overrides how the query is turned into a vector. Omitted — the normal case — this
     function builds one for the store it opened, which is the whole of the local and the
     filesystem-peer paths. It is supplied by exactly one caller: a process SERVING this knowledge
@@ -475,6 +498,7 @@ def run_kb_search(query: str, tags: list[str] | None = None, what_kind: str | No
         return {"hits": [], "notices": [_kb_unavailable_notice(kb, e)], "insights": {},
                 "trace": {"kb": kb, "ran": "none", "why": "knowledge base unavailable"}}
     foreign = kb_name != LOCAL_KB
+    kb_name = _label_as(kb_name, as_kb)   # the store is chosen; this is only what to call it
     try:
         who_id, resolved = _author_ids(conn, who, who_id)
         # bm25-only needs no vectors (and no cost); hybrid/semantic embed the query. A
@@ -600,7 +624,7 @@ def _hit_card(h, kb_name: str = LOCAL_KB) -> dict:
     }
 
 
-def kb_open(atom_id: str, kb: str | None = None) -> dict:
+def kb_open(atom_id: str, kb: str | None = None, as_kb: str | None = None) -> dict:
     """Follow an atom's pointer. Returns the REAL raw snapshot text + live `source_url` so the
     host asserts from the source, not a description. Fail-safe: unknown atom / missing snapshot
     returns an error dict. `body_state` matters here more than on a search hit — it's the last
@@ -608,12 +632,15 @@ def kb_open(atom_id: str, kb: str | None = None) -> dict:
 
     `kb` must be the value the hit card carried. An atom id is scoped to its store — the same
     tweet ingested by two people is one id in two knowledge bases — so opening a foreign id
-    against your own store finds nothing, or finds YOUR copy of the same source."""
+    against your own store finds nothing, or finds YOUR copy of the same source.
+
+    `as_kb` renames the store in the returned dict and nowhere else — see `_label_as`."""
     try:
         row = _remote_row(kb)
         if row is not None:
             return kb_remote.open_atom(row, atom_id)
         conn, kb_name, _label = _open_kb(kb)
+        kb_name = _label_as(kb_name, as_kb)
     except peers.PeerUnavailable as e:
         # The same sentence `search` gives, including which names DO resolve — a host that
         # guessed one has no other way to find the real ones and would otherwise guess again.
@@ -658,7 +685,8 @@ def kb_open(atom_id: str, kb: str | None = None) -> dict:
     }
 
 
-def kb_aggregate(scope: dict | None = None, kb: str | None = None) -> dict:
+def kb_aggregate(scope: dict | None = None, kb: str | None = None,
+                 as_kb: str | None = None) -> dict:
     """A pure-SQL state-of-play skeleton for a dossier: counts by kind/source, trust coverage,
     topic/entity distribution, and top atom DESCRIPTIONS. The host drafts from this, then
     `open()`s pivotal atoms to ground each claim in raw text. `scope` filters like search:
@@ -668,7 +696,9 @@ def kb_aggregate(scope: dict | None = None, kb: str | None = None) -> dict:
     and pass `who_id=` here, so resolution has one home rather than two that can drift.
 
     `kb` picks which knowledge base to summarize — omitted (or "me") is your own; any other name
-    is a registered peer's. `scope` stays filters-only: which store to read is not a filter."""
+    is a registered peer's. `scope` stays filters-only: which store to read is not a filter.
+
+    `as_kb` renames that store in the returned dict and nowhere else — see `_label_as`."""
     scope = scope or {}
     tags = _slug_tags(scope.get("tags"))
     what_kind = scope.get("what_kind")
@@ -682,6 +712,7 @@ def kb_aggregate(scope: dict | None = None, kb: str | None = None) -> dict:
         if row is not None:
             return kb_remote.aggregate(row, scope)
         conn, kb_name, _label = _open_kb(kb)
+        kb_name = _label_as(kb_name, as_kb)
     except peers.PeerUnavailable as e:
         return {"scope": scope, "kb": kb, "total": 0,
                 "notices": [_kb_unavailable_notice(kb, e)]}

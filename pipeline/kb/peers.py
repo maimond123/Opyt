@@ -29,8 +29,12 @@ apart. THIS MODULE OPENS ONLY THE FIRST KIND — a remote peer is routed over HT
 `opyt_core/kb_remote.py`, before an entry point reaches `open_peer`, which is the whole reason
 the seam was drawn at the store-opening boundary rather than inside `retrieve.py`.
 
-There is deliberately NO MCP tool for the registry. Nothing adds a peer today except a test and a
-person at a Python prompt:
+WHO WRITES A ROW HERE. `mcp_server/share_tools.accept` is the surface a person reaches — it
+redeems an invite and registers the peer in one call, because a reader who has to open a shell is
+a reader the design does not get. `opyt-redeem` does the same thing from a terminal and stays as
+the operator rail. `service/uploads.Receiver.commit` writes the SERVICE's own row for the export
+it just received, which is a different job under the same schema. A file peer on this disk still
+takes a Python prompt, and has no other caller:
 
     python -c "from pipeline.kb import peers; peers.add('david', '/path/export.db', \"David's KB\")"
 """
@@ -65,8 +69,31 @@ def is_remote(location: str) -> bool:
 
 
 def add(name: str, location: str | Path, label: str | None = None, *,
-        token: str | None = None) -> None:
-    """Register a knowledge base under `name`, idempotently. Re-adding updates every field.
+        token: str | None = None, rename_on_collision: bool = True) -> str:
+    """Register a knowledge base under `name`. Returns the name it ACTUALLY landed under.
+
+    ⚠️`peers.token` is the only copy of a reader bearer token in existence — the service stores
+    only its sha256 and hands the clear text over exactly once, at redemption — so a row this
+    function overwrote is an UNRECOVERABLE credential, restorable only by a fresh grant code from
+    that owner. That is why it never replaces a row it did not recognise.
+
+    ONE rule, applied to `name`, then `name-2`, `name-3`, … until it settles:
+
+      • nothing registered there → insert, and that is the name
+      • registered at the SAME location → the same knowledge base, registered again: update the
+        label and token, which is the genuine re-redeem (a revoked token being replaced)
+      • registered somewhere else → a different knowledge base wearing this name → try the next
+
+    Applying it at every candidate rather than only the first is what makes re-redeeming an
+    already-suffixed peer land back on `alex-2` instead of minting `alex-3` on every attempt.
+    Auto-suffixing rather than prompting is the frictionless constraint: the caller reads the
+    returned name and says which one it got.
+
+    `rename_on_collision=False` turns the suffix off and makes the name authoritative —
+    overwrite whatever is there. Its one caller is `service/uploads.Receiver.commit`, where name
+    and location are welded by `export_path(owner)`, so a differing location does not mean two
+    knowledge bases; it means the exports directory moved and the row is stale. Suffixing there
+    would leave `open_peer(owner)` resolving the OLD file and serving a stale export silently.
 
     A PATH is resolved and `~` expanded here rather than at open time, so the row means the same
     file no matter which directory a later process runs from. A URL is stored verbatim: putting
@@ -89,15 +116,43 @@ def add(name: str, location: str | Path, label: str | None = None, *,
         Path(location).expanduser().resolve())
     conn = schema.connect()
     try:
-        conn.execute(
-            "INSERT INTO peers (name, location, label, token) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(name) DO UPDATE SET location=excluded.location, label=excluded.label, "
-            "token=excluded.token",
-            (name, path, label, token),
-        )
+        candidate, n = name, 1
+        while True:
+            row = conn.execute("SELECT location FROM peers WHERE name = ?",
+                               (candidate,)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO peers (name, location, label, token) "
+                             "VALUES (?, ?, ?, ?)", (candidate, path, label, token))
+                break
+            if row["location"] == path or not rename_on_collision:
+                conn.execute("UPDATE peers SET location = ?, label = ?, token = ? "
+                             "WHERE name = ?", (path, label, token, candidate))
+                break
+            n += 1
+            candidate = f"{name}-{n}"
         conn.commit()
     finally:
         conn.close()
+    return candidate
+
+
+def remove(name: str) -> bool:
+    """Deregister a knowledge base. Returns whether a row was there.
+
+    The mirror of `add`. This row is what `open_peer` resolves, so deleting it is what makes the
+    name stop answering — which is why an owner unpublishing calls this on the SERVICE's registry
+    before deleting the export file.
+
+    Deleting that file is deliberately NOT this function's job: a file peer's `location` is a
+    path on somebody else's disk, and a module that removed it would be deleting data it never
+    wrote."""
+    conn = schema.connect()
+    try:
+        n = conn.execute("DELETE FROM peers WHERE name = ?", (name,)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return n > 0
 
 
 def _read_registry(sql: str, params=()) -> list:

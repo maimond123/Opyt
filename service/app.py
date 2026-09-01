@@ -28,9 +28,11 @@ max-pools in Python between NumPy calls, so it holds the GIL for most of its run
 concurrent queries in ONE process serialize. Measured on the real 2,805-atom export, 16 at once:
 7,699 ms in a single process, 2,133 ms across four worker processes.
 
-So throughput scales with PROCESSES, and the deploy command is where that is set:
+So throughput scales with PROCESSES, and the deploy command is where that is set. The shape of
+it, with `<n>` = the box's CORE COUNT and never more, since processes time-slicing one core are
+still one core (`service/DEPLOY.md` §3 is the real command, and today's box is one core):
 
-    uvicorn service.app:app --workers 4 --limit-concurrency 32 \
+    uvicorn service.app:app --workers <n> --limit-concurrency 32 \
             --log-config service/log_config.json
 
 `--log-config` is not optional. Uvicorn's default access formatter writes `%(client_addr)s` —
@@ -119,6 +121,33 @@ def _reader_of(owner: str, auth: dict = Depends(_token)) -> dict:
     return auth
 
 
+def _served(owner: str, auth: dict = Depends(_reader_of)) -> dict:
+    """A reader token AND an export to serve. 404 when there is nothing here yet.
+
+    ⚠️THIS IS A BOUNDARY CHECK AND IT IS NOT OPTIONAL, because the read handlers call the LOCAL
+    entry points, whose answer to an unreadable `kb=` is written for a person at their own
+    install: it names every knowledge base registered here — on this box, that is every published
+    routing key — and advises omitting `kb` to search their own store, which is not a thing a
+    reader of a served export can do. Measured 2026-09-01, before this existed: `search`, `open`
+    and `aggregate` all answered 200 with the service's whole registry inside the message, and
+    only `meta` 404'd. The fix belongs HERE rather than in `opyt_core/kb.py`, because naming the
+    registered peers is genuinely useful to the local caller it was written for; what is wrong is
+    that this service was passing a local answer across a trust boundary without deciding
+    anything first.
+
+    ONE sentence for two states the service cannot tell apart and need not: an owner who has
+    shared but whose export has not landed yet, and one whose first push failed. Both are ordinary
+    now — `share` returns the invite immediately and pushes detached, so a link is live for the
+    minute or two the upload takes — and the reader does the same thing in either case."""
+    if not uploads.export_path(owner).exists():
+        raise HTTPException(
+            status_code=404,
+            detail="this knowledge base has not arrived on the service yet. Its owner shared it, "
+                   "and the copy usually lands within a minute or two of them doing so — nothing "
+                   "is wrong with your install. Try again shortly.")
+    return auth
+
+
 # ── request bodies ───────────────────────────────────────────────────────────────
 
 class SearchBody(BaseModel):
@@ -142,14 +171,20 @@ class SearchBody(BaseModel):
     # pays; absent → the vector arm falls back to whatever `run_kb_search` can build locally,
     # which on a served export means the owner's model must also be this install's.
     query_vector: list[float] | None = None
+    # R4: what the READER calls this knowledge base. The `{owner}` path segment is the routing
+    # key and picks the export; this picks the string every `kb` field in the answer carries
+    # back. Absent falls back to the routing key, which is what a pre-R4 client sends.
+    as_kb: str | None = None
 
 
 class OpenBody(BaseModel):
     atom_id: str
+    as_kb: str | None = None
 
 
 class AggregateBody(BaseModel):
     scope: dict | None = None
+    as_kb: str | None = None
 
 
 class GrantBody(BaseModel):
@@ -175,6 +210,10 @@ _REDEEM_NOTICE = (
 
 class RevokeBody(BaseModel):
     token_sha256: str
+
+
+class RegisterBody(BaseModel):
+    label: str | None = None
 
 
 # ── the query endpoints (§3.1) ───────────────────────────────────────────────────
@@ -207,7 +246,7 @@ def _query_embedder(owner: str, vector: list[float] | None):
 
 
 @app.get("/v1/kb/{owner}/meta")
-def meta(owner: str, auth: dict = Depends(_reader_of)) -> dict:
+def meta(owner: str, auth: dict = Depends(_served)) -> dict:
     """The embedding identity of this export — what a remote reader must embed their query with.
 
     Read from the served file on demand and never stored. `kb_meta` changes the day the owner
@@ -232,12 +271,12 @@ def meta(owner: str, auth: dict = Depends(_reader_of)) -> dict:
 
 @app.post("/v1/kb/{owner}/search")
 def search(owner: str, body: SearchBody,
-           auth: dict = Depends(_reader_of)) -> dict:
+           auth: dict = Depends(_served)) -> dict:
     envelope = kb_entry.run_kb_search(
         body.query, tags=body.tags, what_kind=body.what_kind, source_type=body.source_type,
         who_id=body.who_id, who=body.who, date_from=body.date_from, date_to=body.date_to,
         entry_mode=body.entry_mode, k=min(body.k, K_MAX), mode=body.mode, kb=owner,
-        embedder=_query_embedder(owner, body.query_vector),
+        as_kb=body.as_kb, embedder=_query_embedder(owner, body.query_vector),
     )
     store.record_usage(owner, auth["token_sha256"], "search",
                        zero_results=not envelope["hits"])
@@ -246,8 +285,8 @@ def search(owner: str, body: SearchBody,
 
 @app.post("/v1/kb/{owner}/open")
 def open_atom(owner: str, body: OpenBody,
-              auth: dict = Depends(_reader_of)) -> dict:
-    envelope = kb_entry.kb_open(body.atom_id, kb=owner)
+              auth: dict = Depends(_served)) -> dict:
+    envelope = kb_entry.kb_open(body.atom_id, kb=owner, as_kb=body.as_kb)
     raw = envelope.get("raw")
     if isinstance(raw, str):
         encoded = raw.encode("utf-8")
@@ -264,14 +303,14 @@ def open_atom(owner: str, body: OpenBody,
 
 @app.post("/v1/kb/{owner}/aggregate")
 def aggregate(owner: str, body: AggregateBody,
-              auth: dict = Depends(_reader_of)) -> dict:
+              auth: dict = Depends(_served)) -> dict:
     # No cap applied, and that is a finding rather than an omission: every list `kb_aggregate`
     # returns is already `LIMIT`ed in its own SQL (15/15/12) and its two dicts are keyed on
     # closed enums, so there is no unbounded surface here to clamp. Adding a truncation branch
     # that can never fire would be a cap in name only. The bound is asserted at this boundary
     # instead — see tests/service/test_caps.py — so a future edit that raises those LIMITs has to
     # decide about this endpoint rather than silently widening it.
-    envelope = kb_entry.kb_aggregate(scope=body.scope, kb=owner)
+    envelope = kb_entry.kb_aggregate(scope=body.scope, kb=owner, as_kb=body.as_kb)
     store.record_usage(owner, auth["token_sha256"], "aggregate")
     return envelope
 
@@ -304,18 +343,58 @@ async def upload(owner: str, request: Request,
         rx = uploads.Receiver(owner)
     except uploads.BadOwner as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except uploads.NoSpace as e:
+        # 507, not 500: the request is well-formed and the owner did nothing wrong. It says the
+        # STORAGE is the problem, so a client knows retrying later is the right move and
+        # shrinking the export is not.
+        raise HTTPException(status_code=507, detail=str(e)) from e
     try:
         async for chunk in request.stream():
             rx.write(chunk)
+    except uploads.TooLarge as e:
+        # 413, and the previously served export is still answering — `abort` touches only the
+        # temp file. The owner CAN act on this one, which is why it is not the same code as a
+        # full disk.
+        rx.abort()
+        raise HTTPException(status_code=413, detail=str(e)) from e
     except BaseException:
         # Including a disconnect mid-body. The previously served export is untouched, because
         # `commit` is the only statement that would have replaced it.
         rx.abort()
         raise
-    return rx.commit(label=auth["label"])
+    result = rx.commit(label=auth["label"])
+    # AFTER the commit, so the recorded size always describes a file that is really being served.
+    store.record_upload(owner, result["bytes"])
+    return result
 
 
-# ── grant / redeem / revoke (§3.4) ───────────────────────────────────────────────
+# ── register / grant / redeem / revoke (§3.4) ────────────────────────────────────
+
+@app.post("/v1/register")
+def register(body: RegisterBody) -> dict:
+    """A new knowledge base: `{owner, token}`, unauthenticated, returned once.
+
+    R5: anyone with Opyt installed can publish. `DEPLOY.md` §7 used to say there was deliberately
+    no such endpoint, because one that hands out owner tokens hands out the right to publish. Its
+    rationale was largely the permanent NAME claim, which R4 deleted by making the key an
+    assigned address rather than a name anybody would type. What remains is resource abuse, and
+    R5a rules that a quota question rather than a gate question — handled after the fact, by the
+    operator, reading `/v1/stats`.
+
+    UNMETERED on purpose (R5a). No rate limit, no identity, no verification: every candidate is a
+    weaker imitation of the human gate R5 removed deliberately, and the damage they prevent is
+    bounded, cheap and reversible. The transition rule for the paid tier is that the free tier
+    must be a LIMIT and not a GATE — going paid raises a cap, so nobody loses a capability and
+    there is no grandfather cohort to negotiate.
+
+    `label` is the owner's display name, and it is what every reader gets back from `redeem` as
+    `suggested_name`. It is not a claim, not unique, and never routes.
+
+    The on-box `mint_token` stays as the operator fallback and as the rotation path for a leaked
+    token; this endpoint is the one a person reaches."""
+    owner, token = store.register_owner(body.label)
+    return {"owner": owner, "token": token}
+
 
 @app.post("/v1/grant")
 def grant(body: GrantBody, auth: dict = Depends(_owner_token)) -> dict:
@@ -327,15 +406,25 @@ def grant(body: GrantBody, auth: dict = Depends(_owner_token)) -> dict:
 
 @app.post("/v1/redeem")
 def redeem(body: RedeemBody) -> dict:
-    """Exchange a code for a reader token. THE REAL CLIENT ENTRY POINT, and the reason Phase 2
-    deliberately shipped no `peers` MCP tool: on redemption the client writes its own peer row
-    from what comes back here, so registering a knowledge base is something a person does once
-    with a code rather than a tool a host model can call."""
+    """Exchange a code for a reader token. THE REAL CLIENT ENTRY POINT: on redemption the client
+    writes its own peer row from what comes back here — `share_tools.accept` in an assistant, or
+    `opyt-redeem` from a terminal.
+
+    `owner` is the ROUTING key — opaque, in the URL path, and not something anybody would type.
+    `suggested_name` is what the owner called themselves, and it is what the client registers the
+    peer under. A SUGGESTION, deliberately: `peers.add` may suffix it if this reader already
+    knows another `alex`, and nothing about serving depends on it being unique, because R4 moved
+    uniqueness onto the routing key. It can be null — an owner registered without a label — and
+    the client then falls back to the routing key.
+
+    NOT returned: a base URL. The client knows the URL it POSTed to, and synthesizing one here
+    would mean reading proxy headers to find out what the world calls this service."""
     try:
         owner, token = store.redeem_grant(body.code, body.install_id)
     except store.GrantUnavailable as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    return {"owner": owner, "token": token, "notice": _REDEEM_NOTICE}
+    return {"owner": owner, "token": token, "suggested_name": store.owner_label(owner),
+            "notice": _REDEEM_NOTICE}
 
 
 @app.post("/v1/revoke")
@@ -344,11 +433,45 @@ def revoke(body: RevokeBody, auth: dict = Depends(_owner_token)) -> dict:
     return {"revoked": store.revoke(auth["owner"], body.token_sha256)}
 
 
+@app.post("/v1/unpublish")
+def unpublish(auth: dict = Depends(_owner_token)) -> dict:
+    """Stop sharing this knowledge base: every reader cut off AND the served copy deleted.
+
+    ONE act, not two, because a person who says "stop sharing my KB" means both halves and will
+    not think to say it twice. Each half alone is a wrong end state: revoking every token leaves
+    the export on this disk with no reader and no removal path, and deleting the file alone
+    leaves live tokens meeting 404s that read like an outage rather than a decision.
+
+    READERS FIRST, then the file. A failed unlink then leaves readers already cut off (safe) and
+    an orphaned file that a retry clears; the reverse order would open a window where live tokens
+    reach for a file that is gone. This is not one transaction and cannot be — a SQLite delete
+    and a filesystem unlink have no shared commit — so the ordering is what makes the crash-in-
+    the-middle state the harmless one.
+
+    Takes no body: the token names the knowledge base, the same way `grant` and `revoke` do.
+    """
+    readers = store.revoke_all_readers(auth["owner"])
+    served = uploads.remove(auth["owner"])
+    # The bytes are gone, so the accounting must say so — a stored-bytes total that only ever
+    # climbs is not a disk-usage number. The row stays: `first_published_at` is the fact that
+    # cannot be recovered.
+    store.clear_upload(auth["owner"])
+    return {"owner": auth["owner"], "readers_revoked": readers, "export_deleted": served}
+
+
 @app.get("/v1/tokens")
 def tokens(auth: dict = Depends(_owner_token)) -> dict:
     """Who currently holds a token for this knowledge base — the list `revoke` takes its handle
-    from. Hashes only, because that is all this service has."""
-    return {"owner": auth["owner"], "tokens": store.list_tokens(auth["owner"])}
+    from. Hashes only, because that is all this service has.
+
+    Also carries R3's push gate: `last_upload_at` and `reads_since_last_upload`. They ride HERE
+    rather than on an endpoint of their own because `push` already calls this first — it is how
+    the routing key is derived from the token — so the gate costs the rail no extra round trip.
+    The rail pushes when someone has READ since the last push AND the local store has CHANGED
+    since it; this answers the first, and the second is a question about the owner's own store
+    that this service has no view of."""
+    return {"owner": auth["owner"], "tokens": store.list_tokens(auth["owner"]),
+            **store.publish_demand(auth["owner"])}
 
 
 # ── the public stats page (the collection ruling's transparency obligation) ───────
@@ -359,6 +482,7 @@ def _rollup() -> dict:
     the first and deliberately does not reach into the second, so the join happens here."""
     return {**store.stats_rollup(),
             "kbs_published": len(peers.list_peers()),
+            "stored_bytes_by_kb": store.stored_bytes(),
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
@@ -366,7 +490,13 @@ def _rollup() -> dict:
 def stats() -> dict:
     """The roll-up as JSON. UNAUTHENTICATED on purpose: this is the transparency mechanism for
     what `TELEMETRY.md` says is collected, and a transparency page behind a credential is not
-    one. Nothing here is per-owner or per-reader — see `/stats` for the same numbers as a page."""
+    one.
+
+    `stored_bytes_by_kb` is the one per-knowledge-base list, and it rides the JSON rather than
+    the page: it exists so an operator can see who is eating the disk and remove them by hand
+    (R5a puts abuse handling after the fact, not at admission), and a notifier reads JSON. It
+    carries the routing key and NO label — after R4 that key is an assigned address, not a name
+    anybody chose. Nothing here is per-reader."""
     return _rollup()
 
 
@@ -385,11 +515,14 @@ _STATS_PAGE = """<!doctype html>
  footer {{ margin-top: 3rem; color: #666; font-size: 0.9rem; }}
 </style>
 <h1>What this service has served</h1>
-<p>Every number on this page is a total. No knowledge-base owner, no reader, and no query
-appears here or in the database behind it — see TELEMETRY.md in the Opyt repository for the
-full schema.</p>
+<p>Every number on this page is a total. No reader and no query appears here or in the database
+behind it. Knowledge bases do appear, by their routing key — the address of a file, which
+<code>register</code> now assigns at random, though a key claimed before it did so may still
+read like a name; <code>/v1/stats</code> lists how much disk each one uses. See TELEMETRY.md in
+the Opyt repository for the full schema.</p>
 <dl>
  <dt class="n">{kbs_published}</dt><dd>knowledge bases published to this service.</dd>
+ <dt class="n">{stored_mb}</dt><dd>of exports stored, across all of them.</dd>
  <dt class="n">{readers_total}</dt><dd>reader tokens currently held. Revoked ones leave this count
    and stay in the read totals below.</dd>
  <dt class="n">{codes_redeemed} / {codes_minted}</dt>
@@ -414,4 +547,5 @@ def stats_page() -> str:
     return _STATS_PAGE.format(
         by_tool=", ".join(f"{v} {k}" for k, v in sorted(d["reads_by_tool"].items())) or "none yet",
         zero_rate="not yet known" if rate is None else f"{rate:.0%}",
+        stored_mb=f"{d['stored_bytes_total'] / 1_000_000:,.0f} MB",
         **d)
