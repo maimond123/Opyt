@@ -27,7 +27,7 @@ Every bookmark, follow and subscription was you deciding whose thinking is worth
 
 ## Why Opyt
 
-I kept bookmarking posts on X, subscribing to Substacks, and saving papers I meant to read. Most of them stayed unread. I wanted that material where I actually work and learn — so Opyt turns the sources you already follow and trust into a knowledge base, keeps adding to it as they publish, and answers from it in the client you already use.
+I kept bookmarking posts on X, subscribing to Substacks, and saving papers I meant to read. Most of them stayed unread. I wanted that material where I actually work and learn, so Opyt turns the sources you already follow and trust into a knowledge base, keeps adding to it as they publish, and answers from it in the client you already use.
 
 - **Nobody you did not choose.** Candidates are ranked off your own follows, Lists, subscriptions, bookmarks and likes. There is no recommendation model and no trending list. Zero hits is an answer: nobody you trust has touched the claim.
 - **Your backlog is searchable on the first run.** Everything you saved before today comes in during setup. You are not starting from an empty store.
