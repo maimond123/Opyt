@@ -27,12 +27,16 @@ Every bookmark, follow and subscription was you deciding whose thinking is worth
 
 ## Why Opyt
 
+I kept bookmarking posts on X, subscribing to Substacks, and saving papers I meant to read. Most of them stayed unread. I wanted that material where I actually work and learn — so Opyt turns the sources you already follow and trust into a knowledge base, keeps adding to it as they publish, and answers from it in the client you already use.
+
 - **Nobody you did not choose.** Candidates are ranked off your own follows, Lists, subscriptions, bookmarks and likes. There is no recommendation model and no trending list. Zero hits is an answer: nobody you trust has touched the claim.
 - **Your backlog is searchable on the first run.** Everything you saved before today comes in during setup. You are not starting from an empty store.
-- **It grows on the days you never open it.** Reading a topic end to end emits standing questions. Those questions keep running against arXiv, GitHub and OpenAlex, and stage what they find for you to review when you feel like it.
+- **It grows on the days you never open it.** Reading a topic end to end emits standing questions. Those questions keep running against arXiv, GitHub and OpenAlex, and stage what they find for you to review when you feel like it. Catching up on AI becomes one question, answered from people you trust plus what arrived while you were away.
 - **Full archives, not the three posts you bookmarked.** Confirm one person and Opyt finds their other platforms, verifies them, and pulls years of posts, repos and essays in full text.
-- **Free of new subscriptions.** Reading and reasoning run on the AI client you already have. One metered key covers classification and embeddings, on cheap open models.
-- **One local SQLite file.** Your whole knowledge base lives in `~/.opyt/opyt.db`. No vault of markdown, no dashboard, no account. One background process, `opyt-worker`, runs the ingest jobs on a schedule; it opens no port and keeps only its own small job queue beside the store.
+- **Check before you build.** Search repos, papers and posts together: find out whether someone already built your idea, and what the people you follow learned trying it.
+- **Share with a friend.** Grant each other access to your knowledge bases, search both with one question, see whose collection each result came from, and revoke whenever you want.
+- **Free of new subscriptions.** Reading and reasoning run on the AI client you already pay for. One metered OpenRouter key covers classification and embeddings, on cheap open models.
+- **One local SQLite file.** Your whole knowledge base lives in `~/.opyt/opyt.db`. No new app to open, no vault of markdown, no dashboard, no account. One background process, `opyt-worker`, runs the ingest jobs on a schedule; it opens no port and keeps only its own small job queue beside the store.
 - **Any MCP client.** Claude Code, Claude Desktop, Cursor, Windsurf, Codex, or anything else that speaks MCP over stdio.
 - **MIT licensed.** [Read the source](https://github.com/maimond123/Opyt).
 
