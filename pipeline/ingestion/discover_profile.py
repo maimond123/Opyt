@@ -1,34 +1,34 @@
 """
 pipeline/ingestion/discover_profile.py
-Discover all content sources for a credible person from their X handle.
+Discover profile sources rooted at a confirmed X, Substack, or blog profile.
 
-Runs 4 probes to find blog, Substack, GitHub, academic papers:
+Runs 3 probes to find blog, Substack and GitHub accounts:
   1. Twitter bio extraction (free, on the user's own x.com session)
   2. Substack RSS probe (free HTTP check)
   3. GitHub user lookup (free API)
-  4. Semantic Scholar author search (free API)
-Probe 5 (open-web search for a blog/YouTube/podcasts) does not exist in any form — see
+The host supplies open-web discoveries through `extra_source_urls`; this module judges them.
+
+A fourth probe searched Semantic Scholar BY DISPLAY NAME and was deleted 2026-09-09. A person's
+papers are pulled from their OpenAlex author id, which `oracles._ingest_oracle` handles without
+discovery; nothing here needs to guess at a research identity. See
+docs/plans/2026-09-09-delete-the-scholar-name-search.md.
 
 No outbound work here is PAID at all since 2026-08-30 — the X profile probe moved to the user's
 own session. Trust is computed entirely from
 free signals (bio-declared links, landing-page fetches, propagation).
 
-Results cached in state/discovered_profiles.json for reuse.
+The trust cache can reuse an unchanged profile.
 
 Usage:
   python pipeline/ingestion/discover_profile.py --username someuser
-  python pipeline/ingestion/discover_profile.py --username someuser --skip-web-search
-  python pipeline/ingestion/discover_profile.py --username someuser --ingest --since 2025-06-01
-  python pipeline/ingestion/discover_profile.py --username someuser --ingest --dry-run
+  python pipeline/ingestion/discover_profile.py --username someuser --reverify
 """
 
-import argparse
 import hashlib
 import json
 import os
 import re
 import sys
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pipeline.timeparse import utc_now
@@ -54,6 +54,7 @@ for _env_candidate in [
 
 from pipeline.config import state_paths, StatePaths
 from pipeline.ingestion.utils import log
+from pipeline.ingestion import identity_tokens
 from pipeline.ingestion.trust_graph import propagate
 from pipeline.ingestion.trust_types import Edge, TrustEvidence
 from pipeline.ingestion.trust_edges import (
@@ -65,29 +66,18 @@ from pipeline.ingestion.trust_edges import (
 )
 from pipeline.ingestion.source_classify import classify_source
 from pipeline.ingestion.handle_match import match_known_handle, normalize_handle
-from pipeline.ingestion.url_canon import canonical_identity
-
-S2_BASE = "https://api.semanticscholar.org/graph/v1"
-
-
-def _s2_headers() -> dict:
-    """S2 headers incl. `S2_API_KEY` when set. Imported lazily and called per-request so a key
-    written to ~/.opyt/.env mid-session takes effect without a restart."""
-    from pipeline.credentials import s2_headers
-    return s2_headers()
-
+from pipeline.ingestion.url_canon import canonical_identity, parse_url
 
 # ── Data structures ──────────────────────────────────────────────────────────
 
 @dataclass
 class DiscoveredSource:
-    source_type: str                           # blog, substack, github, scholar, youtube, podcast
+    source_type: str                           # blog, substack, github, scholar, orcid
     url: str
     feed_url: Optional[str] = None
     metadata: dict = field(default_factory=dict)
     confidence: str = "high"                   # high | medium | low
     trust: Optional[TrustEvidence] = None      # owner-validation verdict (asdict-serializable)
-    evidence_edges: list = field(default_factory=list)  # supporting edges for the verdict
 
 
 @dataclass
@@ -104,30 +94,16 @@ class DiscoveredProfile:
 
 def _normalize_url(url: str) -> str:
     """Normalize a URL for deduplication."""
-    if not url:
-        return url
-    url = url.rstrip("/")
-    if url.startswith("http://"):
-        url = "https://" + url[7:]
+    parsed = parse_url(url)
+    if parsed is None:
+        return ""
+    url = parsed._replace(scheme="https").geturl().rstrip("/")
     # Fix double slashes in path (but not after protocol)
     parsed = urlparse(url)
     if "//" in parsed.path:
         clean_path = parsed.path.replace("//", "/")
         url = parsed._replace(path=clean_path).geturl()
     return url
-
-
-def _load_discovered(state_file: Path | None = None) -> dict:
-    sf = state_file or state_paths().state_file("discovered_profiles")
-    if sf.exists():
-        return json.loads(sf.read_text())
-    return {}
-
-
-def _save_discovered(profiles: dict, state_file: Path | None = None) -> None:
-    sf = state_file or state_paths().state_file("discovered_profiles")
-    sf.parent.mkdir(parents=True, exist_ok=True)
-    sf.write_text(json.dumps(profiles, indent=2, default=str))
 
 
 def _detect_rss_feed(blog_url: str) -> Optional[str]:
@@ -170,36 +146,14 @@ def _detect_rss_feed(blog_url: str) -> Optional[str]:
 
 
 def _classify_url(url: str) -> Optional[str]:
-    """Classify a URL into a source type based on domain."""
-    if not url:
-        return None
-    domain = urlparse(url).netloc.lower()
-    host = domain[4:] if domain.startswith("www.") else domain
-    # Exact-host match (not substring) so a site like "max.com" can't false-positive on "x.com".
-    if host in ("x.com", "twitter.com", "mobile.twitter.com"):
-        return "x"
-    if "substack.com" in domain:
-        return "substack"
-    if "github.com" in domain:
-        return "github"
-    if "youtube.com" in domain or "youtu.be" in domain:
-        return "youtube"
-    if "scholar.google" in domain:
-        return "scholar"
-    if "linkedin.com" in domain:
-        return "linkedin"
-    if "spotify.com" in domain:
-        return "podcast"
-    if "podcasts.apple.com" in domain or "apple.co" in domain:
-        return "podcast"
-    if "medium.com" in domain:
-        return "blog"
-    if "mirror.xyz" in domain:
-        return "blog"
-    return "blog"  # default: treat unknown URLs as blogs
+    """Classify source links, including artifacts that identify a known account.
 
+    Blog anchors to known account platforms remain ownership declarations by policy.
+    Platform roots have neither a profile nor an account handle and are excluded.
+    """
+    profile = classify_source(_normalize_url(url))
+    return profile.type if profile and (profile.is_profile or profile.handle) else None
 
-# ── Probes ───────────────────────────────────────────────────────────────────
 
 def _probe_twitter_bio(username: str) -> tuple[dict, list]:
     """Probe 1: bio, website and the other homes an X profile links to.
@@ -215,9 +169,8 @@ def _probe_twitter_bio(username: str) -> tuple[dict, list]:
 
     log(f"  [probe] Twitter bio for @{username}")
     try:
-        cookies = core.read_x_cookies()
-        headers = core.auth_headers(cookies, f"https://x.com/{username}")
-        data = core.fetch_user_profile(cookies, headers, username)
+        session = core.x_session(f"https://x.com/{username}")
+        data = core.fetch_user_profile(session, session, username)
         if not data:
             log(f"    [error] No profile data returned for @{username}")
             return {}, []
@@ -234,34 +187,31 @@ def _probe_twitter_bio(username: str) -> tuple[dict, list]:
     sources = []
 
     website = data["website"]
-    if website:
-        # Skip X/Twitter self-links
-        website_domain = urlparse(website).netloc.lower()
-        if "twitter.com" not in website_domain and "x.com" not in website_domain:
-            stype = _classify_url(website)
-            feed_url = None
-            if stype == "substack":
-                parsed = urlparse(website)
-                feed_url = f"{parsed.scheme}://{parsed.netloc}/feed"
-            elif stype == "blog":
-                feed_url = _detect_rss_feed(website)
-            sources.append(DiscoveredSource(
-                source_type=stype,
-                url=_normalize_url(website),
-                feed_url=feed_url,
-            ))
+    stype = _classify_url(website)
+    # Skip X/Twitter self-links.
+    if stype and stype != "x":
+        feed_url = None
+        if stype == "substack":
+            parsed = urlparse(website)
+            feed_url = f"{parsed.scheme}://{parsed.netloc}/feed"
+        elif stype == "blog":
+            feed_url = _detect_rss_feed(website)
+        sources.append(DiscoveredSource(
+            source_type=stype,
+            url=_normalize_url(website),
+            feed_url=feed_url,
+        ))
 
-    # The OTHER homes the bio links to — a Substack, a podcast, a personal site. Already expanded
+    # The OTHER homes the bio links to — a Substack or a personal site. Already expanded
     # past t.co by `fetch_user_profile`.
     for expanded in data["bio_urls"]:
         if not expanded:
             continue
         expanded = _normalize_url(expanded)
         # Skip X/Twitter self-links
-        parsed = urlparse(expanded)
-        if parsed.netloc and ("twitter.com" in parsed.netloc or "x.com" in parsed.netloc):
-            continue
         stype = _classify_url(expanded)
+        if not stype or stype == "x":
+            continue
         feed_url = None
         if stype == "substack":
             parsed = urlparse(expanded)
@@ -302,20 +252,12 @@ def _probe_substack(username: str) -> list:
     return []
 
 
-def _resolve_substack_user_slug(seed: str) -> Optional[str]:
-    """A Substack seed → the user slug the public_profile API keys on.
-
-    A bare label is already a user slug (used as-is). A host/URL (custom-domain mint) is
-    resolved to its primary author's slug via the publication's ranked-users API. Returns
-    None on any miss — caller skips gracefully.
-    """
-    seed = (seed or "").strip()
-    if not seed:
+def _resolve_substack_user_slug(publication_url: str) -> Optional[str]:
+    """Resolve a publication URL to its primary author's public-profile slug."""
+    parsed = parse_url(publication_url)
+    if parsed is None:
         return None
-    if "." not in seed and "/" not in seed:
-        return seed                                      # already a user slug
-    host = urlparse(seed if "://" in seed else f"https://{seed}").netloc or seed
-    host = host.split("/")[0]
+    host = parsed.netloc
     try:
         resp = requests.get(
             f"https://{host}/api/v1/publication/users/ranked?public=true",
@@ -340,7 +282,7 @@ def _probe_substack_profile(seed: str) -> tuple[dict, list, list]:
 
     GETs the public profile (`/api/v1/user/{handle}/public_profile`, not the
     Cloudflare-hostile subscriber-lists API). `userLinks` are the person's own typed,
-    declared links (site / X / YouTube / …).
+    declared links (site / X / GitHub / …).
 
     Returns (profile_info, sources, identity_targets):
       profile_info:     {display_name, bio, website, root_url}
@@ -353,7 +295,9 @@ def _probe_substack_profile(seed: str) -> tuple[dict, list, list]:
     profile_info = {"display_name": "", "bio": "", "website": "", "root_url": ""}
     sources: list = []
     identity_targets: list = []
-    handle = _resolve_substack_user_slug(seed)
+    publication_url = _normalize_url(
+        seed if "." in seed or "/" in seed else f"{seed}.substack.com")
+    handle = _resolve_substack_user_slug(publication_url)
     if not handle:
         log(f"    Could not resolve a Substack user slug for {seed!r}")
         return profile_info, sources, identity_targets
@@ -377,8 +321,8 @@ def _probe_substack_profile(seed: str) -> tuple[dict, list, list]:
     # Use primaryPublication's {subdomain}.substack.com as the root (not the user-level
     # subdomainUrl, which is often null, or "substack.com/@{handle}", which collides across
     # users) — this canonicalizes to a unique node matching the Oracle's substack:{subdomain} id.
-    sub = (data.get("primaryPublication") or {}).get("subdomain") or handle
-    root_url = f"https://{sub}.substack.com"
+    sub = (data.get("primaryPublication") or {}).get("subdomain")
+    root_url = f"https://{sub}.substack.com" if sub else publication_url
     profile_info["root_url"] = root_url
 
     seen: set = set()
@@ -424,24 +368,34 @@ def _probe_substack_profile(seed: str) -> tuple[dict, list, list]:
     return profile_info, sources, identity_targets
 
 
-# Anchor links on a blog home that count as a declared own account (a typed identity edge → Rule 5).
-# Everything else (`_classify_url` defaults unknown hosts to "blog") is ignored as a random
-# outbound link, not an identity claim.
-_BLOG_IDENTITY_TYPES = frozenset({"x", "github", "substack", "linkedin", "youtube"})
+# Blog links to known account platforms remain ownership declarations (David, 2026-09-05).
+# The occasional mention of another person is an accepted tradeoff.
+#
+# Everything else used to be ignored as a random outbound link. That lost the person's actual
+# corpus: `_classify_url` defaults unknown hosts to "blog", so on karpathy.ai his own
+# `karpathy.github.io` (14 links), `karpathy.medium.com` and `karpathy.bearblog.dev` were never
+# considered, while a DIFFERENT person's repo was auto-trusted because it classified as `github`.
+# Since 2026-09-09 a non-platform host is admitted when it carries one of the person's identity
+# tokens — see `identity_tokens`, which holds the measurement. This set is now the FIRST of two
+# arms, not the whole rule.
+_BLOG_IDENTITY_TYPES = frozenset({"x", "github", "substack"})
 
 
 def _probe_blog_profile(seed: str) -> tuple[dict, list, list]:
     """ROOT probe for a blog-seeded person — the blog analog of `_probe_substack_profile`.
 
     `seed` is the blog home URL. GETs the home HTML: `<title>` is the display name, and any
-    anchor to a known identity platform (x / github / substack / linkedin / youtube) is a
+    anchor to a known identity platform (x / github / substack) is a
     self-declared own account → a typed IDENTITY edge (Rule 5, T1). The blog itself is added
     first as the self-rooted source. A JS-rendered home yields no server-side anchors — the
     blog still roots + ingests, just with no cross-platform links surfaced.
 
     Returns (profile_info, sources, identity_targets), platform-agnostic across x/substack/blog
     roots — the shape `discover_profile`'s dispatch feeds `_compute_trust`."""
-    seed_url = _normalize_url(seed if "://" in seed else f"https://{seed}")
+    seed_url = _normalize_url(seed)
+    root_cid = canonical_identity(seed_url)
+    if not root_cid:
+        return {}, [], []
     host = urlparse(seed_url).netloc
     profile_info = {"display_name": "", "bio": "", "website": seed_url, "root_url": seed_url}
     sources: list = []
@@ -456,8 +410,13 @@ def _probe_blog_profile(seed: str) -> tuple[dict, list, list]:
             html = resp.text or ""
         else:
             log(f"    Blog home returned status {resp.status_code} for {seed_url}")
+            return {}, [], []
     except Exception as e:
         log(f"    [error] Blog home probe failed: {e}")
+        return {}, [], []
+
+    if not html:
+        return {}, [], []
 
     # display_name from <title>, trimming a trailing " | Site" tail; falls back to the host.
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
@@ -469,19 +428,29 @@ def _probe_blog_profile(seed: str) -> tuple[dict, list, list]:
         profile_info["display_name"] = host
 
     # Add the blog itself first, as the self-rooted source.
-    root_cid = canonical_identity(seed_url)
-    seen: set = {root_cid} if root_cid else set()
+    seen: set = {root_cid}
     sources.append(DiscoveredSource(source_type="blog", url=seed_url,
                                     feed_url=_detect_rss_feed(seed_url)))
 
-    # Outbound anchors to KNOWN identity platforms → declared OWN accounts (Rule 5).
+    # Outbound anchors to a declared OWN account (Rule 5) — a known identity platform, or any
+    # other host that carries one of this person's identity tokens.
+    tokens = identity_tokens.tokens_for(seed_url, profile_info.get("display_name"))
     for href in set(re.findall(r'href=[\'"](https?://[^\'"]+)[\'"]', html, re.I)):
         url = _normalize_url(href)
+        stype = _classify_url(url)
+        if stype not in _BLOG_IDENTITY_TYPES:
+            # HOST match only, never a path match. `karpathy.github.io` is a whole site of his and
+            # becomes one source whose feed yields the posts; `cs.stanford.edu/people/karpathy/…`
+            # carries the token in its PATH, and promoting that would register all of Stanford CS
+            # as his site. Path-scoped work is `link_discovery`'s job, as a hub candidate.
+            if not identity_tokens.host_carries_token(url, tokens):
+                continue
+            # The HOME, not the deep link that revealed it: his 14 essays are one source, and the
+            # blog adapter discovers the rest of them from its sitemap/RSS.
+            parsed_home = urlparse(url)
+            url = f"{parsed_home.scheme}://{parsed_home.netloc}"
         cid = canonical_identity(url)
         if not cid or cid in seen:
-            continue
-        stype = _classify_url(url)
-        if stype not in _BLOG_IDENTITY_TYPES:            # skip the page's random outbound links
             continue
         seen.add(cid)
         identity_targets.append((cid, False))            # declared, not platform-verified
@@ -539,9 +508,8 @@ def _probe_github(username: str) -> list:
             blog = f"https://{blog}"
         blog = _normalize_url(blog)
         # Skip X/Twitter self-links
-        blog_domain = urlparse(blog).netloc.lower()
-        if "twitter.com" not in blog_domain and "x.com" not in blog_domain:
-            stype = _classify_url(blog)
+        stype = _classify_url(blog)
+        if stype and stype != "x":
             feed_url = None
             if stype == "substack":
                 parsed = urlparse(blog)
@@ -559,74 +527,6 @@ def _probe_github(username: str) -> list:
     return sources
 
 
-def _probe_semantic_scholar(display_name: str) -> list:
-    """Probe 4: Search Semantic Scholar for author by display name.
-
-    Semantic Scholar has a 100 req/5min rate limit. Retries on 429 with backoff.
-    """
-    if not display_name:
-        return []
-    log(f"  [probe] Semantic Scholar for '{display_name}'")
-
-    authors = None
-    for attempt in range(3):
-        try:
-            resp = requests.get(
-                f"{S2_BASE}/author/search",
-                params={
-                    "query": display_name,
-                    "fields": "name,url,paperCount,citationCount,hIndex",
-                    "limit": 5,
-                },
-                headers=_s2_headers(),     # S2_API_KEY when set — raises the rate limit
-                timeout=15,
-            )
-            if resp.status_code == 429:
-                wait = 5 * (attempt + 1)
-                log(f"    [rate-limit] 429 from Semantic Scholar, retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            authors = resp.json().get("data", [])
-            break
-        except Exception as e:
-            log(f"    [error] Semantic Scholar probe failed: {e}")
-            return []
-
-    if authors is None:
-        log(f"    [error] Semantic Scholar rate limit exceeded after 3 retries")
-        return []
-
-    if not authors:
-        log(f"    No authors found")
-        return []
-
-    # Pick the best match — prefer exact name match, then highest paper count
-    best = None
-    for a in authors:
-        if a.get("name", "").lower() == display_name.lower():
-            best = a
-            break
-    if not best:
-        best = max(authors, key=lambda a: a.get("paperCount", 0))
-
-    confidence = "high" if best.get("name", "").lower() == display_name.lower() else "medium"
-
-    log(f"    Found: {best.get('name')} — {best.get('paperCount', 0)} papers (confidence: {confidence})")
-    return [DiscoveredSource(
-        source_type="scholar",
-        url=best.get("url", f"https://www.semanticscholar.org/author/{best.get('authorId', '')}"),
-        metadata={
-            "author_id": best.get("authorId"),
-            "name": best.get("name"),
-            "paper_count": best.get("paperCount", 0),
-            "citation_count": best.get("citationCount", 0),
-            "h_index": best.get("hIndex"),
-        },
-        confidence=confidence,
-    )]
-
-
 def _sources_from_urls(urls) -> list:
     """Turn host-supplied URLs into typed CANDIDATE sources. Never raises.
 
@@ -640,16 +540,16 @@ def _sources_from_urls(urls) -> list:
         if not isinstance(raw, str) or not raw.strip():
             continue
         raw = raw.strip()
-        # classify_source prepends "https://" to a scheme-less string, so it is NOT a URL
-        # validator — this caller's input is generated text, so filter obvious non-URLs first.
+        # Host suggestions may be bare domains; reject prose before URL normalization.
         if any(c.isspace() for c in raw) or "." not in raw:
             continue
+        raw = _normalize_url(raw)
         pl = classify_source(raw)
-        # is_profile filters ARTIFACTS (e.g. a /watch link) — sources are accounts/homes only.
+        # is_profile filters artifacts (e.g. a repository) — sources are accounts/homes only.
         if not pl or not pl.is_profile:
             continue
-        # X/GitHub are already covered by probes 1 and 3; papers aren't footprint.
-        if pl.type in ("x", "github", "scholar", "orcid", "paper"):
+        # X uses the confirmed root; academic collection is a separate handoff.
+        if pl.type in ("x", "scholar", "orcid", "paper"):
             continue
         out.append(DiscoveredSource(
             source_type=pl.type,
@@ -658,10 +558,6 @@ def _sources_from_urls(urls) -> list:
             metadata={"found_by": "host_web_search", "shape": pl.shape, "handle": pl.handle},
         ))
     return out
-
-
-# Open-web discovery does not happen here — a known gap, not an oversight; see
-# docs/plans/2026-08-16-cold-start-anchor-as-built.md for why it stays open.
 
 
 def _dedupe_sources(sources: list) -> list:
@@ -676,16 +572,16 @@ def _dedupe_sources(sources: list) -> list:
     return deduped
 
 
-# ── Trust cache: skip expensive re-discovery when the X profile is unchanged ──
+# ── Trust cache: reuse discovery while the seed profile is unchanged ──
 
 TRUST_CACHE_TTL_DAYS = 30
 
 
-def _x_snapshot_hash(display_name: str, bio_url_ids: list[str]) -> str:
-    """Fingerprint the trust-relevant X profile state (display name + declared URLs) so a
-    change forces re-discovery and an unchanged profile can reuse the cached verdict.
+def _snapshot_hash(display_name: str, identity_ids: list[str]) -> str:
+    """Fingerprint the seed name, canonical root and declared account IDs so a change
+    forces re-discovery. Unchanged profiles can reuse results until the cache TTL.
     """
-    raw = (display_name or "") + "||" + "|".join(sorted(bio_url_ids))
+    raw = (display_name or "") + "||" + "|".join(sorted(identity_ids))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -699,7 +595,7 @@ def _get_cached_trust(username: str, snapshot: str, cfg) -> Optional[dict]:
     except (json.JSONDecodeError, OSError):
         return None
     entry = cache.get(username)
-    if not entry or entry.get("x_snapshot_hash") != snapshot:
+    if not entry or entry.get("snapshot_hash") != snapshot:
         return None
     ts = entry.get("evaluated_at")
     if ts:
@@ -709,7 +605,10 @@ def _get_cached_trust(username: str, snapshot: str, cfg) -> Optional[dict]:
                 return None
         except (ValueError, TypeError):
             return None  # unparseable timestamp → treat as stale
-    return entry.get("result")
+    result = entry.get("result")
+    if result and any(not canonical_identity(s["url"]) for s in result["sources"]):
+        return None  # a persisted source is no longer an eligible identity
+    return result
 
 
 def _save_cached_trust(username: str, snapshot: str, result: dict, cfg) -> None:
@@ -721,7 +620,7 @@ def _save_cached_trust(username: str, snapshot: str, result: dict, cfg) -> None:
         except (json.JSONDecodeError, OSError):
             cache = {}
     cache[username] = {
-        "x_snapshot_hash": snapshot,
+        "snapshot_hash": snapshot,
         "evaluated_at": utc_now().isoformat(),
         "result": result,
     }
@@ -730,11 +629,6 @@ def _save_cached_trust(username: str, snapshot: str, result: dict, cfg) -> None:
 
 
 # ── Hub expansion: let a TRUSTED blog/Substack surface the Oracle's own profiles ──
-
-# A trusted, self-curated hub page can surface at most this many NEW candidate
-# profiles — a hard bound so a link-heavy page can't blow up the graph.
-MAX_NEW_HUB_CANDIDATES = 15
-
 
 def _known_handles(username: str, all_sources: list, verdicts: dict) -> set[str]:
     """Normalized handles the Oracle demonstrably owns: their X username + the
@@ -762,13 +656,13 @@ def _expand_from_trusted_hubs(
 ) -> dict:
     """Grow the trust graph from ALREADY-TRUSTED hubs, then re-propagate.
 
-    A trusted, self-curated blog/Substack surfaces the Oracle's other accounts as NEW candidate
-    nodes + `hub→id` edges; re-runs all 4 rules over the expanded graph, then applies an
+    A trusted, self-curated blog/Substack links to the Oracle's other accounts. Both existing
+    and new candidates receive `hub→id` edges; re-runs the trust rules over the expanded graph, then applies an
     ADDITIVE handle-match layer that auto-trusts a surfaced namesake the graph itself didn't
     reach (Decision 1, 4).
 
-    Bounded: trusted hubs only, single hop, one-profile-per-platform, dedup,
-    MAX_NEW_HUB_CANDIDATES. Fail-safe: any fetch/parse error makes this a no-op.
+    Bounded: trusted hubs only, single hop, one profile per platform, dedup.
+    Fail-safe: any fetch/parse error makes this a no-op.
     """
     def _trusted(u: str) -> bool:
         ev = verdicts.get(canonical_identity(u))
@@ -783,9 +677,9 @@ def _expand_from_trusted_hubs(
     # Decision 5 — one profile per platform. Seed with platforms already trusted.
     seen_types = {s.source_type for s in all_sources if _trusted(s.url)}
 
-    added = 0
     n_edges_before = len(edges)
     surfaced: list = []
+    existing = {canonical_identity(s.url): s for s in all_sources}
 
     for hub in hubs:
         hub_cid = canonical_identity(hub.url)
@@ -803,31 +697,27 @@ def _expand_from_trusted_hubs(
             if pl.type not in PROFILE_SCOPE or not pl.is_profile:
                 continue
             cid = canonical_identity(pl.url)
-            if not cid or cid in relevant or pl.type in seen_types:
+            if not cid or pl.type in seen_types:
                 continue                                # dedup / stop-when-found
-            if added >= MAX_NEW_HUB_CANDIDATES:
-                break
             relevant.add(cid)
             edges.append(Edge(hub_cid, cid, via="hub_link", found_by="hub"))
-            src = DiscoveredSource(
-                source_type=pl.type,
-                url=pl.url,
-                confidence="medium",
-                metadata={"discovered_via": "blog_hub", "hub": hub.url,
-                          "shape": pl.shape, "handle": pl.handle},
-            )
-            all_sources.append(src)      # flows to discovery output + Phase D ingest
+            src = existing.get(cid)
+            if src is None:
+                src = DiscoveredSource(source_type=pl.type, url=pl.url, confidence="medium")
+                all_sources.append(src)
+                existing[cid] = src
+            src.metadata.update({"discovered_via": "blog_hub", "hub": hub.url,
+                                 "shape": pl.shape, "handle": pl.handle})
             surfaced.append(src)
             seen_types.add(pl.type)      # one profile per platform across the whole pass
-            added += 1
 
-    if added == 0 and len(edges) == n_edges_before:
+    if not surfaced and len(edges) == n_edges_before:
         return verdicts                  # nothing surfaced → unchanged
 
     # Re-propagate over the EXPANDED graph — a surfaced profile that also links
     # back graduates by Rule 2/3 with no special-casing.
     verdicts = propagate(edges, x_attested, candidates=relevant)
-    log(f"  [expand] surfaced {added} candidate(s) from {len(hubs)} trusted hub(s); re-propagated")
+    log(f"  [expand] surfaced {len(surfaced)} candidate(s) from {len(hubs)} trusted hub(s); re-propagated")
 
     # Additive auto-trust for surfaced candidates the graph can't reach. Only ever
     # PROMOTES a not-yet-trusted, non-org surfaced candidate — two layers:
@@ -896,7 +786,6 @@ def _compute_trust(
     seed_label: str,
     root_id: str,
     identity_targets: list,
-    profile_info: dict,
     github_sources: list,
     all_sources: list,
     skip_edge_fetch: bool = False,
@@ -953,8 +842,6 @@ def _compute_trust(
                 if sid:
                     edges += fetch_landing_edges(sid, s.url, relevant)
 
-    # Dedupe edges by (source, target); keep first occurrence's metadata.
-    edges = list({(e.source, e.target): e for e in edges}.values())
     if edges:
         log(f"  [trust] {len(edges)} edges, root {root_id}")
     # Pass `relevant` as candidates so EVERY discovered source is evaluated and
@@ -978,23 +865,23 @@ def discover_profile(
     config: StatePaths | None = None,
     skip_edge_fetch: bool = False,
     reverify: bool = False,
-    probe_scholar: bool = True,
     seed_type: str = "x",
     extra_source_urls: list[str] | None = None,
 ) -> dict:
     """
     Discover all content sources for a credible person, ROOTED at a confirmed seed
-    profile — an X handle (`seed_type="x"`) OR a Substack handle (`seed_type="substack"`).
+    profile — X (`seed_type="x"`), Substack (`seed_type="substack"`), or a blog URL
+    (`seed_type="blog"`).
     The trust graph is platform-agnostic: a Substack-only person is rooted at their
     Substack, with no X anywhere in the graph.
 
     Probe 1 resolves the ROOT profile + its declared identity links; the remaining
-    deterministic probes (Substack-convention, GitHub, Scholar) run on the discovered
-    name/handle. There is NO open-web step — see the module docstring.
+    deterministic probes (Substack-convention, GitHub) run on the discovered name/handle.
+    There is NO open-web step — see the module docstring.
 
     Args:
-        username: the seed handle — X handle (no @) or Substack user handle.
-        seed_type: "x" or "substack" — which platform the seed profile lives on.
+        username: the seed handle for X/Substack, or the blog home URL.
+        seed_type: "x", "substack", or "blog" — the confirmed root platform.
         skip_trust_cache_write: suppress the invalidation-keyed trust-cache WRITE. Reads are
             unaffected; only `reverify` skips those.
         extra_source_urls: Probe 5's return leg — URLs the HOST model found by web search.
@@ -1002,12 +889,6 @@ def discover_profile(
             any other source; none is trusted on the host's say-so. Junk is dropped silently.
             See `_sources_from_urls`.
         reverify: force re-discovery, ignoring the trust cache
-        probe_scholar: run Probe 4 (Semantic Scholar author lookup). Default True. The atom-KB
-            footprint expansion (pipeline.kb.expand) sets this False — it never ingests papers as
-            Oracle footprint (papers aren't footprint), so a `scholar` source would only be
-            discovered to be discarded, at the cost of a live API call per person. Scholar feeds
-            NO trust edges (only identity/github/substack/blog do), so skipping it can't weaken
-            trust-rooting. Every OTHER caller (vault add_person, radar, setup) keeps it on.
 
     Returns:
         dict with: username, display_name, bio, website, sources[], discovered_at
@@ -1048,12 +929,12 @@ def discover_profile(
     display_name = profile_info.get("display_name", "")
     bio = profile_info.get("bio", "")
 
-    # Trust cache: if the seed profile (name + declared links) is unchanged and fresh, reuse
+    # Trust cache: if the seed profile (name + canonical root + declared links) is unchanged and fresh, reuse
     # the cached result and skip the expensive probes. Key namespaced for non-X seeds so an X
     # handle and a Substack handle sharing a string don't collide.
     cache_key = username if seed_type == "x" else f"{seed_type}:{username}"
     root_link_ids = [t for t, _ in identity_targets]
-    snapshot = _x_snapshot_hash(display_name, root_link_ids)
+    snapshot = _snapshot_hash(display_name, [root_id, *root_link_ids])
     # extra_source_urls bypasses the cache: the snapshot key fingerprints the profile, not
     # URLs the host just found, so a hit would silently discard the host's whole search.
     if not reverify and not extra_source_urls:
@@ -1073,37 +954,6 @@ def discover_profile(
     github_sources = [] if seed_type == "blog" else _probe_github(username)
     all_sources.extend(github_sources)
 
-    # Probe 4: Semantic Scholar — try display_name, then GitHub name as fallback.
-    if probe_scholar:
-        scholar_name_candidates = []
-        if display_name:
-            # Strip emoji and special chars for Scholar search
-            import re as _re
-            clean_name = _re.sub(r'[^\w\s\'-]', '', display_name).strip()
-            if clean_name:
-                scholar_name_candidates.append(clean_name)
-        # GitHub often has a cleaner real name than X display name
-        for s in github_sources:
-            gh_name = s.metadata.get("name")
-            if gh_name and gh_name not in scholar_name_candidates:
-                scholar_name_candidates.append(gh_name)
-
-        scholar_found = False
-        for name_candidate in scholar_name_candidates:
-            # Skip names that look like handles/aliases (contain dots, @, are single words)
-            if "." in name_candidate or "@" in name_candidate:
-                continue
-            results = _probe_semantic_scholar(name_candidate)
-            if results:
-                all_sources.extend(results)
-                scholar_found = True
-                break
-
-        if not scholar_found and not scholar_name_candidates:
-            log(f"  [skip] Semantic Scholar — no display name available")
-    else:
-        log("  [skip] Semantic Scholar — disabled (probe_scholar=False; papers aren't footprint)")
-
     # ── Probe 5 — open-web discovery, CO-ROUTED to the host model ────────────────────────────
     # The host model does the FINDING (web search) via `extra_source_urls`; this module does the
     # JUDGING. Appended last: `_dedupe_sources` keeps the first (type, url) occurrence, so a
@@ -1118,19 +968,9 @@ def discover_profile(
     # Dedupe and build profile
     all_sources = _dedupe_sources(all_sources)
 
-    # Break ① — a discovered YouTube URL is usually a watch/playlist link, but the
-    # ingester (and trust identity) need the CHANNEL. Resolve before trust runs.
-    if not skip_edge_fetch:
-        from pipeline.ingestion.url_canon import resolve_channel_url
-        for s in all_sources:
-            if s.source_type == "youtube":
-                channel = resolve_channel_url(s.url)
-                if channel:
-                    s.url = _normalize_url(channel)
-
     # ── Owner validation: trust via graph reachability ───────────────────────
     verdicts = _compute_trust(
-        username, root_id, identity_targets, profile_info, github_sources, all_sources,
+        username, root_id, identity_targets, github_sources, all_sources,
         skip_edge_fetch=skip_edge_fetch,
     )
     _NEEDS_REVIEW = TrustEvidence(
@@ -1139,7 +979,6 @@ def discover_profile(
     for s in all_sources:
         ev = verdicts.get(canonical_identity(s.url), _NEEDS_REVIEW)
         s.trust = ev
-        s.evidence_edges = ev.edges
 
     profile = DiscoveredProfile(
         username=username,
@@ -1150,17 +989,9 @@ def discover_profile(
         discovered_at=utc_now().isoformat(),
     )
 
-    # Save to state (discovery output + the invalidation-keyed trust cache).
-    sf = cfg.state_file("discovered_profiles")
-    profiles = _load_discovered(sf)
-    profiles[cache_key] = asdict(profile)
-    _save_discovered(profiles, sf)
-
     result = asdict(profile)
     # A degraded run (skip_edge_fetch → fewer edges, weaker verdicts) must not poison the cache
-    # for later full runs. skip_trust_cache_write stays True for the ingest path deliberately:
-    # letting ingest populate the cache would flip re-ingest to skip discovery, an out-of-scope
-    # behavior change.
+    # for later full runs. The CLI can also explicitly suppress cache writes.
     if not skip_trust_cache_write and not skip_edge_fetch:
         _save_cached_trust(cache_key, snapshot, result, cfg)
 
@@ -1181,41 +1012,3 @@ def discover_profile(
 
 # This module only discovers accounts; it does not pull content. Routing a discovered source
 # to its atom adapter is `pipeline/kb/expand.py` + `onboard_footprint.py`. Keep the halves apart.
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Discover content sources for a credible person"
-    )
-    parser.add_argument("--username", required=True, help="X handle (no @)")
-    parser.add_argument("--skip-trust-cache-write", action="store_true",
-                        help="Do not write the trust cache for this run (reads are unaffected; "
-                             "use --reverify to ignore an existing entry)")
-    parser.add_argument("--show-untrusted", action="store_true",
-                        help="Print the needs-review partition with trust reasons")
-    parser.add_argument("--skip-edge-fetch", action="store_true",
-                        help="Skip landing-page fetches for trust edges (faster, fewer edges)")
-    parser.add_argument("--reverify", action="store_true",
-                        help="Force re-discovery, ignoring the trust cache")
-
-    args = parser.parse_args()
-
-    # This CLI only DISCOVERS. Ingesting a discovered person is the atom rail's job
-    # (`pipeline/kb/expand.py`) — do not add ingest-side flags here.
-    result = discover_profile(
-        username=args.username,
-        skip_trust_cache_write=args.skip_trust_cache_write,
-        skip_edge_fetch=args.skip_edge_fetch,
-        reverify=args.reverify,
-    )
-
-    if args.show_untrusted:
-        review = [s for s in result.get("sources", [])
-                  if not (s.get("trust") or {}).get("trusted")]
-        print(f"\n── Needs review ({len(review)}) " + "─" * 40)
-        for s in review:
-            reasons = (s.get("trust") or {}).get("reasons") or []
-            why = reasons[0] if reasons else ""
-            print(f"  {s['source_type']:10} {s['url']}  — {why}")
-        print()
-
-    print(json.dumps(result, indent=2, default=str))

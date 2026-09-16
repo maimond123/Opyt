@@ -71,20 +71,27 @@ def _atom_evidence(hit, *, limit: int = 240) -> dict:
 
 def search_saved_atoms(conn: sqlite3.Connection, query: str, embedder, *,
                        who_ids: set[str], k: int = DEFAULT_K,
-                       evidence: int = DEFAULT_EVIDENCE) -> list[dict]:
+                       evidence: int = DEFAULT_EVIDENCE,
+                       person_by_who: dict[str, str] | None = None) -> list[dict]:
     """Candidates whose SAVED atoms best match `query`, each with its strongest passages.
 
     The trusted-corpus mirror of `probe_search.search_candidates`: same hybrid shape (BM25 +
     vector), same per-ACCOUNT fusion, same RRF constant — so the two arms produce comparable
     WITHIN-arm rankings even though their scores are never added.
 
-    An empty query returns accounts by recency of saved content, matching the probe arm's
+    `person_by_who` collapses already-resolved platform identities into one person before ranking.
+    An empty query returns those people by recency of saved content, matching the probe arm's
     "show me who's here" opening call.
     """
     from . import retrieve
 
     if not who_ids:
         return []
+    person_by_who = person_by_who or {}
+
+    def person(who_id: str) -> str:
+        return person_by_who.get(who_id, who_id)
+
     # `who_id=` is an explicit author set: an empty list matches nothing, never everything.
     pool = retrieve.candidate_atom_ids(conn, None, None, None, who_id=sorted(who_ids))
     if not pool:
@@ -95,9 +102,17 @@ def search_saved_atoms(conn: sqlite3.Connection, query: str, embedder, *,
             "SELECT who_id, MAX(when_ts) AS last_ts, COUNT(*) AS n FROM atoms "
             "WHERE atom_id IN (%s) GROUP BY who_id" % ",".join("?" * len(pool)),
             sorted(pool)).fetchall()
-        ranked = sorted(rows, key=lambda r: (r["last_ts"] or ""), reverse=True)[:k]
-        return [{"who_id": r["who_id"], "atoms": r["n"], "last_ts": r["last_ts"],
-                 "match_score": 0.0, "evidence": []} for r in ranked]
+        grouped: dict[str, dict] = {}
+        for r in rows:
+            entry = grouped.setdefault(person(r["who_id"]),
+                                       {"atoms": 0, "last_ts": None})
+            entry["atoms"] += r["n"]
+            if (r["last_ts"] or "") > (entry["last_ts"] or ""):
+                entry["last_ts"] = r["last_ts"]
+        ranked = sorted(grouped.items(), key=lambda item: item[1]["last_ts"] or "",
+                        reverse=True)[:k]
+        return [{"who_id": who_id, **row, "match_score": 0.0, "evidence": []}
+                for who_id, row in ranked]
 
     # Widened `k` on each arm: these are ATOM ranks, and one account can own several of the top
     # atoms, so an account-level top-k needs more atom-level room than k to fill from.
@@ -107,17 +122,20 @@ def search_saved_atoms(conn: sqlite3.Connection, query: str, embedder, *,
     for arm in (retrieve.atom_bm25_search(conn, query, pool, span),
                 retrieve.atom_semantic_search(conn, query, embedder, pool, span)):
         for rank, hit in enumerate(arm):
-            w = hit.who_id
-            if not w:
+            if not hit.who_id:
                 continue
+            w = person(hit.who_id)
             # RRF over the ACCOUNT, accumulating across its atoms rather than pinning it to its
             # single best one — the same rule the probe arm uses, so the two ranks mean the same.
             scored[w] = scored.get(w, 0.0) + 1.0 / (60 + rank)
             passages.setdefault(w, []).append(_atom_evidence(hit))
 
-    counts = dict(conn.execute(
-        "SELECT who_id, COUNT(*) FROM atoms WHERE atom_id IN (%s) GROUP BY who_id"
-        % ",".join("?" * len(pool)), sorted(pool)).fetchall())
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT who_id, COUNT(*) AS n FROM atoms WHERE atom_id IN (%s) GROUP BY who_id"
+        % ",".join("?" * len(pool)), sorted(pool)):
+        w = person(row["who_id"])
+        counts[w] = counts.get(w, 0) + row["n"]
     out = []
     for w in sorted(scored, key=lambda x: scored[x], reverse=True)[:k]:
         seen, ev = set(), []
@@ -186,8 +204,12 @@ def candidates_payload(conn: sqlite3.Connection, query: str, embedder, *,
     from . import candidate_probe, screen
 
     # Identity for every candidate, whether or not probed, sourced from the SCREEN ranking the
-    # user has already seen.
+    # user has already seen. Saved writing is keyed on every resolved platform identity; probing
+    # stays keyed on the candidate's one X identity.
     ident: dict[str, dict] = {}
+    members_by_person: dict[str, list[str]] = {}
+    x_person: dict[str, str] = {}
+    saved_person: dict[str, str] = {}
     # Retired count is surfaced, never silently dropped, so a list that shrank is distinguishable
     # from one that never had those candidates.
     ranked = screen.rank_candidates(conn, include_retired=True)
@@ -195,39 +217,53 @@ def candidates_payload(conn: sqlite3.Connection, query: str, embedder, *,
     for cand in ranked:
         if cand.retired:
             continue
-        uid = candidate_probe._x_user_id(cand.members)
-        if not uid:
-            continue
-        ident[f"x:user:{uid}"] = {
+        who_id = f"x:user:{uid}" if (uid := candidate_probe._x_user_id(cand.members)) \
+            else cand.canonical_id
+        ident[cand.canonical_id] = {
+            "who_id": who_id,
             "canonical_id": cand.canonical_id, "name": cand.name, "handle": cand.handle,
             "distinct_signals": cand.distinct_signals,
             "is_oracle": schema.is_oracle(conn, cand.canonical_id)}
+        members_by_person[cand.canonical_id] = cand.members
 
-    eligible = {w for w, i in ident.items()
+    eligible = {who_id for who_id, i in ident.items()
                 if i["distinct_signals"] >= min_signals and not i["is_oracle"]}
+    for who_id in eligible:
+        uid = candidate_probe._x_user_id(members_by_person[who_id])
+        if uid:
+            x_person[f"x:user:{uid}"] = who_id
+        for member in members_by_person[who_id]:
+            saved_person[member] = who_id
 
     # Both arms are asked for a FULL k. The interleave decides the final cut, so neither arm may
     # pre-truncate itself on a guess about how many slots it will win.
     probed_hits = probe_search.search_candidates(conn, query, embedder, k=k, evidence=evidence,
-                                                 who_ids=eligible)
-    saved_hits = search_saved_atoms(conn, query, embedder, who_ids=eligible, k=k,
-                                    evidence=evidence)
+                                                 who_ids=set(x_person))
+    probed_hits = [{**hit, "who_id": x_person[hit["who_id"]]} for hit in probed_hits
+                   if hit["who_id"] in x_person]
+    saved_hits = search_saved_atoms(conn, query, embedder, who_ids=set(saved_person), k=k,
+                                    evidence=evidence, person_by_who=saved_person)
     for h in probed_hits:
         for p in h.get("evidence", []):
             p["provenance"] = _PROVENANCE["probed"]
 
     states = probe_store.pull_states(conn)
+    states_by_person = {person: states[who_id] for who_id, person in x_person.items()
+                        if who_id in states}
     rows = []
     for h in _interleave(probed_hits, saved_hits, k):
-        w = h["who_id"]
-        st = states.get(w, {})
-        rows.append({**ident.get(w, {}), **h,
+        who_id = h["who_id"]
+        st = states_by_person.get(who_id, {})
+        rows.append({**h, **ident[who_id],
                      "probed_at": st.get("pulled_at"), "pull_status": st.get("status")})
 
-    probed = set(probe_store.probed_who_ids(conn))
-    fresh = probe_store.fresh_who_ids(
+    probed = {x_person[who_id] for who_id in probe_store.probed_who_ids(conn)
+              if who_id in x_person}
+    fresh = {x_person[who_id] for who_id in probe_store.fresh_who_ids(
         conn, ttl_days=ttl_days if ttl_days is not None else candidate_probe.DEFAULT_TTL_DAYS)
-    with_atoms = {r[0] for r in conn.execute("SELECT DISTINCT who_id FROM atoms")}
+             if who_id in x_person}
+    with_atoms = {saved_person[row[0]] for row in conn.execute("SELECT DISTINCT who_id FROM atoms")
+                  if row[0] in saved_person}
     no_material = eligible - probed - with_atoms
     note = _coverage_note(len(no_material), len(eligible))
     return {

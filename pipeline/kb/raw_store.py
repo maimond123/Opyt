@@ -11,10 +11,16 @@ above it just asks for an atom's text.) Two reasons the files are NOT the vault 
   2. `kb_raw/` is the KB's own private store — its lifecycle is the atom's, not the
      vault's.
 
-`raw_ref` is stored in the DB relative to `opyt_home()` (e.g. `kb_raw/x/x_123.md`),
-never absolute — so the store is distributable (no hardcoded home path; Risk: the
-Distributable invariant). `resolve_ref()` rehydrates it against the CURRENT home, so a
-copied `~/.opyt` still finds its snapshots.
+`raw_ref` is stored in the DB relative to `opyt_home()` (e.g.
+`kb_raw/x/x_123_1a2b3c4d5e6f7081.md`), never absolute — so the store is distributable
+(no hardcoded home path; Risk: the Distributable invariant). `resolve_ref()` rehydrates
+it against the CURRENT home, so a copied `~/.opyt` still finds its snapshots.
+
+The ref stored on an atom is authoritative, and `write_snapshot` alone derives filenames,
+so a change to `_safe_name` needs no reader fallback and no rekey pass: existing atoms keep
+reading the files they already name, and each one moves to the new name the next time its
+source actually changes, leaving its old file orphaned under `kb_raw/`. Those orphans are
+inert — nothing lists the directory to find an atom's body.
 
 `raw_hash = sha256(snapshot)` is the idempotency + change key: identical raw → same
 hash → the ingester skips (no re-embed, no re-write). A changed source → new hash →
@@ -37,13 +43,32 @@ def snapshot_hash(markdown: str) -> str:
     return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
 
 
+# How much of the readable prefix survives into the basename. 96 + `_` + 16 hex + `.md` stays far
+# under the 255-BYTE filename limit even when every kept character is multi-byte UTF-8.
+_NAME_PREFIX_CHARS = 96
+
+
 def _safe_name(key: str) -> str:
-    """`atom_id` → a filesystem-safe basename. `x:123` → `x_123`,
-    `github:owner/name` → `github_owner_name`. Deterministic (idempotent overwrite)."""
-    out = []
-    for ch in key:
-        out.append(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_")
-    return "".join(out)
+    """`atom_id` → a filesystem-safe basename that is UNIQUE per atom_id and stable across runs.
+
+    A readable prefix plus a digest of the WHOLE key: `x:123` → `x_123_a2c1…`,
+    `github:owner/name` → `github_owner_name_9f04…`. Both halves are load-bearing.
+
+    The digest is what makes the map injective, and injectivity is the correctness property, not a
+    nicety: `raw_ref` is the only pointer from an atom to its real text, so two atom_ids sharing a
+    filename means the second write silently replaces the body the first atom still points at —
+    while its `raw_hash`, computed on the string before the write, keeps describing the body that
+    is now gone. The prefix-only version had exactly that shape: every separator collapsed to `_`,
+    and blog atom_ids preserve the URL path, so `blog:example.com/a/b` and `blog:example.com/a:b`
+    both landed on `blog_example.com_a_b.md`.
+
+    The prefix is what keeps `kb_raw/` greppable by hand, and the length cap is why it is a digest
+    rather than a percent-encoding of the key: a blog atom_id is `blog:{host}{path}[?query]`, whose
+    encoded form has no bound and can exceed the filesystem's 255-byte limit on one name.
+    """
+    prefix = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_"
+                     for ch in key[:_NAME_PREFIX_CHARS])
+    return f"{prefix}_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def kb_raw_dir(source: str) -> Path:

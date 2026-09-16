@@ -13,21 +13,18 @@ Likes tab private in June 2024 (served only to the owner's own authenticated ses
 reading your own likes requires the same GraphQL cookie-scrape path as x_lists.py.
 
 Likes is a plain tweet timeline (like Bookmarks): walk it, take each unique liked tweet's
-AUTHOR, count how many of your likes that author earned (`liked_count`), write the
-candidate signal. Output: state/candidate_signals_x_likes.json.
+AUTHOR, and count how many of your likes that author earned (`liked_count`).
+`ingest_curation.sync_likes_signals` stores these author signals in the KB.
 
 Response shape: op `Likes`, root `data.user.result.timeline.timeline` (not `timeline_v2`),
-tweet entries at `content.itemContent.tweet_results.result` — see
+tweet entries at `content.itemContent.tweet_results.result`.
 """
 
-import argparse
 import json
-import time
-from pathlib import Path
 
 from pipeline.ingestion import x_graphql_core as core
 from pipeline.ingestion import x_lists as xlists   # reuse _normalize_user + the feature bundle
-from pipeline.ingestion.utils import log, SyncAuthError
+from pipeline.ingestion.utils import log
 
 LIKES_OP = "Likes"
 
@@ -36,7 +33,6 @@ LIKES_OP = "Likes"
 DEFAULT_LIKES_QID = ""
 
 _DISCOVER_PAGE = "https://x.com/home"   # any authed page harvests the shared JS bundles
-_REFERER = "https://x.com/i/likes"
 DEFAULT_PAGE_SIZE = 100
 
 # X timelines hand back a FRESH bottom cursor on every page forever (the infinite
@@ -155,11 +151,7 @@ def fetch_liked_authors(viewer_id: str, cookies: dict, headers: dict) -> list[di
     return authors
 
 
-# ── Aggregate + write the signal ──────────────────────────────────────────────────────
-
-def _signal_path(config=None) -> Path:
-    from pipeline.config import state_paths
-    return (config or state_paths()).state_file("candidate_signals_x_likes")
+# ── Aggregate author signals ──────────────────────────────────────────────────────────
 
 
 def aggregate_authors(authors: list[dict], viewer_id: str) -> list[dict]:
@@ -178,63 +170,3 @@ def aggregate_authors(authors: list[dict], viewer_id: str) -> list[dict]:
         rec["liked_count"] += 1
     return sorted(by_user.values(),
                   key=lambda c: (-c["liked_count"], c["handle"].lower()))
-
-
-def sync_likes(profile: str | None = None, dry_run: bool = False,
-               config=None) -> dict:
-    """Pull the viewer's liked-tweet authors → deduped candidate signal. Raises
-    SyncAuthError if the session is dead (caller records a broken source, never a silent
-    0). Fail-safe: no twid → skip (likes are viewer-scoped; without the viewer id there's
-    nothing to scope to)."""
-    cookies = core.read_x_cookies(profile=profile)
-    vid = core.viewer_id(cookies)
-    if not vid:
-        log("[x-likes] twid cookie missing — likes are viewer-scoped and can't be read "
-            "without the viewer id; skipping (fail-safe, no crash).")
-        return {"liked_tweets": 0, "candidates": 0, "skipped": "no_viewer_id"}
-
-    headers = core.auth_headers(cookies, referer=_REFERER)
-    authors = fetch_liked_authors(vid, cookies, headers)
-    log(f"[x-likes] {len(authors)} liked tweet(s) with an extractable author")
-
-    candidates = aggregate_authors(authors, vid)
-    result = {"liked_tweets": len(authors), "candidates": len(candidates)}
-
-    if dry_run:
-        log(f"[x-likes] DRY RUN — {len(candidates)} candidate(s); not writing.")
-        for c in candidates[:15]:
-            log(f"    @{c['handle']:<20} liked×{c['liked_count']}  "
-                f"({c['followers_count']} followers)")
-        result["preview"] = candidates[:15]
-        return result
-
-    payload = {
-        "signal": "x_liked_author",
-        "viewer_id": vid,
-        "captured_at": int(time.time()),
-        "candidates": candidates,
-    }
-    path = _signal_path(config)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    log(f"[x-likes] wrote {len(candidates)} candidate(s) → {path}")
-    result["written"] = len(candidates)
-    result["path"] = str(path)
-    return result
-
-
-def _cli() -> None:
-    ap = argparse.ArgumentParser(description="Ingest the authors of the user's X likes "
-                                             "as a candidate signal.")
-    ap.add_argument("--profile", help="Chrome profile dir / browser key (else auto-pick)")
-    ap.add_argument("--dry-run", action="store_true", help="Print candidates, do not write")
-    args = ap.parse_args()
-    try:
-        out = sync_likes(profile=args.profile, dry_run=args.dry_run)
-        log(f"[x-likes] done: {json.dumps({k: v for k, v in out.items() if k != 'preview'})}")
-    except SyncAuthError as e:
-        log(f"[x-likes] NOT LOGGED IN / session dead: {e}")
-        raise SystemExit(2)
-
-
-if __name__ == "__main__":
-    _cli()

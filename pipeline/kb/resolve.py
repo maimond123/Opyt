@@ -8,8 +8,6 @@ be the same human. Stage-3 links same-person rows into one canonical entity by w
 Merge rule: two entities merge iff one's `attests` URL set hits the other's `self` set, or they
 share a `self` (union-find). Never merge on shared `attests` alone — that's the squatter defense.
 `canonical_id` is fully recomputed from `identity_links` on every run; no evidence table.
-
-Full per-platform self/attests semantics, known v1 limitations, and storage rationale:
 """
 
 from __future__ import annotations
@@ -27,7 +25,17 @@ from . import schema
 
 # Platforms whose stored `identity_links` IS the entity's own home, so the link counts as `self`
 # rather than `attests`.
-_SELF_PLATFORMS = frozenset({"substack", "blog", "youtube", "site"})
+_SELF_PLATFORMS = frozenset({"substack", "blog", "site", "scholar", "openalex"})
+
+# The scholar platforms are in that set with a RESTRICTION, applied in `_url_sets`: only an ORCID
+# counts as their `self`. Nobody can claim another person's ORCID — the same uniqueness property
+# `blog_entity_id`'s docstring requires of a blog host — while two researchers in one department
+# share an institution URL and would false-merge on it. Without the restriction the safety of the
+# merge would depend on every distant writer being disciplined about what it puts in
+# `identity_links`, which is the kind of implicit invariant that breaks the first time someone
+# adds a lab page.
+_SCHOLAR_PLATFORMS = frozenset({"scholar", "openalex"})
+_ORCID_PREFIX = "orcid.org/"
 
 
 def _url_sets(entity_id: str, identity_links) -> tuple[frozenset, frozenset]:
@@ -39,6 +47,12 @@ def _url_sets(entity_id: str, identity_links) -> tuple[frozenset, frozenset]:
     canon = frozenset(
         c for c in (canonical_identity(u) for u in (identity_links or [])) if c
     )
+    if platform in _SCHOLAR_PLATFORMS:
+        # ORCID only as `self`; anything else the entity carries is an outbound attestation. This
+        # is what lets `openalex:A5043841592` and `scholar:2081297` merge into one person while an
+        # institution page shared by two researchers merges nobody.
+        selfs = frozenset(c for c in canon if c.startswith(_ORCID_PREFIX))
+        return selfs, canon - selfs
     if platform in _SELF_PLATFORMS:
         return canon, frozenset()      # a footprint source's stored link IS its home
     return frozenset(), canon          # X (and any outbound-storing platform): attests only
@@ -186,36 +200,10 @@ def resolve_entities(conn, *, dry_run: bool = False) -> ResolveStats:
     mapping = _components(entities)
     if not dry_run and mapping:
         schema.set_canonical_ids(conn, mapping)
+        # THE ONE PLACE A HEAD MOVES, so the one place the `oracles` rows pointing at the old one
+        # are repaired. Leaving them stale is what `current_canonical` exists to absorb on read —
+        # and every join that forgot to call it returned a confidently wrong answer instead
+        # (`trusted_atoms` off by 10×, an Oracle's display name resolving to NULL, a second
+        # `oracle_sources` row under the dead id). `reanchor_oracles` says what each cost.
+        schema.reanchor_oracles(conn)
     return _stats(mapping)
-
-
-def _cli(argv: list[str] | None = None) -> int:
-    import argparse
-
-    ap = argparse.ArgumentParser(
-        description="Stage-3 entity resolution: materialize canonical_id from the attested "
-                    "identity_links graph (attested-only; honors $OPYT_HOME).")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Compute the mapping and print stats WITHOUT writing canonical_id.")
-    ap.add_argument("--show-merges", action="store_true",
-                    help="Print each collapsed component (not just the counts).")
-    args = ap.parse_args(argv)
-
-    conn = schema.connect()
-    try:
-        stats = resolve_entities(conn, dry_run=args.dry_run)
-    finally:
-        conn.close()
-
-    out = stats.as_dict()
-    if not args.show_merges:
-        out.pop("merges", None)
-    print(f"[resolve] {'DRY-RUN — no writes' if args.dry_run else 'wrote canonical_id'}")
-    print(json.dumps(out, indent=2, default=str))
-    return 0
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(_cli())

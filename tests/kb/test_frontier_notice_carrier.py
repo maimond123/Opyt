@@ -22,13 +22,14 @@ import pytest
 from mcp_server import atoms_tools
 from pipeline.kb import frontier_surface as fs
 from pipeline.kb import schema
+from tests.conftest import reset_atoms_session
 
 
 @pytest.fixture(autouse=True)
 def _fresh_session():
-    atoms_tools._reset_session()
+    reset_atoms_session()
     yield
-    atoms_tools._reset_session()
+    reset_atoms_session()
 
 
 def _stage(conn, cid="arxiv:2501.00001"):

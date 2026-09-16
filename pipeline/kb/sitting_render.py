@@ -3,24 +3,21 @@ pipeline/kb/sitting_render.py — render a sitting (or the unread mass) as the d
 
 Reads a sitting that already exists (`sitting_store.get_sitting`) or the atoms no sitting has
 covered (`sitting_store.unread_atom_ids`) and turns it into text, always chronological order.
-Decides no membership and writes nothing back except the on-disk export in `write_artifacts`.
+Decides no membership and writes nothing back at all — the caller gets a document.
 
 Depends on `sitting_store` and `sitting_vectors` — never eagerly on `sitting_builder` or
 `sitting_zoom`, so this module imports standalone (a render-only CLI or test) without the build
-loop or fracture logic. `_stored_projection` reaches for `sitting_builder.SeedError` lazily, inside
-the function, because the arrow now points the other way: `sitting_builder` imports THIS module for
-`projection`, which is the one place that decides what a long atom costs and what it shows. Billing
-and rendering share that function precisely so they cannot drift.
+loop or fracture logic. `sitting_builder` imports THIS module for `projection`, which is the one
+place that decides what a long atom costs and what it shows. Billing and rendering share that
+function precisely so they cannot drift.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
 
-from opyt_core.paths import opyt_path
 
 import numpy as np
 
+from . import sitting_builder as sb
 from . import chunk as chunk_mod
 from . import sitting_store as sst
 from . import sitting_vectors as sv
@@ -67,8 +64,7 @@ def whole_tokens(spans: dict) -> dict:
     by 200 chars and summing inflates every multi-chunk atom. An atom with no chunks costs 0.
 
     Seed-INDEPENDENT, which is what makes it worth having as a map: `projection` needs it to decide
-    whether an atom is long enough to cut, and `sitting_zoom.sweep_k` needs it to bill every short
-    atom once instead of once per candidate k.
+    whether an atom is long enough to cut without re-measuring per seed.
     """
     out = {}
     for a, rows in spans.items():
@@ -146,6 +142,53 @@ def _atom_block(atom_id: str, meta: dict, text: dict) -> str:
     return f"### {date or '?'} — {who or '?'}  ({atom_id})\n\n{text.get(atom_id, '')}\n"
 
 
+# ── The closing link table: where a rendered atom gets its URL back ─────────────
+# RULED 2026-09-15. A reader given this document could say what a source CLAIMS but never where it
+# LIVES: the header above carries a date, a who_id and an atom_id, and no document built here has
+# ever carried a URL. So a sitting read could not hand back a link, and the user had to ask for the
+# source every time — on the one rail whose whole output is claims about other people's writing.
+#
+# APPENDED, never folded into that header. The header is a parse contract both reader prompts print
+# verbatim (`sitting_reader._SYSTEM`, `sitting_claims._SYSTEM`), and those prompt rules are tuned
+# against a measured 295-atom window that any edit obliges you to re-run. A table at the end leaves
+# the contracted line byte-identical, so a reader citing `(atom_id)` resolves it to a link with no
+# prompt change and no re-measurement.
+def _source_urls(conn, atom_ids) -> dict:
+    """`{atom_id: source_url}`, omitting atoms that have no stored URL.
+
+    Its own query rather than a third column on `_atom_bodies`: that function returns a
+    positional `(who, date)` tuple read at three call sites, and widening it to carry a URL the
+    document's HEADER must not show would be a change to the contracted path in order to feed the
+    uncontracted one."""
+    ids = list(dict.fromkeys(atom_ids))
+    urls: dict[str, str] = {}
+    for i in range(0, len(ids), sv.SQL_VARS):
+        part = ids[i:i + sv.SQL_VARS]
+        for r in conn.execute(
+                f"SELECT atom_id, source_url FROM atoms "
+                f" WHERE atom_id IN ({sv._in_clause(len(part))})", part):
+            if r["source_url"]:
+                urls[r["atom_id"]] = r["source_url"]
+    return urls
+
+
+def _link_line(atom_id: str, url: str) -> str:
+    return f"- `{atom_id}` — {url}"
+
+
+def _links_section(urls: dict, order: list) -> list[str]:
+    """The `## Sources` block, in the order the atoms appear above. Empty when nothing has a URL —
+    a heading over no links is worse than no heading (fail-safe: a missing URL costs a line, never
+    the document)."""
+    lines = [_link_line(a, urls[a]) for a in order if a in urls]
+    if not lines:
+        return []
+    return ["", "## Sources", "",
+            "The link for every atom above, in the order it appears. When you tell the reader "
+            "what an atom says, give them its link in the same breath — do not wait to be asked "
+            "for the source.", ""] + lines
+
+
 # ── Render ──────────────────────────────────────────────────────────────────────
 def render_sitting(conn, sitting_id: str) -> str:
     """The sitting as one markdown document, chronological.
@@ -189,7 +232,13 @@ def render_sitting(conn, sitting_id: str) -> str:
             f"and are NOT below — they appear as claims above, not as text")
     head += ["", "## Context (chronological)", ""]
     body = [_atom_block(a, meta, text) for a in order]
-    return "\n".join(head + body)
+    # ⚠️ THE LINK TABLE IS NOT BILLED. `sitting_builder` admits atoms against `budget_tokens` via
+    # `projection`, and this is appended after that arithmetic is finished — ~81 chars per atom
+    # measured over the whole store, so ~5% above budget on a 295-atom sitting. RULED 2026-09-15:
+    # accept the overage rather than reserve it in the builder. Reserving means the builder has to
+    # know what the renderer appends, which is precisely the coupling `projection` exists to
+    # prevent; 5% on a survey read does not buy that back. Revisit if a sitting ever runs tight.
+    return "\n".join(head + body + _links_section(_source_urls(conn, order), order))
 
 
 # The sprouts digest is a lens, not a rail: it emits no standing queries and writes nothing, so
@@ -222,17 +271,27 @@ def render_sprouts_digest(conn) -> dict:
         "whatever does not cohere rather than forcing an arc across all of it.",
         "", "## Context (chronological)", "",
     ]
-    body, used, truncated = [], sum(len(h) for h in head), False
+    # Unlike a sitting, THIS cap is a real char ceiling rather than a token budget, and the digest
+    # can run the whole unread store — a link table added on top of a full 400k document would be
+    # ~37% overage, not 5%. So each atom is charged for its own link line here and the table can
+    # never push the digest past the ceiling it exists to enforce.
+    urls = _source_urls(conn, order)
+    body, shown, used, truncated = [], [], sum(len(h) for h in head), False
     for a in order:
         chunk = _atom_block(a, meta, text)
-        if used + len(chunk) > SPROUTS_DIGEST_MAX_CHARS:
+        cost = len(chunk) + (len(_link_line(a, urls[a])) + 1 if a in urls else 0)
+        if used + cost > SPROUTS_DIGEST_MAX_CHARS:
             truncated = True
             break
         body.append(chunk)
-        used += len(chunk)
+        shown.append(a)
+        used += cost
     if truncated:
-        body.append(f"\n[TRUNCATED — {len(ids) - len(body)} more unread atoms not shown]")
-    return {"document": "\n".join(head + body), "atoms": len(ids), "truncated": truncated}
+        body.append(f"\n[TRUNCATED — {len(ids) - len(shown)} more unread atoms not shown]")
+    # `shown`, never `order`: a link to an atom whose text was truncated away points the reader at
+    # something this document does not contain.
+    return {"document": "\n".join(head + body + _links_section(urls, shown)),
+            "atoms": len(ids), "truncated": truncated}
 
 
 def _stored_projection(conn, s: dict, ids: list) -> dict | None:
@@ -246,7 +305,6 @@ def _stored_projection(conn, s: dict, ids: list) -> dict | None:
     billed is the harmless direction — it costs the reader nothing to see extra, while silently
     dropping a section nobody chose to drop is the failure this whole path exists to avoid.
     """
-    from . import sitting_builder as sb           # lazy: sitting_builder imports this module
     try:
         anchor = sst.ensure_seed_vector(conn, s["sitting_id"])
     except (KeyError, sb.SeedError):
@@ -365,34 +423,10 @@ def _concentration(authors: list) -> tuple[float, str]:
     return counts[top] / len(authors), top
 
 
-def manifest(conn, sitting_id: str) -> dict:
-    s = sst.get_sitting(conn, sitting_id)
-    if s is None:
-        raise KeyError(f"no sitting {sitting_id!r}")
-    return s
-
-
-def write_artifacts(conn, sitting_id: str, out_dir: Path | str | None = None) -> dict:
-    """Render the sitting and its manifest to disk; return the two paths.
-
-    Defaults under `$OPYT_HOME`, never a repo path. These files are an export — the DB is the
-    record, so a deleted artifact loses no state.
-    """
-    s = sst.get_sitting(conn, sitting_id)
-    if s is None:
-        raise KeyError(f"no sitting {sitting_id!r}")
-    out = Path(out_dir) if out_dir else Path(opyt_path("sittings"))
-    out.mkdir(parents=True, exist_ok=True)
-    slug = _slug(s["seed_ref"]) + "-" + sitting_id[:8]
-    md, mf = out / f"{slug}.md", out / f"{slug}.manifest.json"
-    md.write_text(render_sitting(conn, sitting_id))
-    # seed_vector is dropped, not serialized: default=str would abbreviate the 4096-dim array via
-    # numpy's repr, silently exporting numbers that look like the vector but aren't.
-    mf.write_text(json.dumps({k: v for k, v in s.items() if k != "seed_vector"},
-                             indent=1, default=str))
-    return {"markdown": str(md), "manifest": str(mf)}
-
-
 def _slug(ref: str | None) -> str:
+    """A seed_ref → a safe, bounded basename. Not a filename any more: `sitting_reader` builds a
+    `<prefix>:<slug>` generator id from it. The narrow-slug rule in `.guards.py`
+    (`retired-filename-slug`) names this function, so it keeps its own copy rather than importing
+    `derive.slugify`, which slugs atom TAGS and is a lookup key."""
     keep = [c if (c.isalnum() or c in "-_") else "-" for c in (ref or "sitting").lower()]
     return ("".join(keep).strip("-") or "sitting")[:60]

@@ -286,9 +286,12 @@ def test_the_json_columns_are_key_filtered(built):
                    .fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM entities WHERE identity_links IS NOT NULL")\
                    .fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM oracles WHERE source IS NOT NULL OR ingest_from IS NOT NULL "
-            "OR ingest_to IS NOT NULL").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM oracles WHERE source IS NOT NULL"
+                            ).fetchone()[0] == 0
+        # `ingest_from`/`ingest_to` were nulled here until 2026-09-02, when they were deleted
+        # outright — coverage is per (Oracle x source) now, in `oracle_sources`, which the export
+        # does not carry at all.
+        assert "ingest_from" not in {r[1] for r in conn.execute("PRAGMA table_info(oracles)")}
     finally:
         conn.close()
 

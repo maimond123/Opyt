@@ -5,10 +5,10 @@ local store has CHANGED since it. Both terms, and the truth table below is the t
 would ship an identical 117 MB every time anyone reads; change alone would push for readers who
 do not exist.
 
-Run against the REAL service in-process, through the same `publisher` fixture `opyt-push` uses,
-because the second thing these tests hold is that the rail and the CLI are one implementation. A
-rail with its own upload sequence would be a second copy of the code every reader's fidelity
-depends on.
+Run against the REAL service in-process, through the same `publisher` fixture `test_push.py`
+uses, because the second thing these tests hold is that the rail adds a GATE and nothing else —
+`push.publish` is the implementation and this rail decides only whether to call it. A rail with
+its own upload sequence would be a second copy of the code every reader's fidelity depends on.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import sqlite3
 
 from opyt_core import push
 from opyt_core.paths import opyt_path
-from pipeline.kb import push_catchup, schema
+from pipeline.kb import forget, push_catchup, schema
 from service import store, uploads
 from tests.kb.test_export import _add
 
@@ -135,6 +135,27 @@ def test_the_gate_goes_quiet_again_after_the_push_consumes_the_demand(publisher)
 
     _ingest_one(publisher, "github:pushed/and-again")
     assert push_catchup.run_push_catchup()["status"] == "no_demand"
+
+
+def test_deleting_an_older_atom_removes_it_from_the_served_copy(publisher):
+    conn = schema.connect()
+    target = conn.execute("SELECT atom_id FROM chunks ORDER BY chunk_id LIMIT 1").fetchone()[0]
+    conn.execute("UPDATE atoms SET ingested_at = '2000-01-01' WHERE atom_id = ?", (target,))
+    conn.commit()
+    _mark_published(publisher)
+    before = push_catchup.read_watermark()
+    _read_once(publisher)
+    assert target in _served_ids(publisher)
+
+    assert forget.atom(conn, target, confirm=True)["status"] == "forgotten"
+    conn.close()
+
+    after = push_catchup.store_position()
+    assert after["atoms_at"] == before["atoms_at"]
+    assert after["chunk_id"] == before["chunk_id"]
+    assert after["atom_count"] == before["atom_count"] - 1
+    assert push_catchup.run_push_catchup()["status"] == "ok"
+    assert target not in _served_ids(publisher)
 
 
 # ── the watermark ────────────────────────────────────────────────────────────────

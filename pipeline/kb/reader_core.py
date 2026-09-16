@@ -42,7 +42,7 @@ ROLE = "frontier_reader"
 
 # ── Which engine reads the bookmarks ────────────────────────────────────────────
 # Two transports, one job. `api` calls OpenRouter through `llm_client`; `claude-cli` shells out to
-# a headless `claude -p`, which bills a Claude subscription instead of metered credits.
+# a headless `claude -p` installed on the local machine.
 #
 # The shipped default is `api`, and that is an invariant, not a preference. CLAUDE.md requires the
 # core to run on ANY MCP client, with Claude Code-specific shell opt-in and never load-bearing —
@@ -57,8 +57,8 @@ CLI_TIMEOUT_S = 1800          # a ~200K-token read runs ~1-3 min; the ceiling is
 def frontier_setting(key: str, env_var: str, default: str) -> str:
     """`$ENV` → `frontier.<key>` in settings.yaml → `default`.
 
-    Env first so a one-off run can override without editing config; settings second because the
-    detached spawn inherits only the MCP server's environment, not the shell's exports.
+    Env first so a one-off run can override without editing config; settings second because a
+    rail child inherits only the worker's environment, not the shell's exports.
     """
     env = os.environ.get(env_var)
     if env:
@@ -126,12 +126,12 @@ def parse_response(text: str) -> dict | None:
 class _CliResponse:
     """Duck-types the fields of `llm_client.LLMResponse` that `_run` reads, so the two transports
     are interchangeable and nothing downstream branches on which one ran."""
-    __slots__ = ("text", "model", "input_tokens", "output_tokens", "cost_usd", "raw")
+    __slots__ = ("text", "model", "input_tokens", "output_tokens", "raw")
 
-    def __init__(self, text, model, input_tokens, output_tokens, cost_usd, raw):
+    def __init__(self, text, model, input_tokens, output_tokens, raw):
         self.text, self.model = text, model
         self.input_tokens, self.output_tokens = input_tokens, output_tokens
-        self.cost_usd, self.raw = cost_usd, raw
+        self.raw = raw
 
 
 def cli_preflight() -> str | None:
@@ -187,8 +187,7 @@ def call_claude_cli(system: str, user: str, *, model: str | None = None) -> _Cli
     `--system-prompt` replaces rather than
     appends, no tools/MCP servers, and the window arrives on stdin (~1MB, past any argv limit).
 
-    Deliberately NOT routed through `llm_client`: different transport, different billing surface —
-    folding subscription usage into OpenRouter spend accounting would corrupt the paid-sweep caps.
+    Deliberately NOT routed through `llm_client`: it is a separate local CLI transport.
     """
     import shutil
     import tempfile
@@ -226,9 +225,6 @@ def call_claude_cli(system: str, user: str, *, model: str | None = None) -> _Cli
         + int(usage.get("cache_creation_input_tokens") or 0)
         + int(usage.get("cache_read_input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),
-        # What it WOULD have cost on metered API pricing; no OpenRouter credit is consumed, but
-        # subscription quota is finite too, so single-flight keys on this figure.
-        cost_usd=float(env.get("total_cost_usd") or 0.0),
         raw=env)
 
 
@@ -300,7 +296,7 @@ def positional_coverage(order: list[str], cited, *, undated=(), buckets: int = 1
     means lost-in-the-middle · weight at the tail means recency bias.
 
     Fail-safe: an empty region, no citations, or fewer atoms than buckets all return a well-formed
-    report rather than raising, since this is an observability signal riding along a paid read.
+    report rather than raising, since this is an observability signal riding along a read.
     """
     undated = set(undated)
     dated = [a for a in order if a not in undated]
@@ -568,7 +564,7 @@ def preflight(backend: str) -> str | None:
 def call(backend: str, system: str, user: str):
     """One completion on `backend`. Raises on failure; the caller decides what a failure costs.
 
-    Returns something with `.text/.model/.input_tokens/.output_tokens/.cost_usd/.raw` either way,
+    Returns something with `.text/.model/.input_tokens/.output_tokens/.raw` either way,
     so nothing downstream branches on which transport ran.
     """
     if backend == BACKEND_CLI:

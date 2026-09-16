@@ -77,7 +77,7 @@ _ARTICLE_URL = "https://www.theverge.com/2026/8/1/some-cool-article"
 _ARTICLE_ATOM = "blog:theverge.com/2026/8/1/some-cool-article"
 
 
-def test_a_hopper_deposit_makes_its_own_entry_mode_claim_true(conn):
+def test_a_hopper_deposit_makes_its_own_entry_mode_claim_true(conn, no_deep_probe):
     """The measured defect: this branch REPORTED `entry_mode: "user-saved"` while writing nothing,
     so a deposit of a URL the frontier already held left the row in the machine lane forever."""
     _seed(conn, _ARTICLE_ATOM, "frontier")
@@ -108,8 +108,7 @@ def test_the_x_adapter_promotes_on_its_presence_skip(conn, fake_embedder):
     """A hand-dumped post is the same act as a bookmark; the store already holding it via the
     frontier changes nothing about that."""
     _seed(conn, _TWEET_ATOM, "frontier", source_type="x")
-    status, aid = ingest_x.x_atom_from_url(conn, fake_embedder, _TWEET_URL,
-                                           entry_mode="user-saved")
+    status, aid = ingest_x.x_atom_from_url(conn, fake_embedder, _TWEET_URL)
     assert (status, aid) == ("present", _TWEET_ATOM)
     assert _mode(conn, _TWEET_ATOM)["entry_mode"] == "user-saved"
 
@@ -150,11 +149,12 @@ def test_the_bookmark_sweep_promotes_what_it_skips(kb_home, fake_embedder, monke
     collected and promoted after the walk, on the writer thread.
 
     Driven by running the sweep TWICE with the atom demoted in between, because that is the real
-    shape — the second pass reaches the hash-unchanged skip, which is where a frontier atom the
+    shape — the second pass reaches the already-resolved skip, which is where a frontier atom the
     user has bookmarked would sit.
     """
     from datetime import datetime, timedelta, timezone
     from pipeline.ingestion import x_graphql as xg
+    from pipeline.ingestion import x_graphql_core as core
     import pipeline.ingestion.x_render as twapi_mod
     import pipeline.kb.derive as derive
     import pipeline.kb.vision as vision
@@ -164,7 +164,9 @@ def test_the_bookmark_sweep_promotes_what_it_skips(kb_home, fake_embedder, monke
             "createdAt": (now - timedelta(days=30)).strftime("%a %b %d %H:%M:%S +0000 %Y"),
             "url": "https://x.com/u/recent", "entities": {"urls": []},
             "extendedEntities": {"media": []}}
-    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0, profile=None: iter([dict(norm)]))
+    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0: iter([dict(norm)]))
+    monkeypatch.setattr(core, "read_x_cookies", lambda: {})
+    monkeypatch.setattr(core, "auth_headers", lambda *a, **k: {})
     monkeypatch.setattr(twapi_mod, "tweet_to_markdown",
                         lambda n, article=None, thread_tweets=None, source=None,
                         footer_label=None: "body recent")
@@ -176,11 +178,11 @@ def test_the_bookmark_sweep_promotes_what_it_skips(kb_home, fake_embedder, monke
                         lambda n, cache, *, describe_all: 0)
 
     c = schema.connect()
-    assert ingest_x.sync_bookmarks(c, fake_embedder, fetch_threads=False)["added"] == 1
+    assert ingest_x.sync_bookmarks(c, fake_embedder)["added"] == 1
     c.execute("UPDATE atoms SET entry_mode = 'frontier' WHERE atom_id = 'x:recent'")
     c.commit()
 
-    summary = ingest_x.sync_bookmarks(c, fake_embedder, fetch_threads=False)
+    summary = ingest_x.sync_bookmarks(c, fake_embedder)
     assert summary["added"] == 0 and summary["skipped"] == 1     # still a skip: nothing re-embedded
     assert _mode(c, "x:recent")["entry_mode"] == "user-saved"
     c.close()

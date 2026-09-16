@@ -35,15 +35,6 @@ CREATE TABLE IF NOT EXISTS sync_dedup_seeded (
     namespace TEXT PRIMARY KEY,
     seeded_at TEXT NOT NULL
 );
-
--- Per-source sync health, so a credential/auth failure is visible: "0 new" is only
--- trustworthy if last_ok_at is recent. See health_status() for reader status.
-CREATE TABLE IF NOT EXISTS sync_health (
-    source        TEXT PRIMARY KEY,
-    last_ok_at    TEXT,
-    last_error    TEXT,
-    last_error_at TEXT
-);
 """
 
 
@@ -161,78 +152,3 @@ class SyncSet:
 
     def close(self) -> None:
         self._conn.close()
-
-
-def record_health(source: str, ok: bool, detail: str | None = None,
-                  db_path: Path | None = None) -> None:
-    """Stamp a source's sync health. ``ok=True`` clears any prior error and sets
-    last_ok_at; ``ok=False`` records the error + when. Distinguishes "caught up" from
-    "silently broken auth". No reader since 2026-08-07 — see health_status()."""
-    conn = _connect(Path(db_path) if db_path else default_db_path())
-    now = _now()
-    if ok:
-        conn.execute(
-            "INSERT INTO sync_health(source, last_ok_at, last_error, last_error_at) "
-            "VALUES (?,?,NULL,NULL) "
-            "ON CONFLICT(source) DO UPDATE SET last_ok_at=excluded.last_ok_at, "
-            "last_error=NULL, last_error_at=NULL",
-            (source, now),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO sync_health(source, last_ok_at, last_error, last_error_at) "
-            "VALUES (?,NULL,?,?) "
-            "ON CONFLICT(source) DO UPDATE SET last_error=excluded.last_error, "
-            "last_error_at=excluded.last_error_at",
-            (source, detail, now),
-        )
-    conn.commit()
-    conn.close()
-
-
-def health_status(db_path: Path | None = None) -> list[dict]:
-    """Per-source sync health. A source with a recent last_error but a stale last_ok_at is
-    broken, not caught up.
-
-    `sync_health` currently has no writer and no reader — kept intentionally, not dead code, as
-    the future observability surface for "is a source caught up or is its auth silently broken".
-"""
-    conn = _connect(Path(db_path) if db_path else default_db_path())
-    rows = conn.execute(
-        "SELECT source, last_ok_at, last_error, last_error_at FROM sync_health ORDER BY source"
-    ).fetchall()
-    conn.close()
-    return [
-        {"source": s, "last_ok_at": ok, "last_error": err, "last_error_at": eat}
-        for (s, ok, err, eat) in rows
-    ]
-
-
-# Namespaces that are genuine dedup ID-sets (NOT value caches like
-# discovered_profiles.json / api_stats.json).
-def migrate_all(state_dir: Path) -> dict[str, int]:
-    """Force the one-time seed for every dedup JSON in ``state_dir``.
-
-    Idempotent — safe to re-run. Returns ``{namespace: row_count}``.
-    """
-    paths = sorted(state_dir.glob("*_synced.json"))
-    for extra in ("synced_ids.json", "processed_ids.json"):
-        p = state_dir / extra
-        if p.exists():
-            paths.append(p)
-
-    out: dict[str, int] = {}
-    for p in paths:
-        s = SyncSet(namespace=p.stem, legacy_json=p)
-        out[p.stem] = len(s)
-        s.close()
-    return out
-
-
-if __name__ == "__main__":
-    # Default to the repo-root state/ dir (pipeline/ -> repo root -> state/).
-    repo_state = Path(__file__).resolve().parent.parent / "state"
-    print(f"Migrating dedup JSON → sync_dedup table in {default_db_path()}")
-    print(f"Source dir: {repo_state}\n")
-    for ns, n in migrate_all(repo_state).items():
-        print(f"  {ns:24s} {n:>7,d} ids")

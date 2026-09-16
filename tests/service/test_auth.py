@@ -106,9 +106,9 @@ def test_redeem_hands_back_the_owners_display_name_to_register_under(svc):
 
 
 def test_an_owner_who_registered_without_a_label_suggests_nothing(svc):
-    """Null rather than an invented name: `opyt-redeem` falls back to the routing key, which is
-    at least a string that resolves. Guessing one here would put a name in the reader's registry
-    that the owner never chose."""
+    """Null rather than an invented name: `share_tools.accept` falls back to the routing key,
+    which is at least a string that resolves. Guessing one here would put a name in the reader's
+    registry that the owner never chose."""
     hdr = {"Authorization": f"Bearer {store.mint_token('nameless', 'owner')}"}
     code = svc.client.post("/v1/grant", json={}, headers=hdr).json()["code"]
     body = svc.client.post("/v1/redeem", json={"code": code, "install_id": "a"}).json()
@@ -173,11 +173,15 @@ def test_the_database_holds_no_usable_credential(svc):
     assert store.token_hash(svc.reader_token).encode() in raw
 
 
-def test_a_grant_code_survives_being_a_command_line_argument(svc):
-    """`opyt-redeem <url> <code>` puts the code in an argparse POSITIONAL, and argparse reads a
-    leading `-` as an option. `secrets.token_urlsafe` produced one about 1 code in 64, so ~1.6% of
-    readers met a usage error naming the wrong problem. The alphabet is the fix, and this asserts
-    it TOTALLY rather than sampling: every character, over enough codes to be worth the second."""
+def test_a_grant_code_is_findable_by_the_regex_that_extracts_it(svc):
+    """`share_tools._CODE` is `(?<![A-Za-z0-9])([A-Za-z0-9]{43})(?![A-Za-z0-9])` — how `accept`
+    finds the code inside a link, a fragment or a bare paste. A `-` or `_` would fail both the
+    character class and the lookarounds, so the invite would silently not work.
+
+    The alphabet predates that regex: it was added because `opyt-redeem <url> <code>` put the code
+    in an argparse POSITIONAL and `secrets.token_urlsafe` starts one with `-` about 1 time in 64.
+    That command was deleted 2026-09-05 and the constraint got STRICTER, not looser. Asserted
+    TOTALLY rather than sampled: every character, over enough codes to be worth the second."""
     for _ in range(200):
         code = store.mint_grant(svc.owner)
         assert code.isalnum() and len(code) >= 40, code

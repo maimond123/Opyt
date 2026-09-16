@@ -66,8 +66,20 @@ class AtomHit:
     body_basis: str | None = None
     # Everything else the adapters captured, verbatim and source-shaped (no allowlist).
     payload: dict = field(default_factory=dict)
-    # How the atom arrived: 'user-saved' vs 'crawled'. Also the value `_filter_clauses` filters on.
+    # How the atom arrived. Also the value `_filter_clauses` filters on.
     entry_mode: str | None = None
+
+
+class QueryVectorError(RuntimeError):
+    """The query could not be turned into a vector, so the semantic arm cannot run.
+
+    NARROW ON PURPOSE. It wraps the query embed and NOTHING else in `atom_semantic_search`,
+    because the other way that function fails is a width disagreement in the reshape — a store
+    whose vectors do not match its own `kb_meta` — and degrading THAT to keyword search would
+    hide real corruption behind a slightly thinner answer. A provider that refuses the call is a
+    condition the user can fix; a store that disagrees with itself is a bug, and the two must not
+    share an exit.
+    """
 
 
 @dataclass
@@ -92,6 +104,10 @@ class SearchRun:
     # bound was asked for. Not the same as `filter_cost["date_from"]` (which also counts
     # dated-but-out-of-window atoms) — this is only the subset the filter couldn't evaluate.
     undated_excluded: int = 0
+    # Why the vector arm did not run, when it was asked for and could not. None on every normal
+    # search, INCLUDING a deliberate `mode="bm25"` — this field means "an arm was lost", never
+    # "an arm was not requested".
+    vector_arm_error: str | None = None
 
 
 def _json_obj(value) -> dict:
@@ -478,7 +494,7 @@ def filter_costs(conn, tags: list[str] | None = None, what_kind: str | None = No
     filter dropped and all the others kept. `{}` when no filter costs anything (self-pruning,
     always computed rather than gated on thin results). One `COUNT(*)` per active filter plus
     one baseline. Every filter `_filter_clauses` knows about must appear in `args` below, or the
-    baseline — and every other filter's reported cost — comes out wrong. Full rationale:
+    baseline — and every other filter's reported cost — comes out wrong.
 """
     args = {"tags": tags, "what_kind": what_kind, "source_type": source_type, "who_id": who_id,
             "date_from": date_from, "date_to": date_to, "entry_mode": entry_mode}
@@ -570,7 +586,12 @@ def atom_semantic_search(conn, query: str, embedder, candidates: set[str] | None
     Full record, and every instrument rejected:
     docs/plans/2026-08-26-frontier-crowding-in-search.md
     """
-    qvec = np.asarray(embedder.embed([query], role="query")[0], dtype=np.float32)
+    try:
+        qvec = np.asarray(embedder.embed([query], role="query")[0], dtype=np.float32)
+    except Exception as e:
+        # The provider refused, or its circuit is open. Typed rather than raised as-is so
+        # `search_atoms` can drop to the keyword arm without also swallowing the reshape below.
+        raise QueryVectorError(f"{type(e).__name__}: {e}") from None
     qn = qvec / (np.linalg.norm(qvec) + 1e-9)
 
     frag, cand_params = _in_clause(candidates, "a")
@@ -653,6 +674,25 @@ def search_atoms(conn, query: str, embedder, *, tags: list[str] | None = None,
                          undated_excluded=undated)
 
     pool = max(k * 5, 40)   # over-fetch so fusion sees enough of each arm before top-k
+    vec_error: str | None = None
+
+    def _semantic(n: int) -> list[AtomHit]:
+        """The vector arm, or [] with the reason recorded. DEGRADE-OPEN: a search that returns
+        keyword-ranked results and says so is worth more than one that raises.
+
+        ⚠️ THIS IS WHERE `search` USED TO DIE. Measured 2026-09-15: with the model allowance
+        spent, OpenRouter refused the query embed, the exception travelled out through
+        `run_kb_search` (which has a `finally` and no `except`) and the most-used tool in the
+        product answered with a traceback — on a store holding 1,004 perfectly readable atoms
+        that BM25 alone would have found. The user read that as the product being broken.
+        """
+        nonlocal vec_error
+        try:
+            return atom_semantic_search(conn, query, embedder, cand, n)
+        except QueryVectorError as e:
+            vec_error = str(e)
+            return []
+
     arm_sizes: dict[str, int] = {}
     w_bm25: float | None = None
     fts: str | None = None
@@ -662,14 +702,30 @@ def search_atoms(conn, query: str, embedder, *, tags: list[str] | None = None,
         fts = _fts_query(query)
         ran, scale, why = "bm25", "reciprocal_rank", "mode=bm25 requested"
     elif mode == "semantic":
-        fused = atom_semantic_search(conn, query, embedder, cand, pool)
+        fused = _semantic(pool)
         arm_sizes["semantic"] = len(fused)
         ran, scale, why = "semantic", "cosine", "mode=semantic requested"
+        if vec_error is not None:
+            # `mode="semantic"` asked for the arm that is gone. Answering with the other one is
+            # what `_query_embedder`'s own degrade already does for a foreign store, so the two
+            # routes to a missing vector arm behave the same way.
+            fused = atom_bm25_search(conn, query, cand, pool)
+            arm_sizes = {"bm25": len(fused)}
+            fts = _fts_query(query)
+            ran, scale, why = "bm25", "reciprocal_rank", "the vector arm could not run"
     else:  # hybrid
         w_bm25 = bm25_weight(query)
-        sem = atom_semantic_search(conn, query, embedder, cand, pool)
+        sem = _semantic(pool)
         arm_sizes["semantic"] = len(sem)
-        if w_bm25 == 0.0:
+        if vec_error is not None:
+            # Hybrid minus its vector half IS bm25, and `effective_mode` has always reported the
+            # arms that RAN rather than the ones requested — so this needs no new vocabulary,
+            # only the honest label and `vector_arm_error` saying why.
+            fused = atom_bm25_search(conn, query, cand, pool)
+            arm_sizes = {"bm25": len(fused)}
+            fts = _fts_query(query)
+            ran, scale, why = "bm25", "reciprocal_rank", "the vector arm could not run"
+        elif w_bm25 == 0.0:
             # Pure-conceptual query → semantic only. "hybrid" was asked for; one arm RAN, and
             # the scores that come back are therefore raw cosines, not fused ranks.
             fused = sem
@@ -695,5 +751,5 @@ def search_atoms(conn, query: str, embedder, *, tags: list[str] | None = None,
         candidates=None if cand is None else len(cand), ranked=len(fused), cutoff=cutoff,
         bm25_weight=w_bm25, fts_query=fts, arm_sizes=arm_sizes,
         pool_saturated=any(n >= pool for n in arm_sizes.values()),
-        undated_excluded=undated,
+        undated_excluded=undated, vector_arm_error=vec_error,
     )

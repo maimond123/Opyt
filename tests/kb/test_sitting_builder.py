@@ -75,11 +75,13 @@ def _at_cos(c: float, axis: int = 1) -> np.ndarray:
 
 
 def _atom(conn, atom_id, vecs, *, when="2026-08-01", who="x:user:1",
-          entry_mode="user-saved", chars=800):
+          entry_mode="user-saved", chars=800, url=None):
     """One atom with `vecs` chunk vectors. `chars` sets each chunk's length, which drives the token
-    estimate and therefore where the budget binds."""
-    conn.execute("INSERT INTO atoms (atom_id, source_type, who_id, when_ts, entry_mode) "
-                 "VALUES (?,?,?,?,?)", (atom_id, "x", who, when, entry_mode))
+    estimate and therefore where the budget binds. `url` defaults to NULL so every test written
+    before the link table keeps exercising the no-URL path."""
+    conn.execute("INSERT INTO atoms (atom_id, source_type, who_id, when_ts, entry_mode, "
+                 "source_url) VALUES (?,?,?,?,?,?)",
+                 (atom_id, "x", who, when, entry_mode, url))
     pos = 0
     for seq, v in enumerate(vecs):
         text = f"{atom_id} chunk {seq} " + ("word " * max(1, chars // 5))
@@ -707,13 +709,17 @@ def test_an_older_store_gains_the_chain_columns_on_open(kb_home):
     # THE BACKFILL IS EXACT, unlike `atoms.first_seen`'s: every input to the key is a column of the
     # row itself, so a key recomputed on migration is the same key a build would have written —
     # under the recipe that no longer takes `lam`.
-    row = c.execute("SELECT region_key, seed_vector, read_at, read_status, stop FROM sittings "
+    # SUBTRACTIVE, 2026-09-06: and `read_status` too. THIS ROW IS THE DOUBLE-DROP CASE — the store
+    # is two drops behind, so a rebuild that took its column list from the OLD table would try to
+    # copy `read_status` into a new table that no longer has it and the store would stop opening.
+    assert "read_status" not in cols
+    row = c.execute("SELECT region_key, seed_vector, read_at, stop FROM sittings "
                     "WHERE sitting_id='old1'").fetchone()
     assert row["region_key"] == sch.region_key("query", "mlx", 0.67, 0.95, 120000)
     # THE READ HISTORY SURVIVES THE REBUILD. Losing it would make the scheduler re-read and re-pay
     # for every region in the store on the next connect — the exact failure the whole table's
     # "append, never overwrite" rule exists to prevent.
-    assert row["read_at"] == "2026-07-02T00:00:00+00:00" and row["read_status"] == "ok"
+    assert row["read_at"] == "2026-07-02T00:00:00+00:00"
     assert row["stop"] == "saturation"
     # And the rebuild leaves the table INDEXED — dropping it dropped its indexes.
     names = {r[1] for r in c.execute("PRAGMA index_list(sittings)")}
@@ -1076,12 +1082,14 @@ def test_a_lens_read_stamp_is_independent_of_queries(conn):
     assert sst.lens_read_state(conn, sid, "claims") is None
 
     sst.mark_lens_read(conn, sid, "claims")
-    assert sst.lens_read_state(conn, sid, "claims")["read_status"] == "ok"
+    assert sst.lens_read_state(conn, sid, "claims")["read_at"] is not None
     assert sst.get_sitting(conn, sid)["read_at"] is None      # queries' own stamp: untouched
 
     sst.mark_read(conn, sid)                                   # queries reads it separately
     assert sst.get_sitting(conn, sid)["read_at"] is not None
-    assert sst.lens_read_state(conn, sid, "claims")["read_status"] == "ok"  # unaffected either way
+    # PRESENCE, not a status field: the stamp itself is the state, which is why `read_status`
+    # went on 2026-09-06 rather than gaining a second value.
+    assert sst.lens_read_state(conn, sid, "claims") is not None  # unaffected either way
 
 
 def test_a_claims_only_read_counts_toward_coverage(conn):
@@ -1249,15 +1257,6 @@ def test_render_removes_the_chunk_overlap(conn):
     assert "ABCDEFGHIJKLMNOPQR" in sre.render_sitting(conn, rec["sitting_id"])
 
 
-def test_artifacts_write_under_the_sandboxed_home(conn, kb_home):
-    _atom(conn, "a:seed", [ANCHOR])
-    rec = sb.build_sitting(conn, sb.resolve_seed(conn, atom_ids=["a:seed"], label="mlx"),
-                           floor=0.68)
-    paths = sre.write_artifacts(conn, rec["sitting_id"])
-    assert str(kb_home) in paths["markdown"]
-    assert paths["markdown"].endswith(".md")
-
-
 # ── degradation ─────────────────────────────────────────────────────────────────
 def test_no_embedded_chunks_yields_an_empty_sitting_not_a_crash(conn):
     """FAIL-SAFE: a store whose embedding pass has not run yet degrades to an empty result."""
@@ -1280,3 +1279,71 @@ def test_undated_atoms_trail_the_chronology(conn):
     md = sre.render_sitting(conn, rec["sitting_id"])
     order = [ln.rsplit("(", 1)[1].rstrip(")") for ln in md.splitlines() if ln.startswith("### ")]
     assert order == ["a:dated", "a:seed", "a:undated"]
+
+
+# ── the closing link table ──────────────────────────────────────────────────────
+# RULED 2026-09-15. A sitting could say what a source CLAIMED but never where it LIVED: the atom
+# header carries a date, a who_id and an atom_id, so a reader had to be asked for the source every
+# time. The fix is a table at the END, and these tests pin both halves of that choice — the links
+# are all there, and the contracted header line did not move to get them.
+def test_render_sitting_ends_with_a_link_for_every_atom_it_showed(conn):
+    """The whole point: a reader handed this document can give the user the post itself."""
+    _atom(conn, "a:seed", [ANCHOR], url="https://x.com/someone/status/1")
+    _atom(conn, "a:near", [_at_cos(0.85)], url="https://sub.substack.com/p/two")
+    rec = sb.build_sitting(conn, sb.resolve_seed(conn, atom_ids=["a:seed"]), floor=0.68)
+    md = sre.render_sitting(conn, rec["sitting_id"])
+    assert "## Sources" in md
+    assert "- `a:seed` — https://x.com/someone/status/1" in md
+    assert "- `a:near` — https://sub.substack.com/p/two" in md
+
+
+def test_the_link_table_leaves_the_atom_header_byte_identical(conn):
+    """⚠️ THE REASON THE TABLE IS AT THE END AND NOT ON THE HEADER. `### date — who (atom_id)` is a
+    parse contract printed verbatim to both reader models (`sitting_reader._SYSTEM`,
+    `sitting_claims._SYSTEM`), and its prompt rules are tuned against a measured window that any
+    edit obliges you to re-run. A URL that creeps into that line is the change this design exists
+    to avoid — so assert the line, not just the links."""
+    _atom(conn, "a:seed", [ANCHOR], when="2026-08-01", url="https://x.com/someone/status/1")
+    rec = sb.build_sitting(conn, sb.resolve_seed(conn, atom_ids=["a:seed"]), floor=0.68)
+    md = sre.render_sitting(conn, rec["sitting_id"])
+    headers = [ln for ln in md.splitlines() if ln.startswith("### ")]
+    assert headers == ["### 2026-08-01 — x:user:1  (a:seed)"]
+    assert "http" not in headers[0]
+
+
+def test_an_atom_with_no_url_costs_a_line_not_the_document(conn):
+    """Fail-safe. Half this store predates any URL being recorded for it; a missing one drops its
+    row and the rest of the table still renders."""
+    _atom(conn, "a:seed", [ANCHOR], url="https://x.com/someone/status/1")
+    _atom(conn, "a:bare", [_at_cos(0.85)])                      # no url at all
+    rec = sb.build_sitting(conn, sb.resolve_seed(conn, atom_ids=["a:seed"]), floor=0.68)
+    md = sre.render_sitting(conn, rec["sitting_id"])
+    assert "- `a:seed` — https://x.com/someone/status/1" in md
+    assert "- `a:bare`" not in md
+    assert "### 2026-08-01 — x:user:1  (a:bare)" in md          # still READ, just not linked
+
+
+def test_a_sitting_with_no_urls_at_all_grows_no_empty_heading(conn):
+    """A `## Sources` heading over nothing is worse than no heading — it reads as "this material
+    has no sources" rather than "we stored none"."""
+    _atom(conn, "a:seed", [ANCHOR])
+    rec = sb.build_sitting(conn, sb.resolve_seed(conn, atom_ids=["a:seed"]), floor=0.68)
+    assert "## Sources" not in sre.render_sitting(conn, rec["sitting_id"])
+
+
+def test_sprouts_digest_links_only_the_atoms_it_actually_showed(conn, monkeypatch):
+    """The digest TRUNCATES, and a link to an atom whose text was cut points the reader at
+    something this document does not contain. It also charges each atom for its own link line, so
+    the table can never push the digest past the ceiling that cap exists to enforce."""
+    monkeypatch.setattr(sre, "SPROUTS_DIGEST_MAX_CHARS", 1_200)
+    for i in range(5):
+        _atom(conn, f"a:{i}", [_unit(0, 1 + i)], when=f"2026-0{1 + i}-01", chars=400,
+              url=f"https://x.com/someone/status/{i}")
+    dig = sre.render_sprouts_digest(conn)
+    assert dig["truncated"] is True
+    doc = dig["document"]
+    assert len(doc) <= sre.SPROUTS_DIGEST_MAX_CHARS
+    shown = {ln.rsplit("(", 1)[1].rstrip(")") for ln in doc.splitlines() if ln.startswith("### ")}
+    linked = {ln.split("`")[1] for ln in doc.splitlines() if ln.startswith("- `")}
+    assert shown and linked == shown        # linked IFF shown — never one without the other
+    assert len(shown) < 5                   # and the cut really did bite

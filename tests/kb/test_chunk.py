@@ -1,7 +1,7 @@
 """chunk — windowing, spans, overlap, the always-≥1 guarantee, and the stitch back."""
 from __future__ import annotations
 
-from pipeline.kb.chunk import (CHUNK_CHARS, CHUNK_OVERLAP, split_text, stitch,
+from pipeline.kb.chunk import (CHUNK_CHARS, CHUNK_OVERLAP, MAX_CHUNKS, split_text, stitch,
                                strip_frontmatter)
 
 
@@ -75,6 +75,20 @@ def test_a_multi_chunk_split_never_emits_a_chunk_under_the_overlap():
         assert len(parts) > 1, f"expected a multi-chunk split at +{extra}"
         shortest = min(len(c) for _s, c, _a, _b in parts)
         assert shortest > CHUNK_OVERLAP, f"+{extra} produced a {shortest}-char chunk"
+
+
+def test_the_capped_tail_log_names_the_first_uncovered_character(monkeypatch):
+    """The cap is intentional; its diagnostic must name the actual lost-tail boundary."""
+    from pipeline.ingestion import utils
+
+    logged = []
+    monkeypatch.setattr(utils, "log", logged.append)
+    text = "x" * (CHUNK_CHARS + (MAX_CHUNKS - 1) * (CHUNK_CHARS - CHUNK_OVERLAP) + 1)
+
+    chunks = split_text(text)
+
+    assert chunks[-1][3] == len(text) - 1
+    assert any(f"tail from char {chunks[-1][3]} DROPPED" in line for line in logged)
 
 
 # ── stitch: the inverse of the split ────────────────────────────────────────────

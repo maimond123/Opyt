@@ -1,19 +1,9 @@
-"""The BOOKMARK lookback — a SPEND filter, not a relevance filter.
+"""Bookmark lookback filters work before ingestion.
 
-Bookmarks are the third selector shape in onboarding, and they match neither of the other two: the
-walk is a free cookie-scrape, but every surviving bookmark costs a twitterapi thread fetch and
-often an image read (measured 2026-07-22: 791 bookmarks → 790 thread fetches + 254 VLM calls,
-~4.1 s each). So the only thing this window buys is money, and it buys it ONLY if the drop happens
-upstream of the paid work — a filter applied after the fetch saves nothing at all.
-
-Two properties, both load-bearing:
-  • an out-of-window bookmark costs NO thread fetch, NO image read, NO embed, NO atom;
-  • the default (no window) is behaviourally identical to before the selector existed, so turning
-    it on can never silently shrink an existing corpus.
-
-And one semantic the wording depends on: the cutoff is the tweet's WRITE date, because X exposes
-no bookmark timestamp. Hence SKIP-and-keep-walking, never break — the walk is ordered by SAVE
-time, so an old post saved yesterday sits near the TOP of it.
+Out-of-window posts reach no conversation fetch, image read, embed, or atom write.
+The default window keeps every bookmark eligible. The cutoff uses the tweet's write date;
+X exposes no bookmark timestamp, and the walk is ordered by save time, so filtering skips
+old posts without stopping the walk.
 """
 from __future__ import annotations
 
@@ -34,13 +24,13 @@ def _norm(tid: str, written: datetime):
 
 
 class _RecordingConvo:
-    """Records every thread fetch — the paid call the filter is supposed to prevent."""
-    backend = "twitterapi"
+    """Record conversation requests so filtering can be checked before any fetch."""
 
-    def __init__(self, profile, checked):
+    def __init__(self, checked):
         self.checked = checked
         self.calls: list[str] = []
         self.n_calls = self.n_failed = self.n_chains = 0
+        self.enabled = True        # mirrors the real fetcher: the funnel reports its kill switch
 
     def chain(self, tid):
         self.calls.append(str(tid))
@@ -66,7 +56,7 @@ def walk(monkeypatch):
 
     norms = [_norm("recent", _NOW - timedelta(days=30)),
              _norm("ancient", _NOW - timedelta(days=1100))]
-    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0, profile=None: iter(norms))
+    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0: iter(norms))
     monkeypatch.setattr(twapi_mod, "tweet_to_markdown",
                         lambda norm, article=None, thread_tweets=None, source=None,
                         footer_label=None: f"body {norm['id']}")
@@ -77,8 +67,7 @@ def walk(monkeypatch):
     monkeypatch.setattr(vision, "enrich_tweet_media",
                         lambda norm, cache, *, describe_all: images.append(norm["id"]) or 0)
     monkeypatch.setattr(ingest_x, "_ConvoFetcher",
-                        lambda profile, checked: seen.setdefault(
-                            "convo", _RecordingConvo(profile, checked)))
+                        lambda checked: seen.setdefault("convo", _RecordingConvo(checked)))
     return seen, images
 
 
@@ -88,10 +77,14 @@ def _atom_ids(conn):
 
 def test_out_of_window_bookmark_costs_nothing_paid(kb_home, fake_embedder, walk):
     """`since` = 1 year ago drops the 3-year-old post — and drops it BEFORE the thread fetch, the
-    image read, and the embed. Anything less than that is a filter that saves no money."""
+    image read, and the embed. Anything less than that is a filter that saves no money.
+
+    Driven at `enrich=True` because that is the pass with anything to save: the free pass spends
+    neither the thread fetch nor the image read on ANY bookmark, so it could not tell a working
+    window from a broken one."""
     seen, images = walk
     conn = schema.connect()
-    summary = ingest_x.sync_bookmarks(conn, fake_embedder, fetch_threads=True,
+    summary = ingest_x.sync_bookmarks(conn, fake_embedder, enrich=True,
                                       since=_NOW - timedelta(days=365))
 
     assert seen["convo"].calls == ["recent"]        # NO thread fetch for the dropped bookmark
@@ -109,7 +102,7 @@ def test_default_window_is_identical_to_no_selector(kb_home, fake_embedder, walk
     before this parameter existed — including the three-year-old post."""
     seen, images = walk
     conn = schema.connect()
-    summary = ingest_x.sync_bookmarks(conn, fake_embedder, fetch_threads=True)
+    summary = ingest_x.sync_bookmarks(conn, fake_embedder, enrich=True)
 
     assert sorted(seen["convo"].calls) == ["ancient", "recent"]
     assert _atom_ids(conn) == {"x:recent", "x:ancient"}
@@ -128,7 +121,8 @@ def test_an_unparseable_date_is_kept_not_dropped(kb_home, fake_embedder, monkeyp
 
     bad = _norm("undated", _NOW)
     bad["createdAt"] = "not a date"
-    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0, profile=None: iter([bad]))
+    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0: iter([bad]))
+    monkeypatch.setattr(ingest_x, "_ConvoFetcher", _RecordingConvo)
     monkeypatch.setattr(twapi_mod, "tweet_to_markdown",
                         lambda norm, article=None, thread_tweets=None, source=None,
                         footer_label=None: "body")
@@ -136,7 +130,7 @@ def test_an_unparseable_date_is_kept_not_dropped(kb_home, fake_embedder, monkeyp
     monkeypatch.setattr(vision, "enrich_tweet_media", lambda norm, cache, *, describe_all: 0)
 
     conn = schema.connect()
-    summary = ingest_x.sync_bookmarks(conn, fake_embedder, fetch_threads=False,
+    summary = ingest_x.sync_bookmarks(conn, fake_embedder,
                                       since=_NOW - timedelta(days=1))
     assert summary["added"] == 1 and summary["out_of_window"] == 0
     conn.close()
@@ -153,7 +147,8 @@ def test_the_filter_skips_rather_than_stopping_the_walk(kb_home, fake_embedder, 
 
     norms = [_norm("ancient", _NOW - timedelta(days=1100)),   # saved most recently, written 2023
              _norm("recent", _NOW - timedelta(days=30))]
-    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0, profile=None: iter(norms))
+    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0: iter(norms))
+    monkeypatch.setattr(ingest_x, "_ConvoFetcher", _RecordingConvo)
     monkeypatch.setattr(twapi_mod, "tweet_to_markdown",
                         lambda norm, article=None, thread_tweets=None, source=None,
                         footer_label=None: f"body {norm['id']}")
@@ -161,7 +156,7 @@ def test_the_filter_skips_rather_than_stopping_the_walk(kb_home, fake_embedder, 
     monkeypatch.setattr(vision, "enrich_tweet_media", lambda norm, cache, *, describe_all: 0)
 
     conn = schema.connect()
-    summary = ingest_x.sync_bookmarks(conn, fake_embedder, fetch_threads=False,
+    summary = ingest_x.sync_bookmarks(conn, fake_embedder,
                                       since=_NOW - timedelta(days=365))
     assert _atom_ids(conn) == {"x:recent"}          # the walk continued PAST the dropped row
     assert summary["out_of_window"] == 1
@@ -169,15 +164,18 @@ def test_the_filter_skips_rather_than_stopping_the_walk(kb_home, fake_embedder, 
 
 
 def test_curation_pull_threads_the_window_to_the_bookmark_arm_only(kb_home, monkeypatch):
-    """`bookmark_since` is the bookmark arm's knob and nothing else's — the other five sources
-    carry no window at all, and must not silently acquire one."""
+    """`bookmark_since` is the bookmark arm's knob and nothing else's — no other producer in the
+    pull carries a window at all, and none must silently acquire one."""
     from pipeline.kb import ingest_curation
 
     got: dict = {}
     monkeypatch.setattr(ingest_x, "sync_bookmarks",
                         lambda conn, emb, **kw: got.setdefault("bookmarks", kw) or {"source": "x"})
-    for name in ("sync_lists_signals", "sync_substack_subs", "sync_following_signals",
-                 "sync_likes_signals"):
+    # Every collector, including the two signal-only halves of the saved walks: unstubbed, they
+    # go to the real network — the Substack one reads the developer's own browser session.
+    for name in ("sync_lists_signals", "sync_substack_follows", "sync_substack_subscriptions",
+                 "sync_following_signals", "sync_likes_signals", "sync_bookmark_signals",
+                 "sync_substack_saved_signals"):
         monkeypatch.setattr(ingest_curation, name, lambda conn, **kw: {"ok": True})
     monkeypatch.setattr(ingest_curation, "sync_substack_saved",
                         lambda conn, emb, **kw: {"ok": True})
@@ -186,7 +184,12 @@ def test_curation_pull_threads_the_window_to_the_bookmark_arm_only(kb_home, monk
     conn = schema.connect()
     out = ingest_curation.curation_pull(conn, object(), bookmark_since=cutoff)
     assert got["bookmarks"]["since"] == cutoff
-    # And the pull's own clock covers all six labels — the only timing the signal-only arms have.
-    assert set(out["stage_seconds"]) == {"x-bookmarks", "x-lists", "substack-subs",
-                                         "substack-saved", "x-following", "x-likes"}
+    # And the pull's own clock covers every producer — the only timing the signal-only arms have.
+    # `paper-authors` is the one that makes no network call; it is on the clock anyway, because a
+    # producer missing from the profile shows up only as an unexplained gap in the wall clock.
+    assert set(out["stage_seconds"]) == {"x-bookmarks", "x-bookmark-signals", "x-lists",
+                                         "substack-follows", "substack-subscriptions",
+                                         "substack-saved-signals", "substack-saved",
+                                         "x-following", "x-likes",
+                                         "paper-authors", "paper-coauthors"}
     conn.close()

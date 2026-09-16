@@ -45,7 +45,7 @@ from .conftest import last_run
 # ceiling and turns a planted 12-atom cluster into one admitted atom.
 DIM = 24
 _NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=timezone.utc)
-_USAGE = {"model": "test/model", "in_tokens": 900, "out_tokens": 300, "cost_usd": 0.0021}
+_USAGE = {"model": "test/model", "in_tokens": 900, "out_tokens": 300}
 
 
 @pytest.fixture()
@@ -119,7 +119,7 @@ def _region(conn, label="mlx", *, floor=0.68, when=_NOW, **kw):
 class _Resp:
     def __init__(self, text):
         self.text, self.model = text, "fake-model"
-        self.input_tokens, self.output_tokens, self.cost_usd = 100, 20, 0.01
+        self.input_tokens, self.output_tokens = 100, 20
         self.raw = {}
 
 
@@ -293,7 +293,7 @@ def test_the_oldest_pointed_region_goes_first(conn):
 
 # ── new mass ────────────────────────────────────────────────────────────────────
 def _read_now(conn, sitting_id, at=_NOW):
-    sst.mark_read(conn, sitting_id, status="ok", at=at)
+    sst.mark_read(conn, sitting_id, at=at)
 
 
 # Every arrival stamp is a full DAY after `_NOW`, and that gap is load-bearing rather than tidy:
@@ -607,3 +607,68 @@ def test_a_read_that_skips_does_not_count_against_the_breaker(conn, ready):
     assert queue[0]["sitting_id"] == rec["sitting_id"]
     assert ss.run_sitting_scheduler(conn, now=_NOW)["status"] == "skipped"
     assert ss.health(conn)["breaker_open"] is False
+
+
+def test_an_atom_the_region_already_read_is_not_counted_as_new_mass(conn):
+    """THE TRIGGER MUST AGREE WITH THE BUILD ABOUT WHAT "NEW" MEANS. `build_sitting` subtracts the
+    chain; this scan did not, so an atom the region had already read could still buy a re-read of
+    it. Two rulings meet here to make it reachable: membership widened to `REGION_VISIBLE`, so
+    frontier atoms are admitted and READ, and promotion opens the wallet, so a human touch stamps
+    one of those already-read atoms with a fresh `promoted_at`. The scan then sees new mass, the
+    regrow finds the atoms already in the chain, and the read is bought for nothing.
+    """
+    _atom(conn, "a:mlx-seed", _axis(0), who="x:alice", first_seen="2026-01-01 00:00:00")
+    _atom(conn, "a:mlx-near", _unit(0.85 * _axis(0) + 0.53 * _axis(1)), who="x:bob",
+          first_seen="2026-01-01 00:00:00")
+    _arrive(conn, 8, first_seen="2026-01-02 00:00:00", entry_mode="frontier")
+    rec = sb.build_sitting(conn, sb.resolve_seed(conn, atom_ids=["a:mlx-seed"], label="mlx"),
+                           floor=0.68, now=_NOW)
+    chain = set(sb.chain_atom_ids(conn, rec["sitting_id"]))
+    already_read = sorted(a for a in chain if a.startswith("a:new-"))
+    assert len(already_read) >= 3, "the fixture did not admit the frontier atoms it is about"
+    _read_now(conn, rec["sitting_id"])
+
+    # The human touch: promotion stamps a fresh `promoted_at` on atoms this region already read.
+    for aid in already_read:
+        ingest_common.promote_atom(conn, aid, "user-saved")
+
+    assert ss.claims(conn) == [], \
+        "atoms already in the chain were counted as new mass and bought a re-read of nothing"
+
+
+def test_unroutable_models_record_a_skipped_run_so_health_names_the_real_cause(conn, monkeypatch):
+    """`ever_ran` IS the signal for "this loop never fired", and it is derived from COUNT(*) on the
+    run table. So the one early return that wrote no row made a routing outage indistinguishable
+    from a rail that was never wired — and `health()`'s remediation then tells the user to run the
+    CLI by hand, which takes the same silent path and teaches them nothing.
+
+    The other no-row early returns on this rail are deliberate and stay: `plan_only` must not make
+    `ever_ran` report a live loop (see the test above). This one is not a plan; it is a real pass
+    that could not proceed, which is what `skipped` means everywhere else here.
+    """
+    monkeypatch.setattr(ss, "models_unroutable", lambda rail: "no model routed for role 'reader'")
+    rec = _region(conn, "mlx", when=_NOW)
+    _asked(conn, rec["sitting_id"])
+
+    res = ss.run_sitting_scheduler(conn, now=_NOW)
+    assert res["status"] == "models_unroutable"
+
+    row = last_run(conn, generator=ss.GENERATOR)
+    assert row is not None, "a routing outage left no trace at all"
+    assert row["status"] == "skipped" and "no model routed" in row["reason"]
+
+    h = ss.health(conn)
+    assert h["ever_ran"] is True, "an outage must not read as 'never run'"
+
+
+def test_a_plan_still_records_no_run_when_models_are_unroutable(conn, monkeypatch):
+    """The routability gate must stay behind `plan_only`: a plan spends nothing, so gating it would
+    block a free report, and recording a row for it would resurrect exactly the `ever_ran` lie the
+    test above fixes — from the other direction."""
+    monkeypatch.setattr(ss, "models_unroutable", lambda rail: "no model routed for role 'reader'")
+    rec = _region(conn, "mlx", when=_NOW)
+    _asked(conn, rec["sitting_id"])
+
+    res = ss.run_sitting_scheduler(conn, plan_only=True, now=_NOW)
+    assert res["status"] == "plan" and len(res["claims"]) == 1
+    assert last_run(conn, generator=ss.GENERATOR) is None

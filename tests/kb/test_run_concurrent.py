@@ -72,8 +72,34 @@ def test_source_error_drains_produced_prefix_not_aborts():
         raise RuntimeError("scrape DependencyError on the next page")   # mid-pagination transient
 
     got: list[int] = []
-    run_concurrent(flaky_source(), lambda i: i, got.append, workers=4)
+    report = run_concurrent(flaky_source(), lambda i: i, got.append, workers=4)
     assert sorted(got) == list(range(30))            # the fetched prefix survived; run didn't abort
+    # AND the caller can now tell that apart from a source that finished. It could not before: the
+    # handler logged one line and returned the same sentinel a StopIteration returns, so the loop
+    # drained normally and the caller honestly reported counters that happened to be short.
+    assert isinstance(report["source_error"], RuntimeError)
+
+
+def test_a_finished_source_reports_no_error():
+    """The other half of the pair, and the reason the first one matters. These two runs are
+    indistinguishable in every counter a caller keeps; `source_error` is the only thing that
+    separates them."""
+    report = run_concurrent(range(30), lambda i: i, [].append, workers=4)
+    assert report["source_error"] is None
+
+
+def test_a_source_that_dies_before_yielding_is_still_reported():
+    """The case NO caller could hand-roll. `ingest_blog` and `ingest_substack` each computed
+    `producer_failed = dispatched - consumed`; an iterator that raises before its first yield
+    dispatches nothing, so that difference is 0 and the failure is invisible. This is the shape a
+    dead X session takes in `sync_bookmarks`, which hand-rolled nothing at all."""
+    def dead_source():
+        raise RuntimeError("cookie expired")
+        yield                                        # unreachable; makes this a generator
+
+    report = run_concurrent(dead_source(), lambda i: i, [].append, workers=4)
+    assert isinstance(report["source_error"], RuntimeError)
+    assert report["producer_failed"] == 0            # nothing was ever dispatched to fail
 
 
 def test_producer_error_skips_only_that_item():
@@ -82,8 +108,17 @@ def test_producer_error_skips_only_that_item():
             raise ValueError("bad producer")
         return i
     got: list[int] = []
-    run_concurrent(range(100), work, got.append, workers=8)
+    report = run_concurrent(range(100), work, got.append, workers=8)
     assert 42 not in got and len(got) == 99              # one skipped, the run finished
+    assert report["producer_failed"] == 1
+
+
+def test_a_producer_returning_none_is_not_a_failure():
+    """`dispatched - consumed`, the subtraction two callers hand-rolled, could not tell these two
+    apart: a `work_fn` that RAISED and one that legitimately returned nothing both leave the
+    consumer un-called. Counting the raise where it happens can."""
+    report = run_concurrent(range(10), lambda i: None, [].append, workers=4)
+    assert report["producer_failed"] == 0
 
 
 def test_consumer_error_skips_only_that_result():
@@ -92,8 +127,9 @@ def test_consumer_error_skips_only_that_result():
             raise ValueError("bad consumer")
         got.append(i)
     got: list[int] = []
-    run_concurrent(range(50), lambda i: i, consume, workers=8)
+    report = run_concurrent(range(50), lambda i: i, consume, workers=8)
     assert 7 not in got and len(got) == 49
+    assert report["consumer_failed"] == 1
 
 
 def test_submission_window_stays_bounded():
@@ -128,9 +164,10 @@ class _ManyConvo:
     odd, and mirrors the resolved-ledger add. Its counters are locked (many producer threads)."""
     backend = "twitterapi"
 
-    def __init__(self, profile, checked):
+    def __init__(self, checked):
         self.checked = checked
         self.n_calls = self.n_failed = self.n_chains = 0
+        self.enabled = True        # mirrors the real fetcher: the funnel reports its kill switch
         self._lock = threading.Lock()
 
     def chain(self, tid):
@@ -164,7 +201,7 @@ def test_sync_bookmarks_concurrent_equivalence_and_single_writer(kb_home, fake_e
              for i in range(1, 61)]
 
     monkeypatch.setattr(ingest_x, "_INGEST_WORKERS", 8)   # force real concurrency
-    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0, profile=None: iter(norms))
+    monkeypatch.setattr(xg, "iterate_bookmarks", lambda limit=0: iter(norms))
     monkeypatch.setattr(twapi_mod, "tweet_to_markdown",
                         lambda norm, article=None, thread_tweets=None, source=None,
                         footer_label=None: f"body {norm['id']}")
@@ -185,7 +222,10 @@ def test_sync_bookmarks_concurrent_equivalence_and_single_writer(kb_home, fake_e
     monkeypatch.setattr(ingest_x, "_ConvoFetcher", _ManyConvo)
 
     conn = schema.connect()
-    summary = ingest_x.sync_bookmarks(conn, fake_embedder, fetch_threads=True)
+    # `enrich=True`: the concurrency this pins is the PRODUCER pool's, and on the free pass the
+    # producers do neither of the two things that make a producer worth parallelizing (the thread
+    # fetch and the image read), so there would be nothing to observe.
+    summary = ingest_x.sync_bookmarks(conn, fake_embedder, enrich=True)
 
     # Concurrency was REAL (not accidentally serialized on one thread).
     assert len(producer_threads) > 1

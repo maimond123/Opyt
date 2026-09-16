@@ -84,7 +84,7 @@ def test_compute_trust_x_seed_identity_and_bidirectional_collapse(monkeypatch):
     monkeypatch.setattr(dp, "fetch_profile_links", lambda url, timeout=12: [])
     monkeypatch.setattr(dp, "fetch_substack_twitter_handle", lambda url, timeout=12: None)
     verdicts = dp._compute_trust(
-        "naval", root_id, identity_targets, profile_info, [], all_sources)
+        "naval", root_id, identity_targets, [], all_sources)
 
     assert verdicts[ci("https://nav.al")].trusted               # Rule 5 (declared)
     assert "Identity-attested" in verdicts[ci("https://nav.al")].reasons[0]
@@ -94,7 +94,7 @@ def test_compute_trust_x_seed_identity_and_bidirectional_collapse(monkeypatch):
 
 def test_compute_trust_substack_seed_reaches_t1_with_no_x():
     """The de-X-rooting payoff: a Substack-rooted person's declared userLinks (X, site,
-    YouTube) all reach T1 via identity edges — no X profile in the root set at all."""
+    GitHub) all reach T1 via identity edges — no X profile in the root set at all."""
     import importlib
     dp = importlib.import_module("pipeline.ingestion.discover_profile")
     ci = dp.canonical_identity
@@ -104,14 +104,14 @@ def test_compute_trust_substack_seed_reaches_t1_with_no_x():
     identity_targets = [
         (ci("x.com/them"), True),          # connected account (verified)
         (ci("https://them.com"), False),   # declared website
-        (ci("https://youtube.com/@them"), False),
+        (ci("https://github.com/them"), False),
     ]
-    all_sources = [DS("youtube", "https://youtube.com/@them"), DS("blog", "https://them.com")]
+    all_sources = [DS("github", "https://github.com/them"), DS("blog", "https://them.com")]
 
     # skip_edge_fetch → no landing fetch, no hub expansion, no cold-start: purely the
     # identity edges → Rule 5 → all declared accounts reach T1 with no X in the root set.
     verdicts = dp._compute_trust(
-        "them", root_id, identity_targets, {"display_name": "Them"}, [], all_sources,
+        "them", root_id, identity_targets, [], all_sources,
         skip_edge_fetch=True)
 
     for tid, _v in identity_targets:

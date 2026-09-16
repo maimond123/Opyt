@@ -1,7 +1,7 @@
 """
 pipeline/kb/ingest_blog.py — a confirmed Oracle's OWN blog archive → OPINION atoms.
 
-Stage-5 footprint ingest (after Substack; YouTube's footprint lives in Radar instead). Fetch is
+Stage-5 footprint ingest for personal blogs. Fetch is
 ported from `pipeline.ingestion.ingest_blog` (`_fetch_sitemap_urls` + trafilatura
 `_fetch_article`) rather than copied. who_id = `blog:{canonical_host}` (`derive.blog_entity_id`);
 atom_id = `_canon_post_url` = `blog:{host}{path}[?query]`, path-preserving so posts don't collapse
@@ -233,7 +233,7 @@ def build_article_atom(article: dict, *, url: str, atom_id: str, blog_url: str, 
     raw_ref, raw_hash = decided
 
     # Replay the pre-enrichment mask onto the enriched body so descriptions land in the CHUNKS
-    # (the snapshot above is still the full page, re-derivable via rechunk-from-raw). Fail-safe:
+    # (the snapshot above is still the FULL page, which is what `open()` serves). Fail-safe:
     # if enrichment changed the unit count, re-grade the enriched body rather than emit mis-sliced
     # text that could silently drop real writing and keep an ad.
     md_kept = content_gate.reapply_keep(md, verdict.keep)
@@ -305,6 +305,9 @@ def article_atom_from_url(conn: sqlite3.Connection, embedder, url: str, *,
         return "present", atom_id
 
     try:
+        # Match the crawl and direct GitHub paths: reject known vector-subspace drift before the
+        # fetch, VLM fan-out, raw archival, or embedding that the writer would later reject.
+        assert_model(conn, embedder)
         article = _fetch_article(u)
         verdict = _classify_article(article)
         if verdict != FETCH_OK:
@@ -386,13 +389,14 @@ def sync_blog_footprint(conn: sqlite3.Connection, embedder, *, blog_url: str,
     # the baseline. `timer` instruments the serial fetch path to size a future producer pool.
     timer = StageTimer()
     # `seen` is loaded BEFORE discovery because discovery consumes it (a gray candidate already
-    # in the store is dropped before the paid LLM triage). `known_urls` excludes body-pending
-    # atoms — a post stored without a body because its fetch was BLOCKED must stay a discovery
-    # candidate, or the block freezes into a permanent hole.
+    # in the store is dropped before the paid LLM triage). A blocked blog fetch writes NOTHING
+    # (`_jobs` continues on FETCH_UNDETERMINED), so the post never enters `seen` and stays a
+    # discovery candidate by construction — no body-pending subtraction is possible or needed on
+    # this rail. The substack rail is the one that keeps a stub; `ingest_curation` subtracts there.
     seen = schema.load_hashes(conn, "blog")
-    known_urls = set(seen) - schema.load_body_pending(conn, "blog")
+    known_urls = set(seen)
     with timer.stage("discovery"):       # sitemap ∪ hub-harvest, once per sync
-        entries = link_discovery.discover_candidate_urls(base, handle=handle,
+        entries = link_discovery.discover_candidate_urls(base,
                                                          author_name=author_name,
                                                          known_urls=known_urls)
     with timer.stage("feed_dates"):      # once per sync: real pubDates to cross-reference onto URLs
@@ -414,7 +418,7 @@ def sync_blog_footprint(conn: sqlite3.Connection, embedder, *, blog_url: str,
     dispatched = challenge_skipped = undetermined = 0
     # consumed/submitted/skipped/gate_rejected: a shared dict, not four more `nonlocal` ints — see
     # `make_consumer`'s docstring for why (its `_consume` closure is defined outside this scope).
-    counters = {"consumed": 0, "submitted": 0, "skipped": 0, "gate_rejected": 0}
+    counters = {"submitted": 0, "skipped": 0, "gate_rejected": 0}
     author = ((f"@{handle.lstrip('@')}" if handle else None)
               or author_name or canonical_identity(base) or "blog")
 
@@ -481,20 +485,31 @@ def sync_blog_footprint(conn: sqlite3.Connection, embedder, *, blog_url: str,
     # Byte-identical to `ingest_substack`'s consumer — see `ingest_common.make_consumer`.
     _consume = make_consumer(sink, seen, counters, _mark)
 
-    run_concurrent(_jobs(), _work, _consume, workers=POST_WORKERS, inflight=POST_INFLIGHT)
+    report = run_concurrent(_jobs(), _work, _consume, workers=POST_WORKERS,
+                            inflight=POST_INFLIGHT)
     sink.close()
     save_image_cache(opyt_home(), img_cache)   # persist new VLM descriptions for the next run
     # A poison-chunk atom the sink isolates fires no _mark → not counted, not marked durable,
     # retried next run. `failed` = submitted-but-never-durable.
-    return {"source": "blog", "added": counts["added"], "skipped": counters["skipped"],
-            "challenge_skipped": challenge_skipped, "undetermined": undetermined,
-            "failed": counters["submitted"] - counts["added"],
-            # `dispatched` = handed to the pool. A gap vs what the consumer saw means a producer
-            # RAISED (run_concurrent logs and skips those) — tracked here so it isn't silently lost.
-            "dispatched": dispatched, "producer_failed": dispatched - counters["consumed"],
-            "gate_rejected": counters["gate_rejected"],
-            "stage_seconds": timer.totals, "stage_latency": timer.distribution(),
-            # per-CALL (not per-atom) — separates "one unlucky call" from "the provider
-            # is slow right now", which decide oppositely on hedging.
-            **llm_run_stats(llm0),
-            "total": schema.count_atoms(conn, "blog")}
+    out = {"source": "blog", "added": counts["added"], "skipped": counters["skipped"],
+           "challenge_skipped": challenge_skipped, "undetermined": undetermined,
+           "failed": counters["submitted"] - counts["added"],
+           # `dispatched` = handed to the pool, which is what `limit` caps. `producer_failed`
+           # comes from the runner now: it counts producers that RAISED, where the local
+           # `dispatched - consumed` this used to compute could not tell a raise from a `_work`
+           # that returned nothing, and could not see a source failure at all.
+           "dispatched": dispatched, "producer_failed": report["producer_failed"],
+           "gate_rejected": counters["gate_rejected"],
+           "stage_seconds": timer.totals, "stage_latency": timer.distribution(),
+           # per-CALL (not per-atom) — separates "one unlucky call" from "the provider
+           # is slow right now", which decide oppositely on hedging.
+           **llm_run_stats(llm0),
+           "total": schema.count_atoms(conn, "blog")}
+    if report["source_error"] is not None:
+        # The post list died mid-walk. `error` + the `undetermined` already in the dict is
+        # `classify_run`'s BLOCKED — the right word for a host that stopped us, and the reason
+        # `_route_source` will not report this run as ingested. Before this the run reported
+        # whatever it had reached and nothing said the walk was cut short.
+        e = report["source_error"]
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out

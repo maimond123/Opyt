@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from pipeline.ingestion import x_graphql as xg
+from pipeline.ingestion import x_graphql_core as xg
 from pipeline.ingestion import x_graphql_core as core
 
 
@@ -72,29 +72,29 @@ def _page(entries: list[dict], *, pinned: dict | None = None) -> dict:
 # ── 1. the normalizer carries the filter's two decision fields ────────────────
 
 def test_normalize_marks_a_retweet():
-    assert xg._normalize(_result("1", retweet=True))["isRetweet"] is True
+    assert xg.normalize(_result("1", retweet=True))["isRetweet"] is True
 
 
 def test_normalize_does_not_infer_a_retweet_from_the_text_prefix():
     # "RT @" is a rendering convention, not a fact — anyone can type it.
-    assert xg._normalize(_result("1", text="RT @someone: stolen take"))["isRetweet"] is False
+    assert xg.normalize(_result("1", text="RT @someone: stolen take"))["isRetweet"] is False
 
 
 def test_normalize_carries_the_numeric_reply_target():
-    norm = xg._normalize(_result("2", uid="11", reply_to_uid="77"))
+    norm = xg.normalize(_result("2", uid="11", reply_to_uid="77"))
     assert norm["isReply"] is True
     assert norm["inReplyToUserId"] == "77"      # the filter compares THIS to the author's own id
 
 
 def test_normalize_leaves_reply_target_empty_on_an_original():
-    assert xg._normalize(_result("3"))["inReplyToUserId"] == ""
+    assert xg.normalize(_result("3"))["inReplyToUserId"] == ""
 
 
 def test_curation_filter_keeps_a_self_thread_off_normalized_output():
     """The point of the two new fields: the shipped filter must work on THIS shape unchanged."""
     from pipeline.kb.ingest_x_footprint import _filter_and_stitch
 
-    tweets = [xg._normalize(t) for t in (
+    tweets = [xg.normalize(t) for t in (
         _result("1", uid="11", conv="1"),                        # original
         _result("2", uid="11", reply_to_uid="11", conv="1"),     # SELF-reply → thread continuation
         _result("3", uid="11", reply_to_uid="99"),               # reply to someone else → dropped

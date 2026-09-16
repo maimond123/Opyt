@@ -1,0 +1,45 @@
+[Unit]
+Description=OPYT hosted MCP gateway
+After=network.target
+
+[Service]
+User=opyt
+EnvironmentFile=/etc/opyt-gateway.env
+Environment=OPYT_GATEWAY_HOST=127.0.0.1
+Environment=OPYT_GATEWAY_PORT=8080
+# Inherited by every child, so a product action can queue durable rail work into the one
+# database opyt-worker.service reads. It must match that unit's value exactly; a child that has
+# a home id and no control database refuses to queue rather than writing where nothing looks.
+Environment=OPYT_WORKER_DB=/var/lib/opyt-worker/rail_jobs.db
+# Declared here too, so the directory exists for a child even if the worker has never started.
+StateDirectory=opyt-worker
+WorkingDirectory=/srv/opyt-src
+ExecStart=/srv/opyt-src/.venv/bin/python -m gateway
+Restart=always
+KillMode=control-group
+# Bounds the gateway's whole process group: every MCP child and every interactive sign-in
+# desktop spawned by this service. 20G of the measured 31 GB, against 8G for the worker.
+# What it buys: the gateway tree cannot starve opyt-worker.service or the OS.
+#
+# What it does NOT buy, despite what this comment claimed until 2026-09-08: isolation BETWEEN
+# users. All users share this one cgroup, so an in-cgroup OOM still selects a victim by RSS
+# across users. Per-user containment needs a transient scope per sign-in; nothing here provides
+# it. Restoring the sign-in cap below is what keeps the box off that path in the first place.
+#
+# MemoryHigh is deliberately absent: it throttles by reclaim pressure, which on a swapless box
+# is thrashing rather than a bounded failure — the same reason no swap was configured.
+MemoryMax=20G
+# REQUIRED alongside MemoryMax, not optional. systemd defaults OOMPolicy to `stop`, so without
+# this line one OOM-killed Chrome stops the unit, KillMode=control-group takes every OTHER
+# user's MCP child down with it, and Restart=always brings the gateway back empty. That turns a
+# one-user failure into an all-users outage, and MemoryMax is what would trigger it — at 20G,
+# well before the box's own 31 GB limit. `continue` logs the kill and keeps the unit running.
+OOMPolicy=continue
+# How many interactive sign-in desktops may be open at once, across every user. Above it the
+# visitor gets a 503 page telling them to wait and reload, and their sign-in link is NOT spent.
+# Six is a launch floor set below anything measured; gateway/children.py DEFAULT_MAX_SIGNINS
+# carries the derivation. Raise it only on evidence from the logged refusals.
+Environment=OPYT_GATEWAY_MAX_SIGNINS=6
+
+[Install]
+WantedBy=multi-user.target

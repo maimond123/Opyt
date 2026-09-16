@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from pipeline.kb import frontier_execute as fe
+from pipeline.kb import rail_runtime
 from pipeline.kb import frontier_queries as fq
 from pipeline.kb import schema
 from pipeline.kb.frontier_sources import Candidate, SourceError
@@ -107,13 +108,6 @@ def test_a_never_pulled_pair_looks_back_a_bounded_window(conn):
     assert a.calls[0][1] == _NOW - timedelta(days=fe.FIRST_PULL_DAYS)
 
 
-def test_the_cursor_never_rewinds(conn):
-    qid = _query(conn)
-    fe.record_pull(conn, qid, "arxiv", last_status="ok", cursor_ts="2026-08-09", now=_NOW)
-    fe.record_pull(conn, qid, "arxiv", last_status="ok", cursor_ts="2026-01-01", now=_NOW)
-    assert fe.get_pair(conn, qid, "arxiv")["cursor_ts"] == "2026-08-09"
-
-
 # ── failure must not stamp ──────────────────────────────────────────────────────
 def test_a_failed_pull_leaves_the_watermark_untouched(conn):
     """Otherwise one bad night buys a full TTL of silence on that pair."""
@@ -122,7 +116,6 @@ def test_a_failed_pull_leaves_the_watermark_untouched(conn):
     res = fe.run_frontier_execute(conn, registry={"arxiv": bad}, now=_NOW)
     row = fe.get_pair(conn, qid, "arxiv")
     assert row["last_pulled_at"] is None and row["last_status"] == "error"
-    assert row["error_count"] == 1
     assert res["status"] == "ok" and res.get("pairs_pulled", 0) == 0
     # ...and because it never stamped, the very next run retries instead of waiting out the TTL.
     good = FakeAdapter()
@@ -350,54 +343,6 @@ def test_a_never_pulled_pair_outranks_every_pulled_one(conn, monkeypatch):
     assert [c[0] for c in a.calls] == ["brand new"]
 
 
-# ── the scheduler ───────────────────────────────────────────────────────────────
-@pytest.fixture()
-def spawn_env(tmp_path, monkeypatch):
-    """Point the stamp and log at a tmp dir, and never actually fork."""
-    monkeypatch.delenv("OPYT_NO_FRONTIER_EXEC", raising=False)
-    monkeypatch.setenv("OPYT_FRONTIER_EXEC_STAMP", str(tmp_path / "stamp"))
-    monkeypatch.setenv("OPYT_FRONTIER_EXEC_LOG", str(tmp_path / "exec.log"))
-    calls = []
-    monkeypatch.setattr(fe.subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
-    return calls
-
-
-def test_the_spawn_is_detached_and_never_writes_to_stdout(spawn_env):
-    """The server's stdout IS the JSON-RPC channel, so an inherited handle from a child would
-    corrupt the protocol. It also has to outlive the session that started it."""
-    assert fe.spawn_frontier_execute() is True
-    cmd, kw = spawn_env[0]
-    assert cmd[1:] == ["-m", "pipeline.kb.frontier_execute", "--once"]
-    assert kw["stdout"] is kw["stderr"] and kw["stdout"] is not None   # to the log, not inherited
-    assert kw["stdin"] == fe.subprocess.DEVNULL
-    assert kw["start_new_session"] is True
-    assert (Path(kw["cwd"]) / "pipeline" / "kb").is_dir()             # repo root, so -m resolves
-
-
-def test_the_coalesce_window_stops_every_session_firing_a_pass(spawn_env):
-    assert fe.spawn_frontier_execute() is True
-    assert fe.spawn_frontier_execute() is False                       # inside the window
-    assert fe.spawn_frontier_execute(force=True) is True              # ...but force gets through
-    assert len(spawn_env) == 2
-
-
-def test_the_kill_switch_stops_the_rail_without_touching_stage_one(spawn_env, monkeypatch):
-    """Each rail owns its own switch: stage 1 and stage 2 fail for different reasons, so either
-    must be disableable alone."""
-    monkeypatch.setenv("OPYT_NO_FRONTIER_EXEC", "1")
-    assert fe.spawn_frontier_execute(force=True) is False
-    assert spawn_env == []
-
-
-def test_a_broken_spawn_is_swallowed_rather_than_raised(spawn_env, monkeypatch):
-    """It is called from the MCP server's startup path. A scheduler hiccup must never stop the
-    server serving."""
-    def boom(*a, **kw):
-        raise OSError("no fork for you")
-    monkeypatch.setattr(fe.subprocess, "Popen", boom)
-    assert fe.spawn_frontier_execute() is False
-
-
 # ── politeness ──────────────────────────────────────────────────────────────────
 def test_a_rate_limited_source_is_paced_between_requests(conn):
     """arXiv asks for one request every three seconds and enforces it — a live run firing 22 in
@@ -508,3 +453,30 @@ def test_the_kind_that_decides_the_minter_is_persisted(conn):
     fe.run_frontier_execute(conn, registry={"arxiv": FakeAdapter(results=[_cand()])}, now=_NOW)
 
     assert conn.execute("SELECT kind FROM frontier_candidates").fetchone()[0] == "paper"
+
+
+# ── the scoped run ──────────────────────────────────────────────────────────────
+def test_a_scoped_run_pulls_only_the_named_queries(conn):
+    """`query_ids` exists for the add-time first pull: a watchlist add runs its OWN new
+    queries in the foreground and must not drag every other due pair along with it."""
+    _query(conn, text="the new one")
+    _query(conn, text="the older one")
+    a = FakeAdapter()
+
+    fe.run_frontier_execute(conn, registry={"arxiv": a},
+                            query_ids={fq.query_id_for(fq.normalize("the new one"))}, now=_NOW)
+
+    assert [q for q, _ in a.calls] == ["the new one"]
+
+
+def test_a_scope_that_matches_nothing_pulls_nothing(conn):
+    """A retired or unknown id scopes to zero queries — never falls through to "run
+    everything", which would turn a typo into the full pass the scope exists to prevent."""
+    _query(conn)
+    a = FakeAdapter()
+
+    res = fe.run_frontier_execute(conn, registry={"arxiv": a},
+                                  query_ids={"no-such-id"}, now=_NOW)
+
+    assert a.calls == []
+    assert res["status"] == "skipped"

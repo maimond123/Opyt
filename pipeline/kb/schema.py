@@ -158,17 +158,32 @@ CREATE TABLE IF NOT EXISTS entities (
 -- Stage-4 output: the user's CONFIRMED Oracles, keyed on the CANONICAL entity (so a
 -- cross-platform person is one oracle, not one-per-platform). Stage 5 reads this table
 -- to know which footprints to expand.
--- `ingest_from`/`ingest_to` are LIVE since 2026-08-05 (`set_oracle_window`): the window an
--- ingest actually covered, so a re-ingest knows what was already paid for. NULL from =
--- unbounded; NULL to = never ingested. `paused` is still reserved/inert.
+-- What an ingest COVERED is not here: it is per (Oracle x source), in `oracle_sources`
+-- (`last_pulled_at` / `covered_from`, pipeline/kb/oracle_refresh_state.py). This table answers
+-- "is this person an Oracle", nothing about how much of them we hold. `paused` is reserved/inert.
 CREATE TABLE IF NOT EXISTS oracles (
   canonical_id TEXT PRIMARY KEY,
   name         TEXT,
   source       TEXT,                   -- 'screen' (a ranked pick) | 'freeform' (a pasted handle)
   confirmed_at TEXT DEFAULT (datetime('now')),
-  ingest_from  TEXT,                   -- reserved (per-oracle date range) — inert v1
-  ingest_to    TEXT,                   -- reserved — inert v1
   paused       INTEGER NOT NULL DEFAULT 0  -- reserved — inert v1
+);
+
+-- A discovered source that is not safe to attribute needs a durable user decision. This is
+-- separate from `oracle_sources`: that table records pull coverage for sources already enabled;
+-- this table records whether a possible source is allowed to become enabled at all.
+CREATE TABLE IF NOT EXISTS oracle_review_items (
+  review_id         INTEGER PRIMARY KEY,
+  canonical_id      TEXT NOT NULL,
+  source_type       TEXT NOT NULL,
+  source_url        TEXT NOT NULL,
+  source_key        TEXT NOT NULL,     -- platform-aware canonical identity for deduplication
+  reason            TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending', -- pending | verified | approved | dismissed
+  verification_urls TEXT,              -- JSON URLs the user supplied to re-check the identity
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(canonical_id, source_type, source_key)
 );
 
 -- The OTHER knowledge bases this install can read — the reader-side registry, owned by
@@ -358,18 +373,27 @@ CREATE INDEX IF NOT EXISTS idx_fqg_generator ON frontier_query_generators(genera
 -- every other claimant's verdicts. The DEFAULT is 1 — a claim votes unless declared otherwise,
 -- matching how this rail treats silence.
 --
--- No shipping generator sets this to 0 today. `sitting:*` did, on the grounds that a sitting was
--- read exactly once so no verdict could ever arrive; that ended 2026-08-16 when `sitting_reader`
--- was taught verdicts (D11) and flipped to votable in the same commit, so retiring the bookmark
--- reader (D13) would not take decay with it. The column stays because the PROPERTY is real and a
--- future write-once generator will have it — not because anything currently declares it.
+-- The watchlist sets this to 0: `sitting_tools.py:386` calls `add_user_query(votable=False)`
+-- through a production path, since a query a person typed on purpose must not decay because
+-- nobody voted on it. `c046bfcf` (2026-08-25) added that and did not touch this comment, which
+-- until 2026-09-06 still said "no shipping generator sets this to 0 today" — a sentence born
+-- true and read as current for twelve days.
 --
--- `status` is the per-CHANNEL kill switch, and it is a HUMAN act exactly like
--- `frontier_queries.status`. Retiring a generator retires the queries whose last live claimant it
--- was; a query another live channel still wants keeps running. The alternative — filtering at
--- query time inside `active_queries` — was rejected: that list is both what stage 2 executes AND
--- what a reader is shown, so anything filtered there can never be verdicted or revived, and
--- retirement would stop being one visible value in one column.
+-- `sitting:*` also set it to 0 once, on the grounds that a sitting was read exactly once so no
+-- verdict could ever arrive; that ended 2026-08-16 when `sitting_reader` was taught verdicts
+-- (D11) and flipped to votable in the same commit, so retiring the bookmark reader (D13) would
+-- not take decay with it.
+--
+-- `status` WAS the per-CHANNEL kill switch. Nothing reads it and nothing writes it any more:
+-- `frontier_queries.retire_generator` (the only writer) and `generators` (the only reader outside
+-- it) were deleted on 2026-09-05, because neither had ever been run and neither had a door in the
+-- app. Decay already answers "that region turned out to be a dead end" without anyone acting — a
+-- quiet thread slows to the monthly floor and stays visible and revivable. Every row therefore
+-- holds the DEFAULT. The column is not dropped here only because dropping it is a migration; if
+-- you are about to write a second reader of it, delete the column instead.
+--
+-- Per-QUERY retirement is untouched and is still a human act: `frontier_queries.status`, written
+-- by `retire_query` and undone by `unretire_query`.
 --
 -- `label` exists because a slug is an id, not a name. `sitting:mlx-continuous-batching` does not
 -- tell you what region that was or when it was read.
@@ -392,9 +416,9 @@ CREATE TABLE IF NOT EXISTS frontier_generators (
 -- treated as a fact about the world — it is a machine opinion, and the admissibility rule keeps
 -- machine opinions out of the KB proper.
 -- `generator` scopes this table, and without it two reading rails corrupt each other. The bookmark
--- reader derives both its trigger ("new saves since the last ok run") and its single-flight cost cap
--- ("when did we last spend") from these rows. A sitting read landing here unscoped would satisfy
--- both — silently suppressing the next bookmark read and burning a cap it never paid into. NULL
+-- reader derives both its trigger ("new saves since the last ok run") and its single-flight rule
+-- ("when did we last read") from these rows. A sitting read landing here unscoped would satisfy
+-- both — silently suppressing the next bookmark read. NULL
 -- means "written before this column existed", which was bookmark-reader-only.
 CREATE TABLE IF NOT EXISTS frontier_reader_runs (
   run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -403,16 +427,15 @@ CREATE TABLE IF NOT EXISTS frontier_reader_runs (
   -- Which lens produced this row. NULL on every row written before Job L — those all predate the
   -- lens split, so NULL means 'queries' by construction, the same way a NULL `generator` means
   -- 'bookmark-reader' above. A host-side lens (briefing, trajectory, disconfirmation, gaps) writes
-  -- a RECEIPT here — this column set, no consensus/queries/cost — never a full read row; see
+  -- a RECEIPT here — this column set, no consensus/queries — never a full read row; see
   -- `sitting_reader.record_lens_run`. This is what lets `sitting_scheduler`'s `pointed` channel
   -- tell "a queries read was attempted and failed" (retry it) apart from "a lens read the region
   -- and stored nothing" (not a retry signal) — see docs/plans/2026-08-16-lens-reads-subscribe-a-region.md.
   lens        TEXT,
   ran_at      TEXT NOT NULL,
-  window_from TEXT, window_to TEXT,
   atoms_read  INTEGER,
   consensus   TEXT,
-  model       TEXT, in_tokens INTEGER, out_tokens INTEGER, cost_usd REAL,
+  model       TEXT, in_tokens INTEGER, out_tokens INTEGER,
   -- `emitted` is the one counter every lens shares: how many records this run produced (queries, or
   -- Job N's claims). `new`/`refreshed`/`kept`/`dropped`/`unverdicted` are QUERY-SHAPED — they answer
   -- questions ("was this seen before", "did it survive a verdict") that only make sense where a
@@ -512,8 +535,14 @@ CREATE TABLE IF NOT EXISTS sittings (
   -- re-read trigger cannot be computed without it — "how much new mass does this region hold" means
   -- re-running membership, which is cosine against THIS vector at THIS floor.
   seed_vector      BLOB,
-  read_at          TEXT,                 -- stamped when an agent actually READ it; NULL = unread
-  read_status      TEXT                  -- ok | failed — the reader's outcome, once there is one
+  -- Stamped when an agent actually READ it; NULL = unread, and `read_at IS NOT NULL` is the whole
+  -- test every reader makes. A `read_status` column sat beside this until 2026-09-06 holding the
+  -- literal 'ok' and nothing else: a FAILED read writes no stamp at all, so the region stays
+  -- unread and the ledger keeps asking for it (`sitting_reader._fail`), and the failure is
+  -- recorded in the run table. Do NOT bring it back — `b24fba39` removed the second writable
+  -- value because it was a second home for a fact the run log already owns, and the only thing
+  -- it added was a way to report a failure as coverage.
+  read_at          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sittings_read ON sittings(read_at);
 -- The indexes on `continues`, `parent_sitting_id` and `region_key` are created in `init_kb_schema`,
@@ -559,8 +588,8 @@ CREATE TABLE IF NOT EXISTS sitting_claims (
 );
 CREATE INDEX IF NOT EXISTS idx_sitting_claims_sitting ON sitting_claims(sitting_id);
 
--- Per-LENS read state, additive alongside `sittings.read_at`/`read_status` rather than a
--- replacement for them. `queries` keeps its existing stamp on `sittings` — `sitting_scheduler`'s
+-- Per-LENS read state, additive alongside `sittings.read_at` rather than a replacement for it.
+-- `queries` keeps its existing stamp on `sittings` — `sitting_scheduler`'s
 -- `pointed`/`sub_region`/new-mass SQL all read that column directly, and this table does not touch
 -- any of it. What this buys is a second lens (`claims` today) getting its OWN "never re-read once
 -- read" guard on the SAME sitting, independent of whether `queries` has read it — the two lenses
@@ -568,8 +597,7 @@ CREATE INDEX IF NOT EXISTS idx_sitting_claims_sitting ON sitting_claims(sitting_
 CREATE TABLE IF NOT EXISTS sitting_reads (
   sitting_id  TEXT NOT NULL,
   lens        TEXT NOT NULL,
-  read_at     TEXT NOT NULL,
-  read_status TEXT NOT NULL,          -- ok | failed
+  read_at     TEXT NOT NULL,          -- presence IS the state; see `sittings.read_at` above
   PRIMARY KEY (sitting_id, lens)
 );
 
@@ -577,11 +605,10 @@ CREATE TABLE IF NOT EXISTS sitting_reads (
 -- instruction applied to ONE part's rendered document. The host then receives every part's output
 -- at once, plus the lens's join rule, and performs the reduce in-session.
 --
--- AN IMMUTABLE-INPUT CACHE, and that is the entire reason it may be persisted at all. A sitting's
--- membership is frozen at build time, so a part's rendered document never changes and there is no
--- invalidation rule to get wrong — a closed part is lensed once per lens EVER. The open tail's
--- `sitting_id` churns on every rebuild, so it naturally re-maps without anything having to detect
--- that it went stale. Steady-state cost of any lens on any region is one call for the open part.
+-- Per-part cache. Membership is fixed at build time except when `forget` removes an atom;
+-- that removal discards affected parts' outputs in the same database transaction. The next
+-- lens read maps those parts again. Ordinary open-tail rebuilds get a new `sitting_id`, so they
+-- naturally miss the cache. Steady-state cost is one call for the open part.
 --
 -- The RECONCILED output is deliberately absent from this table and from every other (ruled
 -- 2026-08-25). Its input is the LIVE region, which is mutable, so storing it buys the invalidation
@@ -597,7 +624,6 @@ CREATE TABLE IF NOT EXISTS sitting_lens_outputs (
   model      TEXT,
   in_tokens  INTEGER,
   out_tokens INTEGER,
-  cost_usd   REAL,
   created_at TEXT NOT NULL,
   PRIMARY KEY (sitting_id, lens)
 );
@@ -614,10 +640,8 @@ CREATE TABLE IF NOT EXISTS frontier_query_sources (
   query_id       TEXT NOT NULL,
   source         TEXT NOT NULL,
   last_pulled_at TEXT,                 -- NULL = never pulled → infinitely stale
-  cursor_ts      TEXT,                 -- newest artifact DATE seen for this pair
   last_status    TEXT,                 -- ok | empty | error | no_adapter | breaker_open |
                                        -- window_refused (frontier_execute.window_ok said no)
-  error_count    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (query_id, source)
 );
 
@@ -679,7 +703,7 @@ CREATE TABLE IF NOT EXISTS frontier_exec_runs (
   ran_at TEXT NOT NULL,
   pairs_due INTEGER, pairs_pulled INTEGER, pairs_deferred INTEGER, requests INTEGER,
   candidates_new INTEGER, candidates_seen INTEGER,
-  status TEXT NOT NULL,                -- ok | skipped | failed | budget_paused
+  status TEXT NOT NULL,                -- ok | skipped | failed
   reason TEXT
 );
 
@@ -706,7 +730,6 @@ CREATE TABLE IF NOT EXISTS frontier_candidate_events (
   event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
   candidate_id TEXT NOT NULL,
   event        TEXT NOT NULL,          -- shown | dismissed
-  surface      TEXT,                   -- which carrier emitted it, for stage 5 attribution
   at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fce_candidate ON frontier_candidate_events(candidate_id, event);
@@ -847,15 +870,107 @@ def region_key(seed_kind: str, seed_ref, floor, ceiling, budget_tokens) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
-# Every index on `sittings`. Listed here because dropping the table drops its indexes, and the
-# rebuild below has to put them back — `init_kb_schema` creates three of these AFTER the rebuild
-# runs and `_DDL` creates the fourth BEFORE it, so neither alone would leave the table indexed.
-_SITTINGS_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_sittings_read ON sittings(read_at)",
-    "CREATE INDEX IF NOT EXISTS idx_sittings_continues ON sittings(continues)",
-    "CREATE INDEX IF NOT EXISTS idx_sittings_parent ON sittings(parent_sitting_id)",
-    "CREATE INDEX IF NOT EXISTS idx_sittings_region ON sittings(region_key)",
-)
+def _ddl_indexes(table: str) -> list[str]:
+    """Every `CREATE INDEX` statement `_DDL` declares for `table`. One declaration, read back.
+
+    This replaced `_SITTINGS_INDEXES`, a hand-kept tuple restating four indexes that `_DDL` and
+    `init_kb_schema` already declared between them — a third copy that had to be edited whenever
+    either of the other two was, and that only ever covered the one table someone had noticed."""
+    return [ln.rstrip(";") for ln in _DDL.splitlines()
+            if ln.startswith("CREATE INDEX") and f" ON {table}(" in ln]
+
+
+def _rebuild_without(conn: sqlite3.Connection, table: str, *drop_cols: str,
+                     after: tuple[str, ...] = ()) -> bool:
+    """Rebuild `table` from the CURRENT `_DDL` without `drop_cols`. True if it ran, False if the
+    store was already converged — a read, so no write lock.
+
+    The portable create-copy-drop-rename. NOT `ALTER TABLE ... DROP COLUMN`, which needs
+    SQLite >= 3.35 (2021-03), and the distributability invariant forbids assuming a version of
+    anything on the user's machine. `init_kb_schema` runs on EVERY writable `connect()`, so such a
+    statement is not a wrong answer — it is a store that does not OPEN, on a machine whose owner
+    did nothing but leave it closed for a fortnight.
+
+    ONE body, because there were five and the persistence rules are the part a copy gets subtly
+    wrong. Of the four below, three were wrong in all five copies; the fourth (indexes) was handled
+    in exactly one of them, and only by keeping a third list by hand.
+
+    THE COLUMN LIST IS INTERSECTED with the new table's, not taken from the old one. Every copy
+    read `PRAGMA table_info` on the OLD table while slicing the replacement DDL from the CURRENT
+    `_DDL`, so the moment `_DDL` dropped a SECOND column the two disagreed — `OperationalError:
+    table _sittings_new has no column named read_status` — and every store last written before the
+    first drop stopped opening. Reading the new table's own `table_info` after creating it is
+    exact and parses nothing.
+
+    NO `executescript`. It issues an implicit COMMIT, so the `BEGIN` above it was committed away
+    and the `CREATE TABLE _<t>_new` landed durably on its own; measured, `in_transaction` went
+    True then False across the call and the orphan survived a simulated crash. The slice is a
+    single statement, so `execute` runs it and the transaction stays open — which is the thing
+    that makes the rebuild atomic at all.
+
+    `DROP TABLE IF EXISTS` on the temp name first, because stores that ran the old code and were
+    interrupted carry that orphan right now. The old slice also replaced `CREATE TABLE IF NOT
+    EXISTS <t> (` with a bare `CREATE TABLE _<t>_new (`, so the retry raised `table _<t>_new
+    already exists` inside `init_kb_schema` on every connect, with no repair path. Dropping is
+    better than restoring the `IF NOT EXISTS`: an orphan from an older `_DDL` has the wrong shape,
+    and `IF NOT EXISTS` would silently reuse it.
+
+    `PRAGMA legacy_alter_table=ON` for the RENAME: a copied FK clause names the original table,
+    which does not exist between the DROP and the RENAME. This store never turns foreign keys on
+    (see `connect`), so those clauses are inert text either way.
+
+    THE TABLE'S OWN `_DDL` INDEXES ARE REISSUED. Dropping a table drops its indexes, and `_DDL`
+    already ran at the top of `init_kb_schema`, so an index declared beside the CREATE TABLE is
+    gone for the rest of that process — silently, because nothing reads an index to check it is
+    there. `init_kb_schema` re-creates SOME of them further down, and only for the tables where
+    somebody previously noticed. Taking them from `_DDL` needs no second list: an index there is
+    consistent with the table there by construction, since removing a column removes its index in
+    the same edit.
+
+    `after` is SQL to run inside the SAME transaction, after the rename — the `region_key` reset
+    `sittings` needs, and nothing else today. Running it outside the transaction leaves a window
+    where the table is converged and the follow-up is not, with nothing left to notice: the guard
+    reads False from then on.
+
+    MUST NOT become `BEGIN IMMEDIATE`. `d2d30591` rejected that: correct for the measured verdict,
+    but it keeps a race the system does not need to be having.
+    """
+    old = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+    if not old or not any(c in old for c in drop_cols):
+        return False
+
+    tmp = f"_{table}_new"
+    head = f"CREATE TABLE IF NOT EXISTS {table} ("
+    start = _DDL.index(head)
+    # SLICED OUT OF `_DDL` rather than spelled again: a hand-copied replica is a second source of
+    # truth for the schema, and the one thing a rebuild must never do is resurrect a column the
+    # DDL has dropped.
+    ddl = _DDL[start:_DDL.index("\n);", start) + 3].replace(head, f"CREATE TABLE {tmp} (", 1)
+
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+        conn.execute(ddl)
+        new = {r[1] for r in conn.execute(f"PRAGMA table_info({tmp})")}
+        keep = ",".join(c for c in old if c in new and c not in drop_cols)
+        conn.execute(f"INSERT INTO {tmp} ({keep}) SELECT {keep} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
+        for stmt in _ddl_indexes(table):
+            conn.execute(stmt)
+        for stmt in after:
+            conn.execute(stmt)
+        conn.commit()
+    except Exception:
+        # This function opened the transaction, so it closes it. Relying on the connection being
+        # discarded would work in `connect()`'s own failure path and nowhere else, and it makes
+        # "the rebuild runs entirely or not at all" a property of the caller instead of this unit.
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+    return True
 
 
 def _drop_sittings_lam(conn: sqlite3.Connection) -> None:
@@ -866,52 +981,170 @@ def _drop_sittings_lam(conn: sqlite3.Connection) -> None:
     commit — it survived only in storage, in two hashes and on one display line. Removed rather
     than left inert: a stored dial with a plausible name is what a future reader tunes.
 
-    NOT `ALTER TABLE ... DROP COLUMN`, which needs SQLite >= 3.35 — the distributability invariant
-    forbids assuming a version of anything on the user's machine. The portable
-    create-copy-drop-rename works on every SQLite that can open this store.
+    Every surviving row's `region_key` is restamped, because the key's recipe just lost an input.
+    `_backfill_region_keys` does the stamping; nulling the column here is what makes those rows
+    visible to it, and it rides in `after=` so it cannot land without the rebuild. `sitting_id` is
+    deliberately NOT restamped: it is an opaque event id, and `continues`/`parent_sitting_id`
+    reference it as a string.
 
-    The new table's DDL is SLICED OUT OF `_DDL` rather than spelled again here. A hand-copied
-    replica is a second source of truth for the schema, and the one thing a rebuild must never do
-    is resurrect a column the DDL has dropped.
-
-    No `PRAGMA foreign_keys` dance: this store never turns them on (see `connect`), so the two
-    self-references in the table are inert text. `legacy_alter_table` is set for the RENAME because
-    the copy's FK clauses name `sittings`, which does not exist between the DROP and the RENAME.
-
-    Every surviving row's `region_key` is then restamped, because the key's recipe just lost an
-    input. `_backfill_region_keys` does the stamping; nulling the column here is what makes those
-    rows visible to it. `sitting_id` is deliberately NOT restamped: it is an opaque event id, and
-    `continues`/`parent_sitting_id` reference it as a string.
+    Mechanics — portability, the DDL slice, the transaction — live in `_rebuild_without`.
     """
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(sittings)")]
-    if "lam" not in cols:
-        return
-    keep = ",".join(c for c in cols if c != "lam")
-    head = "CREATE TABLE IF NOT EXISTS sittings ("
-    start = _DDL.index(head)
-    ddl = _DDL[start:_DDL.index("\n);", start) + 3].replace(head, "CREATE TABLE _sittings_new (", 1)
+    _rebuild_without(conn, "sittings", "lam",
+                     after=("UPDATE sittings SET region_key = NULL",))
 
-    conn.execute("PRAGMA legacy_alter_table=ON")
-    try:
-        conn.execute("BEGIN")
-        conn.executescript(ddl)
-        conn.execute(f"INSERT INTO _sittings_new ({keep}) SELECT {keep} FROM sittings")
-        conn.execute("DROP TABLE sittings")
-        conn.execute("ALTER TABLE _sittings_new RENAME TO sittings")
-        for stmt in _SITTINGS_INDEXES:
-            conn.execute(stmt)
-        conn.execute("UPDATE sittings SET region_key = NULL")
-        conn.commit()
-    finally:
-        conn.execute("PRAGMA legacy_alter_table=OFF")
+
+def _drop_oracle_ingest_window(conn: sqlite3.Connection) -> None:
+    """SUBTRACTIVE migration, 2026-09-02: rebuild `oracles` without `ingest_from` / `ingest_to`.
+
+    They recorded the window an ingest covered, at the wrong grain: ONE window for a person whose
+    sources are pulled independently and fail independently. `set_oracle_window` was called
+    unconditionally, outside the try/except that swallowed a failed X pull, so a run whose X
+    timeline hit a rate limit still stamped the full requested window as covered — and
+    `oracle_refresh_state.seed_from_entities` then copied that stamp into every per-source row,
+    where `upsert_source`'s COALESCE made it permanent. The Oracle looked complete and no rail
+    would ever pick it up again.
+
+    Coverage now lives per (Oracle x source) in `oracle_sources`, written by whoever performed the
+    pull. Removed rather than left inert: a stored column with a plausible name and no writer is
+    what a future reader believes.
+
+    Mechanics live in `_rebuild_without`, which is guarded on a read so this is a no-op, and
+    takes no write lock, on a converged store.
+    """
+    _rebuild_without(conn, "oracles", "ingest_from", "ingest_to")
+
+
+def _drop_frontier_pair_counters(conn: sqlite3.Connection) -> None:
+    """SUBTRACTIVE migration, 2026-09-04: rebuild `frontier_query_sources` without `cursor_ts` /
+    `error_count`.
+
+    `cursor_ts`'s only reader was `since_for`'s fallback, and that branch was measured
+    UNREACHABLE: the five `record_pull` sites passing `stamp=False` never pass `cursor_ts`, the one
+    passing `cursor_ts` also passes `stamp=True`, and the SQL couples them — so no row could exist
+    with `cursor_ts` set and `last_pulled_at` NULL. The branch went in b0d1bda2 and left the column
+    with no reader at all. `error_count` was read by one test assertion and no production code; the
+    escalating back-off it was written for was never built.
+
+    Dropped rather than reconciled. The write was `MAX(COALESCE(?, ''), COALESCE(cursor_ts, ''))`,
+    which turns NULL into '', while the sibling implementing the same idea
+    (`oracle_refresh_state.record_pull`) writes `COALESCE(?, cursor_ts)` and does not — two copies
+    of one concept, already diverged. Deleting the column removes the divergence; fixing the write
+    would only re-align two copies that drifted once and would drift again. `last_status` stays: it
+    is an operator-readable diagnostic and costs one string.
+
+    Mechanics live in `_rebuild_without`.
+    Design record: docs/plans/2026-09-04-nine-open-deletion-decisions.md
+    """
+    _rebuild_without(conn, "frontier_query_sources", "cursor_ts", "error_count")
+
+
+def _drop_entities_kind(conn: sqlite3.Connection) -> None:
+    """SUBTRACTIVE migration, 2026-08-23, made PORTABLE 2026-09-05: rebuild `entities` without
+    `kind`.
+
+    `kind` held 1140 'person' (a hardcoded constant at 14 ingest sites), 2 'org' and 1 NULL, and
+    nothing read it — what a candidate IS is decided by the screen classifier and stored in
+    `profile.classified_kind`. The guard `no-entity-kind-column` states the full case.
+
+    WHY THIS IS NOT STILL `ALTER TABLE entities DROP COLUMN kind`. That statement needs
+    SQLite >= 3.35 (2021-03), it was the ONLY line in the repository imposing that floor (swept
+    2026-09-05; the highest version-gated feature anywhere else is `ON CONFLICT ... DO UPDATE`,
+    3.24, 2018, plus FTS5, 3.9, 2015), and it sat two hundred lines below the rule it broke. One
+    line was costing three years of SQLite compatibility for a column nothing reads.
+
+    ORDERING IS LOAD-BEARING, and it applies to every caller of `_rebuild_without`: they must run
+    in `init_kb_schema`'s REBUILD group, not among the read-guarded drops further down. Those sit
+    after an `INSERT OR IGNORE`, which opens an implicit transaction, and `BEGIN` inside one
+    raises "cannot start a transaction within a transaction". Measured 2026-09-05: it is the
+    INSERT that opens it, not the drops themselves — `DROP TABLE IF EXISTS` leaves
+    `in_transaction` False.
+
+    `idx_entities_canonical` is NOT recreated here. `init_kb_schema` creates it further down with
+    `IF NOT EXISTS`, which runs after this and so lands on the rebuilt table — which is why the
+    `after=` argument is empty for every table but `sittings`.
+    """
+    _rebuild_without(conn, "entities", "kind")
+
+
+def _drop_reader_cost_columns(conn: sqlite3.Connection) -> None:
+    """Rebuild the two response-receipt tables without their retired dollar field.
+
+    `cost_usd` was a locally derived provider-price estimate, not a product fact. It has no
+    reader after the dollar-accounting deletion, while the neighboring model and token metadata
+    remains useful operational evidence.
+
+    ONE TRANSACTION PER TABLE now, not one across both. A crash between them leaves the first
+    converged and the second not, and the next `connect()` finishes the second — which is a
+    better failure than an all-or-nothing that must redo work it already did correctly.
+    """
+    for table in ("frontier_reader_runs", "sitting_lens_outputs"):
+        _rebuild_without(conn, table, "cost_usd")
+
+
+def _drop_reader_run_windows(conn: sqlite3.Connection) -> None:
+    """SUBTRACTIVE migration, 2026-09-06: rebuild `frontier_reader_runs` without
+    `window_from` / `window_to`.
+
+    NEVER WRITTEN. `grep -rn "window_from="` returns nothing across the repository and always
+    has; the columns carried no DDL comment either, so no reader could learn what they were for.
+    They were substrate for a windowed reader that reads by SITTING instead — `sitting_id` and
+    `lens` are how a run says what it covered.
+
+    Removed rather than left inert: a stored column with a plausible name and no writer is what a
+    future reader believes, and two NULL date columns beside `ran_at` read as a coverage claim.
+    """
+    _rebuild_without(conn, "frontier_reader_runs", "window_from", "window_to")
+
+
+def _drop_read_status(conn: sqlite3.Connection) -> None:
+    """SUBTRACTIVE migration, 2026-09-06: rebuild both read-stamp tables without `read_status`.
+
+    Nothing reads the VALUE. Both callers of `sitting_store.lens_read_state` test the ROW, and
+    `_READ_SITTING_IDS` tests presence on both halves of its UNION. The writers only ever wrote
+    the literal `'ok'`, and `mark_lens_read`'s `ON CONFLICT` updates only `read_at` — so a
+    non-`ok` value, had one ever appeared, would have been PERMANENT with nothing able to correct
+    it.
+
+    DO NOT ADD A SECOND WRITABLE VALUE in its place. `b24fba39` removed exactly that: a
+    `status="failed"` on the read stamp was a second home for a fact the run log already owns, and
+    the only thing it added was a way to report a failure as coverage. The absence of a stamp is
+    the failure signal, and it is the one the ledger already reads.
+
+    `sitting_reads.read_status` was NOT NULL, so this rebuild is not optional for that table: the
+    column had to go from `_DDL` and the writer together or one of them would refuse the other.
+    """
+    for table in ("sittings", "sitting_reads"):
+        _rebuild_without(conn, table, "read_status")
+
+
+def _drop_candidate_event_surface(conn: sqlite3.Connection) -> None:
+    """SUBTRACTIVE migration, 2026-09-06: rebuild `frontier_candidate_events` without `surface`.
+
+    WRITE-ONLY, and with one writer passing one constant. Its DDL comment justified it "for stage
+    5 attribution", and stage 5 is ruled do-not-build —
+    `docs/plans/2026-08-13-…-context-brief.md:204`, under "what NOT to do next", says *"Do not
+    build stage 5 (LEARN)."* The column landed one day before that ruling.
+
+    The parameter went with it, down all three of `record_event` / `record_shown` /
+    `record_dismissed`, along with the `_SURFACE` constant in `frontier_tools` that its only
+    caller passed — a single value naming the tool doing the passing. A parameter with exactly one
+    value in the entire codebase does not record a distinction; it records that someone expected
+    one.
+
+    (The constant's spelling is deliberately not quoted here. `.guards.py`'s
+    `human-attested-stays-human` greps this file line by line for that word in quotes, because
+    that is the only signal an AST rule cannot give for tuple membership — and a docstring
+    quoting it is the false positive that gets a good rule disabled.)
+    """
+    _rebuild_without(conn, "frontier_candidate_events", "surface")
 
 
 def _drop_oracle_follows(conn: sqlite3.Connection) -> None:
     """SUBTRACTIVE migration, 2026-08-26: drop the write-only `oracle_follows` table.
 
-    It was W0 substrate for a follow-graph reader that was never built. Its writer
-    (`pipeline/kb/oracle_follows.py`) had no caller, the CLI the `oracle` tool told users to run
-    had no `__main__` block, nothing ever SELECTed the table, and it held 0 rows on the live
+    It was W0 substrate for a follow-graph reader that was never built. Its writer had no caller,
+    the CLI the `oracle` tool told users to run had no `__main__` block, nothing ever SELECTed the
+    table, and it held 0 rows on the live
     store — the feature never ran outside its own test. Same disposition as the `edges` table
     (deleted 2026-08-23, 5,776 rows and no reader); this one did not even accumulate rows.
 
@@ -1043,8 +1276,25 @@ def init_kb_schema(conn: sqlite3.Connection) -> None:
     # Subtractive, and it must run BEFORE the backfill below: the rebuild nulls every `region_key`
     # so the backfill restamps them under the recipe that no longer takes `lam`.
     _drop_sittings_lam(conn)
+    _drop_oracle_ingest_window(conn)
+    # Grouped with the two rebuilds above, not with the read-guarded drops further down:
+    # a create-copy-drop-rename opens its OWN transaction, so it must run while no implicit
+    # one is already open.
+    _drop_frontier_pair_counters(conn)
+    # Grouped here for the same reason, and it was NOT here until 2026-09-05: this migration used
+    # to be a bare `ALTER TABLE entities DROP COLUMN kind` among the drops at the bottom of this
+    # function. See the docstring for why that line was a portability bug and why a rebuild cannot
+    # live down there.
+    _drop_entities_kind(conn)
+    _drop_reader_cost_columns(conn)
+    # Three more rebuilds, 2026-09-06, in the same group and for the same reason: each opens its
+    # own transaction, so all of them must run before the first `INSERT OR IGNORE` below opens an
+    # implicit one.
+    _drop_reader_run_windows(conn)
+    _drop_read_status(conn)
+    _drop_candidate_event_surface(conn)
     _backfill_region_keys(conn)
-    # Additive: when a FULL-SET collector last re-saw this signal. Only the four full-set signals
+    # Additive: when a FULL-SET collector last re-saw this signal. Only the full-set collectors'
     # ever carry it — `save` stays permanently NULL by construction, because no path re-reads your
     # bookmark set to check a bookmark is still there. (The fuller investigation doc was
     # deleted 2026-08-16 in the open-source cleanup; git history has it.)
@@ -1095,6 +1345,8 @@ def init_kb_schema(conn: sqlite3.Connection) -> None:
                SELECT query_id, generator, created_at, last_emitted_at, miss_count
                  FROM frontier_queries""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_frontier_runs_status_time "
+                 "ON frontier_reader_runs(status, ran_at)")
     # AFTER `_ensure_column`, for the reason spelled out next to the `sittings` DDL: on an older
     # store the column does not exist until the lines above run.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sittings_continues ON sittings(continues)")
@@ -1111,13 +1363,19 @@ def init_kb_schema(conn: sqlite3.Connection) -> None:
     # code ever SELECTed from it. Its two intended consumers — trust propagation and an
     # Oracle-referenced-person candidate channel — were ruled dead the same day.
     conn.execute("DROP TABLE IF EXISTS edges")
-    # Same migration, column-shaped: `entities.kind` held 1140 'person' (a hardcoded constant at 14
-    # ingest sites), 2 'org' and 1 NULL, and nothing read it — what a candidate IS is decided by the
-    # screen classifier and stored in `profile.classified_kind`. SQLite has no `DROP COLUMN IF
-    # EXISTS`, so the presence check is the idempotency. Design record:
+    # Subtractive migration, 2026-09-04: `sync_health` (created by `dedup_store`, written on every
+    # Oracle refresh) recorded per-source failure detail under the key
+    # `oracle-refresh:<canonical_id>:<source_type>` — byte-identical to the CircuitBreaker key
+    # written on the adjacent line with the same string. `circuit_breaker.last_failure` already
+    # holds it and clears on success identically; `oracle_sources.last_status` holds the per-pair
+    # outcome and `oracle_refresh.status_summary` already ships it to the `screen` tool. Dropped
+    # here rather than in `dedup_store._connect` so the retired-table list has one home and the
+    # dedup hot path pays nothing. Design record: docs/plans/2026-09-04-nine-open-deletion-decisions.md
+    conn.execute("DROP TABLE IF EXISTS sync_health")
+    # `entities.kind` was dropped here by a bare `ALTER TABLE ... DROP COLUMN` until 2026-09-05.
+    # It is now `_drop_entities_kind`, in the rebuild group above — that statement needs
+    # SQLite >= 3.35 and the distributability invariant forbids assuming one. Design record:
     # docs/plans/2026-08-23-candidate-search-atom-arm.md
-    if "kind" in {r[1] for r in conn.execute("PRAGMA table_info(entities)")}:
-        conn.execute("ALTER TABLE entities DROP COLUMN kind")
     conn.commit()
 
 
@@ -1125,9 +1383,15 @@ def connect(db_path: Path | str | None = None, *, read_only: bool = False) -> sq
     """Open the atom-KB store — the machine-canonical `~/.opyt/opyt.db` by default
     (honoring `$OPYT_HOME`); pass `db_path` to sandbox a test.
 
-    Writable opens run the idempotent DDL, so callers never race a missing table. Read-only
-    opens do NOT run DDL — the retrieval path is read-only
-    and must degrade to "no such table" (caught upstream → empty result), never create.
+    Writable opens run `init_kb_schema`, so a caller never has to create a table itself. That
+    is NOT the same as "callers never race a missing table", which this said until 2026-09-06 and
+    which stopped being true on 2026-08-25 18:12, when `153c7d21` put the first non-idempotent
+    REBUILD on this path: a rebuild DROPs its table and re-creates it, so a second writable open
+    arriving inside that window sees the table gone. (A stale-prose sweep re-canonised the old
+    sentence five hours later the same night. The sweep read it, and it read as current.)
+
+    Read-only opens do NOT run DDL — the retrieval path is read-only and must degrade to
+    "no such table" (caught upstream → empty result), never create.
     """
     p = Path(db_path) if db_path else opyt_db()
     if read_only:
@@ -1187,7 +1451,7 @@ def upsert_atom(conn: sqlite3.Connection, atom: dict) -> None:
 
 
 def replace_chunks(conn: sqlite3.Connection, atom_id: str, chunks: list[dict]) -> None:
-    """Replace ALL chunks for one atom (delete-then-insert), keeping `chunks_fts` in sync.
+    """Replace ALL chunks for one atom, keeping `chunks_fts` in sync. The caller commits.
 
     Full replace, not per-seq upsert: when a snapshot changes, chunk BOUNDARIES shift, so
     a stale seq-3 from the old text would otherwise linger. Each chunk dict:
@@ -1213,17 +1477,25 @@ def replace_chunks(conn: sqlite3.Connection, atom_id: str, chunks: list[dict]) -
             "INSERT INTO chunks_fts (text, atom_id, chunk_id) VALUES (?, ?, ?)",
             (ch["text"], atom_id, cur.lastrowid),
         )
-    conn.commit()
 
 
 def upsert_entity(conn: sqlite3.Connection, entity_id: str, name: str | None = None,
-                  identity_links: list | dict | None = None,
+                  identity_links: list | None = None,
                   profile: dict | None = None) -> None:
     """UPSERT an entity. name/identity_links COALESCE (a non-null new value wins, else
     the stored value survives). `profile` is MERGED, not overwritten, via json_patch: the
     ingest-time write ({bio, verified, followers}) and the later classifier write
     ({classified_kind, classified_at}) each land without clobbering the other's keys. A null
-    profile is a no-op patch (keeps whatever is stored)."""
+    profile is a no-op patch (keeps whatever is stored).
+
+    `identity_links` took `list | dict` until 2026-09-06 and no caller ever passed a dict —
+    `git log -S'identity_links={' --all` is empty across all history, and all 17 live call sites
+    pass a one-string list or None. The annotation was not merely unused: a dict would have
+    serialized to a JSON OBJECT, and all four readers of this column
+    (`screen._loads`, `resolve._loads`, `oracle_refresh_state._links`, `expand._first_url`)
+    decode an ARRAY. The column has exactly one writer and holds only NULL or '[…]', which is
+    why those four agree today; the wider annotation was an invitation to write the one shape
+    they do not."""
     links = json.dumps(identity_links) if identity_links is not None else None
     prof = json.dumps(profile) if profile is not None else None
     conn.execute(
@@ -1302,7 +1574,7 @@ def entities_for_canonical(conn: sqlite3.Connection, canonical_id: str) -> list:
 def upsert_oracle(conn: sqlite3.Connection, canonical_id: str, name: str | None = None,
                   source: str = "screen") -> None:
     """Confirm one Oracle (idempotent on canonical_id). Re-confirming refreshes name/source but
-    NEVER resets confirmed_at or the reserved ingest_from/to/paused (a re-confirm isn't a re-add)."""
+    NEVER resets confirmed_at or the reserved `paused` (a re-confirm isn't a re-add)."""
     conn.execute(
         "INSERT INTO oracles (canonical_id, name, source) VALUES (?, ?, ?) "
         "ON CONFLICT(canonical_id) DO UPDATE SET "
@@ -1312,47 +1584,59 @@ def upsert_oracle(conn: sqlite3.Connection, canonical_id: str, name: str | None 
     conn.commit()
 
 
-def set_oracle_window(conn: sqlite3.Connection, canonical_id: str,
-                      ingest_from, ingest_to) -> None:
-    """Record the window an ingest actually COVERED for this Oracle (ISO-8601, UTC).
+def reanchor_oracles(conn: sqlite3.Connection) -> int:
+    """Re-point every `oracles` row at its cluster's CURRENT head. Returns how many moved.
 
-    These two columns were reserved as "inert v1" for exactly this. Written AFTER the run, from
-    the resolved datetimes (never the preset string), because the point of storing it is that a
-    later re-ingest can tell what was already paid for — and the X adapter's 2-year clamp means
-    the window requested and the window fetched are routinely different.
+    ⚠️ THE STALE HEAD WAS A SILENT WRONG ANSWER IN THREE PLACES, measured 2026-09-14 on a live
+    store. `oracles.canonical_id` is written at confirm time; a later footprint merge can move the
+    head (a `blog:`/`substack:` member sorts below an `x:user:` one), and nothing rewrote the row.
+    `current_canonical` exists to absorb that on READ, and `confirmed_oracles` remembers to call
+    it — but every OTHER join on `oracles.canonical_id` silently misses:
 
-    Widens only. A second ingest with a NARROWER window must not shrink the recorded coverage —
-    the atoms from the wider pull are still in the store, so claiming less than we hold would buy
-    a redundant paid re-pull. So `ingest_from` takes the MIN and `ingest_to` the MAX, and the
-    result is correct under any call order.
+      • `kb.kb_aggregate`'s `trusted_atoms` joined `oracles` directly and reported 80 trusted
+        atoms against a true 884. Three of five Oracles counted as zero.
+      • `oracle_refresh_state`'s source listing LEFT JOINs `oracles` for the display name, so
+        every merged Oracle's pairs dispatched with `author_name=None` — which is why 182 of
+        Dwarkesh Patel's posts are attributed to "substack" rather than to him.
+      • The same stale id got a SECOND `oracle_sources` registration, because `seed_from_entities`
+        registers under the current head while pre-merge rows kept the old one.
 
-    A NULL `ingest_from` means UNBOUNDED (covered to the beginning), which is why it can't just be
-    `MIN`: NULL is the widest value, not a missing one. `ingest_to IS NULL` is the "never ingested"
-    marker — this function is the only writer of that column, so an unset `ingest_to` is exactly
-    "no prior run", and the first write adopts its window rather than unioning with a NULL that
-    meant nothing. Fail-safe: no oracles row (ingesting something never confirmed) → 0 rows
-    updated, not a crash."""
-    frm = ingest_from.isoformat() if ingest_from else None
-    to = ingest_to.isoformat() if ingest_to else None
-    # SQLite evaluates every SET expression against the PRE-update row, so `ingest_to IS NULL`
-    # below still reads the old value while the same statement overwrites it.
-    conn.execute(
-        "UPDATE oracles SET "
-        "  ingest_from = CASE "
-        "      WHEN ingest_to IS NULL THEN ? "                       # first run: adopt its window
-        "      WHEN ingest_from IS NULL OR ? IS NULL THEN NULL "     # either side unbounded → NULL
-        "      ELSE MIN(ingest_from, ?) END, "
-        "  ingest_to   = CASE WHEN ingest_to IS NULL THEN ? ELSE MAX(ingest_to, ?) END "
-        "WHERE canonical_id = ?",
-        (frm, frm, frm, to, to, canonical_id),
-    )
-    conn.commit()
+    Fixing the reads one at a time would have left the next join to discover it again. The row is
+    what is wrong, so the row is what this repairs.
+
+    A MERGE CAN COLLIDE: two separately-confirmed Oracles that turn out to be one person now share
+    a head, and `canonical_id` is the primary key. The oldest confirmation wins the row (it is the
+    one whose `confirmed_at` the user would recognise) and the other is deleted, not renamed onto
+    a duplicate key. `INSERT OR REPLACE` would silently pick by insertion order instead.
+    """
+    moved = 0
+    for row in conn.execute("SELECT canonical_id, name, confirmed_at FROM oracles").fetchall():
+        stale = row["canonical_id"]
+        head = current_canonical(conn, stale)
+        if head == stale:
+            continue
+        existing = conn.execute(
+            "SELECT confirmed_at FROM oracles WHERE canonical_id=?", (head,)).fetchone()
+        if existing is None:
+            conn.execute("UPDATE oracles SET canonical_id=? WHERE canonical_id=?", (head, stale))
+        elif (row["confirmed_at"] or "") < (existing["confirmed_at"] or ""):
+            conn.execute("DELETE FROM oracles WHERE canonical_id=?", (head,))
+            conn.execute("UPDATE oracles SET canonical_id=? WHERE canonical_id=?", (head, stale))
+        else:
+            # The head row is the older confirmation; keep it, and take the name if it has none.
+            conn.execute("UPDATE oracles SET name=COALESCE(name, ?) WHERE canonical_id=?",
+                         (row["name"], head))
+            conn.execute("DELETE FROM oracles WHERE canonical_id=?", (stale,))
+        moved += 1
+    if moved:
+        conn.commit()
+    return moved
 
 
 def list_oracles(conn: sqlite3.Connection) -> list:
     """Every confirmed Oracle, newest first — what Stage 5 consumes."""
     return conn.execute(
-        "SELECT canonical_id, name, source, confirmed_at, ingest_from, ingest_to, paused "
+        "SELECT canonical_id, name, source, confirmed_at, paused "
         "FROM oracles ORDER BY confirmed_at DESC, canonical_id"
     ).fetchall()
 
@@ -1409,8 +1693,9 @@ def set_signal(conn: sqlite3.Connection, entity_id: str, signal_type: str,
     """Record one curation signal, REPLACING `count` on conflict. Idempotent by construction:
     writing the same observation twice leaves the same row.
 
-    Exists as a second function (not a flag on `add_signal`) because the four people-only
-    collectors (`x_lists`, `x_following`, `x_likes`, `substack_subs`) are FULL-SET re-reads: each
+    Exists as a second function (not a flag on `add_signal`) because the five people-only
+    collectors (`x_lists`, `x_following`, `x_likes`, `substack_follows`, `substack_subscriptions`)
+    are FULL-SET re-reads: each
     hands in a person's whole aggregate, not a delta, so SUMming it (as `add_signal` does) double-
     counts on every re-run. That double-counting actually happened once `curation_catchup` made
     these collectors run automatically. Self-heals what it sees on the next full-set pass;
@@ -1421,6 +1706,29 @@ def set_signal(conn: sqlite3.Connection, entity_id: str, signal_type: str,
     """
     _write_signal(conn, entity_id, signal_type, platform, count, extra,
                   "count = excluded.count", confirm=signal_type in CONFIRMABLE_SIGNALS)
+
+
+def ensure_signal(conn: sqlite3.Connection, entity_id: str, signal_type: str,
+                  platform: str, count: int = 1, extra: dict | str | None = None) -> None:
+    """Record one curation signal, LEAVING an existing row untouched. Presence, not counting.
+
+    The third operator, and the one for a caller that knows the signal is TRUE but is not the
+    authority on how strong it is. `save` is the type that needs it: the count means "how many of
+    their posts you saved", and only a caller that walked the whole saved list can say that — so a
+    per-atom writer summing 1 into the row (`add_signal`) inflates the very number the screen
+    shows the user as "bookmarked 12x", while `set_signal` would flatten it to 1.
+
+    This is what `reconcile_saved_signals` open-coded in SQL for exactly this reason ("Uses
+    insert-if-absent, not `add_signal`, which sums `count` and would inflate on every call"). It is
+    a function now because a second caller needed it: `ingest_x.sync_bookmarks` stamps once per
+    atom against a corpus re-walked forever, and `sync_bookmark_signals` — the full-set walk — is
+    the counting authority it must not fight.
+
+    Never CONFIRMS (`set_signal`'s job), because a caller that cannot count the set cannot say
+    what is absent from it either.
+    """
+    _write_signal(conn, entity_id, signal_type, platform, count, extra,
+                  "count = curation_signals.count")
 
 
 def _write_signal(conn: sqlite3.Connection, entity_id: str, signal_type: str, platform: str,
@@ -1439,15 +1747,20 @@ def _write_signal(conn: sqlite3.Connection, entity_id: str, signal_type: str, pl
     extra_json = (json.dumps(extra) if extra is not None and not isinstance(extra, str)
                   else extra)
     stamp = "datetime('now')" if confirm else "curation_signals.last_confirmed_at"
+    # The INSERT arm's value for the same column. Named for the column it fills — it was called
+    # `first_seen` until 2026-09-06, collateral of a mechanical py3.12 compat hoist, and
+    # `curation_signals` has no such column: anyone auditing "who writes `atoms.first_seen`" got
+    # a hit in the one function that does not.
+    #
     # Hoisted for the same reason `stamp` above it is, plus one more: inlined, the conditional
     # needs a backslash-escaped quote INSIDE an f-string expression, which is PEP 701 syntax and
     # a hard SyntaxError before 3.12. pyproject declares `requires-python = ">=3.10"`, so the
     # inline form made this module unimportable on two of the three versions it claims.
-    first_seen = "datetime('now')" if confirm else "NULL"
+    confirmed_now = "datetime('now')" if confirm else "NULL"
     conn.execute(
         "INSERT INTO curation_signals (entity_id, signal_type, platform, count, extra, "
         "                              last_confirmed_at) "
-        f"VALUES (?, ?, ?, ?, ?, {first_seen}) "
+        f"VALUES (?, ?, ?, ?, ?, {confirmed_now}) "
         "ON CONFLICT(entity_id, signal_type, platform) DO UPDATE SET "
         f"{count_clause}, "
         f"last_confirmed_at = {stamp}, "

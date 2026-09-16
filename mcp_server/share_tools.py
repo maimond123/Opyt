@@ -17,7 +17,7 @@ covering everything after it.
                 preview makes it structural rather than hoped-for.
   • `accept`  — SINGLE-phase, deliberately. A preview cannot validate a one-time code without
                 burning it, and pasting the invite is itself the yes.
-  • `unshare` — two-phase, and TWO SCOPES under one verb. `reader="Leo"` cuts off one person and
+  • `unshare` — two-phase, and TWO SCOPES under one verb. `reader="<name>"` cuts off one person and
                 leaves the copy serving; omitting it cuts everyone AND deletes the copy. Same
                 verb with a narrower object, the way `search(kb=)` is, rather than a second tool
                 sitting beside this one under a name a model would have to choose between.
@@ -27,16 +27,23 @@ covering everything after it.
 
 Every failure is a sentence in the return value, never a raise (P3).
 
-⚠️THE FIRST PUBLISH IS DETACHED. `share`'s confirm spawns the push rail and returns the invite
-immediately, because an inline publish is minutes of residential upload inside one MCP call,
-which a host timeout can kill half-done — leaving the person registered, unpublished, and holding
-an error instead of a link. The cost is a one-to-few-minute window where the link resolves and
-the export does not; `service/app.py`'s `_served` answers that with a sentence saying so.
+⚠️THE FIRST PUBLISH IS QUEUED, NOT INLINE. `share`'s confirm makes the push rail due now and
+returns the invite immediately, because an inline publish is minutes of residential upload inside
+one MCP call, which a host timeout can kill half-done — leaving the person registered,
+unpublished, and holding an error instead of a link. The cost is a one-to-few-minute window where
+the link resolves and the export does not; `service/app.py`'s `_served` answers that with a
+sentence saying so.
+
+The queued job carries no override, and the rail's own gate is what publishes a first share: its
+"never published" branch fires precisely because `last_upload_at` is still None. A later share to
+a second reader is correctly a no-op until somebody reads — that reader gets the served copy, and
+their read is what makes the following push due.
 """
 from __future__ import annotations
 
 import re
 import sqlite3
+from urllib.parse import urlparse
 
 import requests
 from requests import RequestException
@@ -91,7 +98,11 @@ def _call(method: str, url: str, *, token: str | None = None, json: dict | None 
     if not 200 <= r.status_code < 300:
         from opyt_core.kb_remote import error_detail
         return {"ok": False, "message": f"the service answered {r.status_code}: {error_detail(r)}"}
-    return {"ok": True, **r.json()}
+    try:
+        body = r.json()
+    except ValueError:
+        return {"ok": False, "message": f"the service returned unreadable JSON from {url}"}
+    return {"ok": True, **body}
 
 
 def _reader_roster(tokens: list[dict]) -> list[dict]:
@@ -107,7 +118,7 @@ def _unshare_one(url: str, token: str, reader: str, confirm: bool) -> dict:
     """Cut off ONE reader. The served copy stays and everybody else keeps reading.
 
     Resolution is deliberately strict in one direction and forgiving in the other. A label match
-    is case-insensitive, because "leo" and "Leo" are the same person and the owner typed the
+    is case-insensitive, because a label typed lowercase and capitalized is the same person, and the owner typed the
     label themselves. But two readers sharing a label REFUSES rather than picking the first: the
     two acts are indistinguishable from here, the wrong one is somebody's access, and the caller
     can re-run with the id that the refusal hands back. Guessing would be silent and wrong half
@@ -122,8 +133,8 @@ def _unshare_one(url: str, token: str, reader: str, confirm: bool) -> dict:
     readers = [t for t in state["tokens"] if t["role"] == "reader"]
     want = reader.strip()
     hits = [t for t in readers
-            if (t["label"] or "").strip().lower() == want.lower()
-            or (len(want) >= 8 and t["token_sha256"].startswith(want.lower()))]
+            if want and ((t["label"] or "").strip().lower() == want.lower()
+                         or (len(want) >= 8 and t["token_sha256"].startswith(want.lower())))]
 
     if not hits:
         return {"status": "no_such_reader",
@@ -218,9 +229,10 @@ def register_share_tools(mcp) -> None:
                 install suggests as the name they search under, so use the user's own name or
                 handle. Required on the FIRST share; ignored afterwards, because the name is
                 already registered.
-            for_whom: an optional label for who this particular invite is for ("Leo"). It is the
-                handle that makes that person nameable afterwards: `unshare(reader="Leo")` cuts
-                off exactly them. Without it they can only be named by a token id.
+            for_whom: an optional label for who this particular invite is for — a first name
+                or handle. It is what makes that person nameable afterwards:
+                `unshare(reader="<that label>")` cuts off exactly them. Without it they can
+                only be named by a token id.
 
         Returns {status, ...}. A preview carries `atoms`, `by_source_type`, `top_entities`,
         `date_span`, `consent` and `already_shared`. A confirm carries `invite` — the link — plus
@@ -249,7 +261,6 @@ def register_share_tools(mcp) -> None:
                 "by_source_type": agg["by_source_type"],
                 "by_what_kind": agg["by_what_kind"],
                 "top_entities": agg["top_entities"],
-                "top_topics": agg["top_topics"],
                 "trusted_atoms": agg["trusted_atoms"],
                 "date_span": {"oldest": oldest, "newest": newest},
                 "already_shared": bool(token),
@@ -282,18 +293,18 @@ def register_share_tools(mcp) -> None:
         if not grant.get("ok"):
             return {"status": "grant_failed", "message": grant["message"]}
 
-        # DETACHED, and after the grant so a failed mint does not leave an upload running for an
+        # QUEUED, and after the grant so a failed mint does not leave an upload running for an
         # invite that was never handed over. See the module docstring for why not inline.
-        from pipeline.kb.push_catchup import spawn_push_catchup
-        publishing = spawn_push_catchup(force=True)
+        from pipeline.kb.rail_jobs import request_now
+        queued = request_now("push_catchup")
 
         return {"status": "shared",
                 "owner": grant["owner"],
                 "invite": f"{_INVITE_BASE}#{grant['code']}",
-                "publishing": publishing,
+                "queued": queued,
                 "message": ("Send them this link. It works immediately; if this is the first "
-                            "share the upload finishes in the background, usually within a "
-                            "minute or two.")}
+                            "share the background worker publishes the export a moment later, "
+                            "usually within a minute or two.")}
 
     @mcp.tool()
     def accept(invite: str, name: str | None = None) -> dict:
@@ -328,12 +339,17 @@ def register_share_tools(mcp) -> None:
                                "https://useopyt.com/invite#<code>, where the code is 43 letters "
                                "and digits. Ask them to send the link again."}
 
-        # The service is the one the LINK points at when it names one, so an invite to somebody's
-        # self-hosted service works without this install configuring anything.
-        m = re.match(r"(https?://[^\s/]+)", invite.strip())
+        # A full invite chooses its issuer: useopyt.com is the public invite host, while every
+        # other explicit host is a self-hosted service. A bare code has no issuer and uses this
+        # install's configured service.
+        parsed = urlparse(invite.strip())
         from opyt_core import config
-        url = (config.service_url() if not m or "useopyt.com" in m.group(1)
-               else m.group(1)).rstrip("/")
+        if parsed.hostname and parsed.scheme in {"http", "https"}:
+            url = (config.DEFAULT_SERVICE_URL if parsed.hostname.lower() == "useopyt.com"
+                   else f"{parsed.scheme}://{parsed.netloc}")
+        else:
+            url = config.service_url()
+        url = url.rstrip("/")
 
         res = _call("post", f"{url}/v1/redeem",
                     json={"code": code, "install_id": get_install_id()})
@@ -362,12 +378,13 @@ def register_share_tools(mcp) -> None:
 
         READ THIS BEFORE CALLING. The two scopes are not the same act and only one of them is
         expensive to undo:
-          • `reader="Leo"` → Leo loses access. Everyone else keeps reading, the served copy
-            stays, and you can invite Leo again with `share` whenever you like.
+          • `reader="<name>"` → that one person loses access. Everyone else keeps reading,
+            the served copy stays, and you can invite them again with `share` whenever you
+            like.
           • `reader` omitted → EVERY reader is cut off AND the served copy is deleted. Every
             invite ever sent stops working, so sharing again means re-inviting everyone by hand.
 
-        So when the user names a person — "stop sharing with Leo", "cut Leo off", "revoke Leo" —
+        So when the user names a person — "stop sharing with <name>", "cut <name> off" —
         `reader` is REQUIRED. Omitting it there does something much larger than what was asked,
         and the preview is where you catch that: it always says which of the two scopes it is
         about, in its first sentence.

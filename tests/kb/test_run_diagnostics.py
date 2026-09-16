@@ -49,8 +49,11 @@ def test_a_wrongly_shaped_diagnostic_is_dropped_not_forwarded(kb_home):
 
 def test_onboard_footprint_reports_a_per_source_clock(kb_home, monkeypatch, fake_embedder):
     """The router-level clock: `sync_github` carries no StageTimer of its own, so without this it
-    contributes nothing to a wall-clock profile except an unexplained gap. The eligibility gate is
-    likewise timed nowhere else."""
+    contributes nothing to a wall-clock profile except an unexplained gap.
+
+    A website stage covers the eligibility gate AND the adapter, since `gate_and_sync_website` is
+    one call. The gate's own share stays recoverable as the stage total minus that source's
+    adapter-reported `stage_seconds`, which is why no separate `eligibility_gate` stage is owed."""
     from pipeline.kb import eligibility, ingest_blog, ingest_github
 
     monkeypatch.setattr(ingest_github, "sync_github",
@@ -69,7 +72,7 @@ def test_onboard_footprint_reports_a_per_source_clock(kb_home, monkeypatch, fake
          {"source_type": "github", "url": "https://github.com/nia", "metadata": {"handle": "nia"},
           "trust": {"trusted": True}}])
 
-    assert {"blog", "github", "eligibility_gate"} <= set(out["stage_seconds"])
+    assert {"blog", "github"} <= set(out["stage_seconds"])
     assert set(out["stage_latency"]["github"]) == {"count", "mean", "p50", "p95", "max"}
     # …and the adapters' own diagnostics survived the trip through run_stats onto the records.
     blog_rec = next(r for r in out["results"] if r["type"] == "blog")

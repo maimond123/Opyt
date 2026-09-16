@@ -43,7 +43,7 @@ def _ct(username, info, ts, gh, all_sources, **kw):
     `_x_identity_targets` the discover_profile X path uses — no logic duplication)."""
     root_id = canonical_identity(f"x.com/{username}")
     targets = dp._x_identity_targets(info or {}, ts)
-    return dp._compute_trust(username, root_id, targets, info, gh, all_sources, **kw)
+    return dp._compute_trust(username, root_id, targets, gh, all_sources, **kw)
 
 
 # ── Headline: blog-only github, handle matches the Oracle → auto-trust ─────────
@@ -149,17 +149,19 @@ def test_only_trusted_hubs_expand(monkeypatch):
     assert calls == []                                          # never fetched a non-trusted hub
 
 
-def test_max_new_candidates_respected(monkeypatch):
-    monkeypatch.setattr(dp, "MAX_NEW_HUB_CANDIDATES", 1)
+def test_hub_adds_at_most_one_profile_per_platform(monkeypatch):
     links = [
         ProfileLink("github", True, "gh1", "personal", "https://github.com/gh1"),
+        ProfileLink("github", True, "gh2", "personal", "https://github.com/gh2"),
         ProfileLink("scholar", True, "sch1", "personal", "https://scholar.google.com/citations?user=sch1"),
     ]
     _neutralize(monkeypatch, links=lambda url, timeout=12: links if "willcb.com" in url else [])
     info, ts, all_sources = _blog_root()
     _ct("willccbb", info, ts, [], all_sources)
     surfaced = [s for s in all_sources if (s.metadata or {}).get("discovered_via") == "blog_hub"]
-    assert len(surfaced) == 1                                   # capped, second dropped
+    assert {s.url for s in surfaced} == {
+        "https://github.com/gh1", "https://scholar.google.com/citations?user=sch1",
+    }
 
 
 def test_already_present_profile_not_re_added(monkeypatch):
@@ -167,11 +169,11 @@ def test_already_present_profile_not_re_added(monkeypatch):
     _neutralize(monkeypatch, links=lambda url, timeout=12: [gh] if "willcb.com" in url else [])
     info, ts, _ = _blog_root()
     all_sources = [DS("blog", "https://willcb.com"), DS("github", "https://github.com/willccbb")]
-    _ct("willccbb", info, ts, [DS("github", "https://github.com/willccbb")],
+    verdicts = _ct("willccbb", info, ts, [DS("github", "https://github.com/willccbb")],
                       all_sources)
     ghs = [s for s in all_sources if s.source_type == "github"]
     assert len(ghs) == 1                                        # not re-added
-    assert not any((s.metadata or {}).get("discovered_via") == "blog_hub" for s in all_sources)
+    assert verdicts["github.com/willccbb"].trusted
 
 
 def test_expansion_noop_when_fetch_returns_empty(monkeypatch):
@@ -179,7 +181,7 @@ def test_expansion_noop_when_fetch_returns_empty(monkeypatch):
     info, ts, all_sources = _blog_root()
     verdicts = _ct("willccbb", info, ts, [], all_sources)
     assert verdicts["willcb.com"].trusted                       # unchanged root
-    assert not any((s.metadata or {}).get("discovered_via") == "blog_hub" for s in all_sources)
+    assert {s.url for s in all_sources} == {"https://willcb.com"}
 
 
 def test_skip_edge_fetch_disables_expansion(monkeypatch):

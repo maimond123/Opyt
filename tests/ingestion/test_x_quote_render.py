@@ -1,6 +1,6 @@
 """Quote-tweet rendering (Level 2): the quoted node's OWN link card, media (with VLM description),
 and X-Article body are rendered — not just its text. The quoted node ships inside the bookmark
-payload (x_graphql._normalize recurses), so this is a render change, not a fetch change.
+payload (x_graphql_core.normalize recurses), so this is a render change, not a fetch change.
 
 One level only: a quote-of-a-quote renders the immediate quoted node's text but does not recurse."""
 from __future__ import annotations

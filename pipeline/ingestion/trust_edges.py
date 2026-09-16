@@ -19,10 +19,9 @@ from pipeline.ingestion.trust_types import Edge
 from pipeline.ingestion.url_canon import canonical_identity
 
 # Typed profile links worth surfacing from a trusted hub — a person's own accounts,
-# not things they cite. Excludes linkedin: never an atom source, never fetched, so it
-# would be a dead-end leaf.
+# not things they cite. Academic profiles remain publication-discovery leads.
 PROFILE_SCOPE = frozenset(
-    {"github", "scholar", "orcid", "substack", "blog", "x", "youtube"}
+    {"github", "scholar", "orcid", "substack", "blog", "x"}
 )
 
 # Full URLs and @handles inside free text (a GitHub bio, a tweet).
@@ -77,7 +76,10 @@ def edges_from_html(source_id: str, html: str, relevant: set[str]) -> list[Edge]
     soup = BeautifulSoup(html or "", "html.parser")
     targets: set[str] = set()
     for a in soup.find_all("a", href=True):
-        cid = canonical_identity(a["href"])
+        href = a["href"]
+        if not href.lower().startswith(("http://", "https://")):
+            continue
+        cid = canonical_identity(href)
         if cid:
             targets.add(cid)
     return _emit(source_id, sorted(targets), relevant, via="html_link", found_by="html")

@@ -25,7 +25,7 @@ Three things that are easy to get wrong and are handled here:
 3. **Fail-safe contract (CLAUDE.md invariant).** A failed external call must SKIP — no
    partial write, no mark-processed. So a batch either returns a COMPLETE list of
    normalized vectors or RAISES; it never returns a half-filled list, and it records
-   NO cost on failure. The caller catches and skips the unit of work.
+   No partial result on failure. The caller catches and skips the unit of work.
 
 Config: an optional `embeddings:` block in settings.yaml (parallel to `llm_backends`)
 overrides the code defaults below. The seam is fully functional WITHOUT that block, so
@@ -37,7 +37,6 @@ it runs on a machine whose settings.yaml predates the atom-KB (distributable).
       endpoint: https://openrouter.ai/api/v1/embeddings
       dim: null            # null = discover from the API, don't hardcode
       batch_size: 64
-      price_per_million: 0.01
       query_instruction: null   # null = derive from the model family
 """
 from __future__ import annotations
@@ -65,7 +64,6 @@ _DEFAULTS = {
     "endpoint": _OPENROUTER_EMBED_URL,
     "dim": None,               # None = discover from the first response, never hardcode
     "batch_size": 64,
-    "price_per_million": 0.01,  # qwen3-embedding-8b: $0.01 / 1M input tokens
     "query_instruction": None,  # None = derive from model family (see _resolve_config)
     # 30s: past that the backend is stalled, not slow.
     "timeout": 30.0,
@@ -149,12 +147,6 @@ _SESSION_LOCK = threading.Lock()   # guards lazy init — many embed threads may
 _EMBED_CONCURRENCY = 8
 _EMBED_GATE = AdaptiveSemaphore(4, min_permits=2, max_permits=_EMBED_CONCURRENCY, increase_after=4)
 
-# Last-seen OpenRouter rate-limit headers — Phase-2 PREP only. Sequential Phase 1 never contends,
-# so this is inert now; it exists so the concurrent design can size its worker count against the
-# real budget instead of guessing. Best-effort: reading a header must never break an embed.
-_LAST_RATE_LIMIT: dict[str, str] = {}
-
-
 def _get_session() -> "requests.Session":
     global _SESSION
     if _SESSION is None:
@@ -164,19 +156,18 @@ def _get_session() -> "requests.Session":
     return _SESSION
 
 
-def _note_rate_limit(resp) -> None:
-    """Stash `X-RateLimit-*` and warn when the remaining budget runs low. Best-effort (Fail-safe:
-    a header hiccup never fails the embed). Phase-2 informational — sequential Phase 1 won't trip it."""
+def _warn_if_rate_limit_low(resp) -> None:
+    """Warn when OpenRouter's remaining embed budget runs low. Best-effort (Fail-safe: a header
+    hiccup never fails the embed).
+
+    The log line IS the whole output. A `_LAST_RATE_LIMIT` dict stashed these three values until
+    2026-09-04; its one reader put them in `ingest_x`'s run summary and nothing throttled on them.
+    `_EMBED_GATE` is what actually reacts to pressure here, by AIMD on observed 429s."""
     try:
         hdr = resp.headers
         remaining = hdr.get("X-RateLimit-Remaining")
         if remaining is None:
             return
-        _LAST_RATE_LIMIT.update({
-            "limit": hdr.get("X-RateLimit-Limit", ""),
-            "remaining": remaining,
-            "reset": hdr.get("X-RateLimit-Reset", ""),
-        })
         rem, limit = int(remaining), int(hdr.get("X-RateLimit-Limit") or 0)
         if rem <= max(5, limit // 10):   # under ~10% of the window (or <5 absolute) → say so
             from pipeline.ingestion.utils import log
@@ -199,7 +190,7 @@ def _http_post_json(req: urllib.request.Request, timeout: float) -> dict:
                             headers=dict(req.header_items()), timeout=timeout)
     except requests.RequestException as e:   # timeout, DNS, connection reset — a re-route may fix it
         raise EmbedError(f"{type(e).__name__}: {e}", retryable=True) from None
-    _note_rate_limit(resp)
+    _warn_if_rate_limit_low(resp)
     if resp.status_code >= 400:
         body = (resp.text or "")[:500]
         raise EmbedError(f"HTTP {resp.status_code}: {body}",
@@ -214,7 +205,7 @@ def _http_post_json(req: urllib.request.Request, timeout: float) -> dict:
 def _maybe_breaker():
     """The OpenRouter-embed circuit breaker, or None if unavailable.
 
-    A sustained embed outage trips it so a broad ingest can't retry-storm the bill.
+    A sustained embed outage trips it so a broad ingest can't retry-storm the provider.
     Best-effort: the breaker keeps state in a SQLite table that may not exist yet on a
     fresh rebuild, and a breaker hiccup must never break the tool (Fail-safe) — so any
     construction failure degrades to a direct, unwrapped call."""
@@ -240,7 +231,6 @@ class HostedEmbedder:
         self.provider = cfg["provider"]
         self.endpoint = cfg["endpoint"]
         self.batch_size = int(cfg["batch_size"])
-        self.price_per_million = float(cfg["price_per_million"])
         self.query_instruction = cfg["query_instruction"] or ""
         self.timeout = float(cfg["timeout"])
         self.max_attempts = max(1, int(cfg.get("max_attempts") or 1))
@@ -281,10 +271,6 @@ class HostedEmbedder:
                 futures = [ex.submit(self._embed_batch, sl) for sl in slices]
                 for f in futures:                   # in submission order → alignment preserved
                     out.extend(f.result())
-        # Defensive: the per-batch check below already guarantees this, but assert the
-        # whole-request contract too — a caller relies on 1 vector per input text.
-        if len(out) != len(texts):
-            raise EmbedError(f"expected {len(texts)} vectors, assembled {len(out)}")
         return out
 
     def _embed_batch(self, batch: list[str]) -> list[np.ndarray]:
@@ -324,7 +310,6 @@ class HostedEmbedder:
                     last = e
                     if not e.retryable or attempt == self.max_attempts - 1:
                         raise
-            raise last  # unreachable; keeps the type checker honest
 
         breaker = _maybe_breaker() if self._use_breaker else None
         # AIMD transport seam: caps concurrent embed calls and tunes the cap from feedback.
@@ -354,17 +339,6 @@ class HostedEmbedder:
         elif int(self._dim) != d:
             raise EmbedError(f"embedding dim drift: config/first={self._dim}, got {d}")
 
-        # Attribute spend into the shared api_stats.json (only on SUCCESS — a failed call
-        # above raised before reaching here, so we never bill for a skipped write).
-        usage = data.get("usage") or {}
-        tokens = int(usage.get("total_tokens") or usage.get("prompt_tokens") or 0)
-        cost = tokens / 1_000_000 * self.price_per_million
-        if cost > 0:
-            try:
-                from pipeline.llm_client import record_external_cost
-                record_external_cost("openrouter-embed", cost, requests=1)
-            except Exception:
-                pass  # a stats hiccup must never fail the embed (Fail-safe)
         return vecs
 
 
@@ -617,8 +591,8 @@ def assert_model(conn, embedder, *, storage_dtype: str | None = None) -> None:
 def assert_strip_version(conn, strip_version: str | None = None) -> None:
     """RAISE if this build's embed-surface strip disagrees with the one the store was built from.
 
-    The before-spend half of the strip guard: `ensure_kb_meta` already refuses the write, but not
-    until the END of a flush, after the batch is paid for. Called once, where a batched ingest
+    The early half of the strip guard: `ensure_kb_meta` already refuses the write, but not
+    until the END of a flush, after the batch ran. Called once, where a batched ingest
     begins (`AtomSink.__init__`), so an un-migrated store costs one exception, not one corpus of
     embeddings."""
     if strip_version is None:
@@ -673,54 +647,3 @@ def convert_chunk_storage_dtype(conn, target: str | None = None) -> int:
     conn.commit()
     return n
 
-
-# ── standalone proof (live; spends a few cents) ──────────────────────────────────
-
-
-def _smoke() -> int:
-    """Prove the seam end-to-end against the LIVE API: real vectors, correct dim,
-    unit-normalized, query prefix applied, cost recorded, kb_meta guard fires.
-
-    Run:  python -m pipeline.kb.embed   (needs OPENROUTER_API_KEY in env or ~/.opyt/.env)
-    """
-    import sqlite3
-
-    emb = get_kb_embedder(use_breaker=False)
-    print(f"[smoke] embedder: model={emb.model} provider={emb.provider}")
-
-    docs = ["Transformers use self-attention.", "The Fed sets interest rates."]
-    q = ["how do neural networks weigh their inputs?"]
-    dvecs = emb.embed(docs, role="document")
-    qvecs = emb.embed(q, role="query")
-
-    dim = dvecs[0].shape[0]
-    dnorm = float(np.linalg.norm(dvecs[0]))
-    print(f"[smoke] dim={dim}  ||doc||={dnorm:.4f}  n_docs={len(dvecs)}  n_q={len(qvecs)}")
-    assert len(dvecs) == 2 and len(qvecs) == 1, "vector count mismatch"
-    assert abs(dnorm - 1.0) < 1e-3, "vectors are not L2-normalized"
-
-    # Retrieval sanity: the ML query should sit closer to the ML doc than the Fed doc.
-    sims = [float(qvecs[0] @ d) for d in dvecs]
-    print(f"[smoke] cos(query, ML doc)={sims[0]:.4f}  cos(query, Fed doc)={sims[1]:.4f}")
-    assert sims[0] > sims[1], "query is not closer to the on-topic document"
-
-    # kb_meta guard: write identity, then a mismatched embedder must RAISE.
-    conn = sqlite3.connect(":memory:")
-    ensure_kb_meta(conn, emb.model, dim, emb.provider, emb.query_instruction)
-    assert_model(conn, emb)  # matches -> ok
-    class _Other:
-        model, provider, dim = "openai/text-embedding-3-large", "openrouter", 3072
-    try:
-        assert_model(conn, _Other())
-        raise SystemExit("[smoke] FAIL: mismatch did not raise")
-    except SubspaceError:
-        print("[smoke] kb_meta guard raised on model mismatch — correct")
-
-    from pipeline.llm_client import spend_total
-    print(f"[smoke] lifetime spend now: ${spend_total():.6f}")
-    print("[smoke] PASS")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_smoke())

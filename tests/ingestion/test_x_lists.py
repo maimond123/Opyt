@@ -208,6 +208,7 @@ class _FakeResp:
         self.status_code = 200
         self._payload = payload
         self.text = "ok"
+        self.headers = {}          # every real response carries them; `graphql_get` meters off it
     def raise_for_status(self):
         pass
     def json(self):

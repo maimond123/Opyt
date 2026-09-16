@@ -1,9 +1,8 @@
 """
 pipeline/ocr_cascade.py — OCR-first media understanding for footprint ingest.
 
-Moved here from `pipeline/processing/` (the vault producer package, queued for deletion)
-because the atom-KB ingesters and `pipeline/kb/vision.py` run every image through it. Nothing
-in this file is vault-specific; only its address changed.
+The atom-KB ingesters and `pipeline/kb/vision.py` run every image through it. Nothing in this
+file is vault-specific.
 
 Replaces "describe every image with one VLM" (describe_images.describe_image) on the footprint
 path. A cheap OCR pass transcribes AND tags the image; the tag routes:
@@ -274,7 +273,7 @@ def read_image(image_url: str, *, context: str = "") -> "MediaRead | None":
     kind = _route(transcription, tag)
 
     if kind == "chart":
-        chart_user = _CHART_PROMPT + (f"\n\nContext from the post:\n{context[:400]}" if context else "")
+        chart_user = _CHART_PROMPT + (f"\n\nContext from the post:\n{context}" if context else "")
         try:
             with _VLM_GATE:    # the chart hop is an image call too — same throttle, not a bypass
                 c = llm_client.call(role="vision", system="", user=chart_user,

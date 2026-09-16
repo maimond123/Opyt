@@ -12,17 +12,13 @@ Two GraphQL ops (queryIds are X-wide, self-heal on drift):
      the viewer (`twid` cookie); the `ListToFollow` (suggested) module is ignored.
   2. ListMembers(listId) → the accounts in one list, paginated by a bottom cursor.
 
-Output: state/candidate_signals_x_lists.json — members deduped by rest_id, with the
-union of the list names/ids they appear in (cross-list membership = stronger signal).
+`aggregate_members` dedups members by rest_id and unions the list names/ids they appear in
+(cross-list membership = stronger signal); `ingest_curation.sync_lists_signals` stores them.
 """
 
-import argparse
-import json
-import time
-from pathlib import Path
 
 from pipeline.ingestion import x_graphql_core as core
-from pipeline.ingestion.utils import log, SyncAuthError
+from pipeline.ingestion.utils import log
 
 LISTS_MGMT_OP = "ListsManagementPageTimeline"
 LIST_MEMBERS_OP = "ListMembers"
@@ -42,7 +38,7 @@ DEFAULT_PAGE_SIZE = 100
 MAX_PAGES = 100
 
 # Feature switches lifted verbatim from the captured request URLs (both ops share them).
-# Neither op sends fieldToggles. Override via $X_LISTS_FEATURES (JSON) if X rotates.
+# Neither op sends fieldToggles.
 LISTS_FEATURES = {
     "rweb_video_screen_enabled": False,
     "rweb_cashtags_enabled": True,
@@ -89,12 +85,6 @@ LISTS_FEATURES = {
     "responsive_web_grok_community_note_auto_translation_is_enabled": True,
     "responsive_web_enhance_cards_enabled": False,
 }
-
-
-def _features() -> dict:
-    import os
-    override = os.getenv("X_LISTS_FEATURES")
-    return json.loads(override) if override else LISTS_FEATURES
 
 
 # ── Parse: owned lists out of the management timeline ─────────────────────────
@@ -145,7 +135,7 @@ def fetch_owned_lists(cookies: dict, headers: dict, viewer_id: str) -> list[dict
         variables = {"count": DEFAULT_PAGE_SIZE}
         if cursor:
             variables["cursor"] = cursor
-        data = core.graphql_get(LISTS_MGMT_OP, qid, variables, _features(), headers,
+        data = core.graphql_get(LISTS_MGMT_OP, qid, variables, LISTS_FEATURES, headers,
                                 tolerate_errors=True)
         timeline = (((data.get("data") or {}).get("viewer") or {})
                     .get("list_management_timeline") or {}).get("timeline", {})
@@ -242,7 +232,7 @@ def fetch_list_members(list_id: str, cookies: dict, headers: dict) -> list[dict]
         variables = {"listId": list_id, "count": DEFAULT_PAGE_SIZE}
         if cursor:
             variables["cursor"] = cursor
-        data = core.graphql_get(LIST_MEMBERS_OP, qid, variables, _features(), headers,
+        data = core.graphql_get(LIST_MEMBERS_OP, qid, variables, LISTS_FEATURES, headers,
                                 tolerate_errors=True)
         timeline = (((data.get("data") or {}).get("list") or {})
                     .get("members_timeline") or {}).get("timeline", {})
@@ -266,12 +256,7 @@ def fetch_list_members(list_id: str, cookies: dict, headers: dict) -> list[dict]
     return members
 
 
-# ── Orchestrate + write the signal ───────────────────────────────────────────
-
-def _signal_path(config=None) -> Path:
-    from pipeline.config import state_paths
-    return (config or state_paths()).state_file("candidate_signals_x_lists")
-
+# ── Aggregate ────────────────────────────────────────────────────────────────
 
 def aggregate_members(owned: list[dict], members_by_list: dict[str, list[dict]],
                       viewer_id: str) -> list[dict]:
@@ -293,69 +278,3 @@ def aggregate_members(owned: list[dict], members_by_list: dict[str, list[dict]],
                 rec["list_ids"].append(lst["id"])
     return sorted(by_user.values(),
                   key=lambda c: (-len(c["list_names"]), c["handle"].lower()))
-
-
-def sync_lists(profile: str | None = None, dry_run: bool = False,
-               config=None) -> dict:
-    """Pull the viewer's owned lists + members → deduped candidate signal. Raises
-    SyncAuthError if the session is dead (caller records a broken source, never a
-    silent 0). Fail-safe: no twid → skip (can't tell owned from subscribed → no noise)."""
-    cookies = core.read_x_cookies(profile=profile)
-    vid = core.viewer_id(cookies)
-    if not vid:
-        log("[x-lists] twid cookie missing — cannot distinguish owned vs subscribed "
-            "lists; skipping (fail-safe, no noise).")
-        return {"lists": 0, "candidates": 0, "skipped": "no_viewer_id"}
-
-    headers = core.auth_headers(cookies, referer=_REFERER)
-    owned = fetch_owned_lists(cookies, headers, vid)
-    log(f"[x-lists] {len(owned)} owned list(s): {[l['name'] for l in owned]}")
-
-    members_by_list: dict[str, list[dict]] = {}
-    for lst in owned:
-        members = fetch_list_members(lst["id"], cookies, headers)
-        log(f"[x-lists]   '{lst['name']}' (declares {lst['member_count']}) "
-            f"→ {len(members)} member(s)")
-        members_by_list[lst["id"]] = members
-
-    candidates = aggregate_members(owned, members_by_list, vid)
-    result = {"lists": len(owned), "candidates": len(candidates)}
-
-    if dry_run:
-        log(f"[x-lists] DRY RUN — {len(candidates)} candidate(s); not writing.")
-        for c in candidates[:15]:
-            log(f"    @{c['handle']:<20} {c['list_names']}  ({c['followers_count']} followers)")
-        result["preview"] = candidates[:15]
-        return result
-
-    payload = {
-        "signal": "x_list_member",
-        "viewer_id": vid,
-        "lists": owned,
-        "captured_at": int(time.time()),
-        "candidates": candidates,
-    }
-    path = _signal_path(config)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    log(f"[x-lists] wrote {len(candidates)} candidate(s) from {len(owned)} list(s) → {path}")
-    result["written"] = len(candidates)
-    result["path"] = str(path)
-    return result
-
-
-def _cli() -> None:
-    ap = argparse.ArgumentParser(description="Ingest the user's OWNED X lists' members "
-                                             "as a candidate signal.")
-    ap.add_argument("--profile", help="Chrome profile dir / browser key (else auto-pick)")
-    ap.add_argument("--dry-run", action="store_true", help="Print candidates, do not write")
-    args = ap.parse_args()
-    try:
-        out = sync_lists(profile=args.profile, dry_run=args.dry_run)
-        log(f"[x-lists] done: {json.dumps({k: v for k, v in out.items() if k != 'preview'})}")
-    except SyncAuthError as e:
-        log(f"[x-lists] NOT LOGGED IN / session dead: {e}")
-        raise SystemExit(2)
-
-
-if __name__ == "__main__":
-    _cli()

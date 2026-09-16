@@ -102,8 +102,14 @@ def test_every_overlapping_read_is_counted_exactly_once(live_server, svc):
     are where a count silently goes wrong, so it is asserted under load rather than in isolation.
     """
     base, _ = live_server
-    before = store.usage_total(svc.owner, store.token_hash(svc.reader_token))
     with ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(lambda i: _search(base, svc.reader_token, i), range(8)))
-    after = store.usage_total(svc.owner, store.token_hash(svc.reader_token))
-    assert after - before == 8
+    conn = store.connect()
+    try:
+        reads = conn.execute(
+            "SELECT COALESCE(SUM(n), 0) FROM usage_daily WHERE owner = ? AND reader = ?",
+            (svc.owner, store.token_hash(svc.reader_token)),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert reads == 8

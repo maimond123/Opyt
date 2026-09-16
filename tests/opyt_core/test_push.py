@@ -1,9 +1,13 @@
-"""`opyt-push` — build the export and replace what the service serves.
+"""`push.publish` — build the export and replace what the service serves.
 
-The owner's whole publish loop is this one command, so the tests assert on what a publish is
+The owner's whole publish loop is this one function, so the tests assert on what a publish is
 supposed to leave behind: the service now serves what THIS store holds (not the file it was
-seeded with), the bytes that arrived hash to what was sent, and each of the two settings the
-command needs is named — by name, and by where it is set — when it is absent.
+seeded with), and the bytes that arrived hash to what was sent.
+
+They call `publish()` DIRECTLY. Until 2026-09-05 they reached it through `opyt-push`'s `main()`
+and read its stdout; the command is gone and the function is what `pipeline/kb/push_catchup.py`
+calls, so the returned dict is now both the real contract and the stronger assertion — a whole
+sha256 rather than the twelve characters a print statement happened to show.
 """
 from __future__ import annotations
 
@@ -46,21 +50,23 @@ def _served_sha(publisher) -> str:
         return hashlib.sha256(uploads.export_path(publisher.svc.owner).read_bytes()).hexdigest()
 
 
-def test_push_replaces_what_the_service_serves(publisher, capsys):
+def test_push_replaces_what_the_service_serves(publisher):
     assert NEW not in _served_ids(publisher)      # the seeded upload predates this atom
     _ingest_one_more(publisher.emb)
 
-    assert push.main([]) == 0
+    res = push.publish(publisher.svc.owner_token, URL)
 
+    assert res["status"] == "ok"
     assert NEW in _served_ids(publisher)
-    out = capsys.readouterr().out
-    assert _served_sha(publisher)[:12] in out     # what arrived hashes to what was sent
+    assert res["sha256"] == _served_sha(publisher)   # what arrived hashes to what was sent
     assert not opyt_path("tmp", "export-push.db").exists()
 
 
-def test_a_sha_mismatch_fails_loudly(publisher, capsys, monkeypatch):
-    """The bytes that arrived are not the bytes that were sent. The exit code is the whole point
-    — a publish that half-worked must not look like one that worked."""
+def test_a_sha_mismatch_fails_loudly(publisher, monkeypatch):
+    """The bytes that arrived are not the bytes that were sent. The STATUS is the whole point —
+    a publish that half-worked must not report ok. `push_catchup` writes its watermark only on
+    `status == "ok"` (push_catchup.py:149), so a soft failure here would mark the store published
+    against a damaged copy and no later pass would ever correct it."""
     real_post = push.requests.post
 
     def corrupt(url, **kw):
@@ -70,17 +76,11 @@ def test_a_sha_mismatch_fails_loudly(publisher, capsys, monkeypatch):
 
     monkeypatch.setattr(push.requests, "post", corrupt)
 
-    assert push.main([]) == 1
-    err = capsys.readouterr().err
-    assert "0" * 64 in err and _served_sha(publisher)[:12] in err
+    res = push.publish(publisher.svc.owner_token, URL)
+
+    assert res["status"] == "corrupt"
+    assert "0" * 64 in res["message"] and _served_sha(publisher) in res["message"]
     assert not opyt_path("tmp", "export-push.db").exists()   # the finally runs on this path too
-
-
-def test_a_missing_token_names_the_env_var(publisher, capsys, monkeypatch):
-    monkeypatch.setattr(push, "get_credential", lambda service: None)
-    assert push.main([]) == 1
-    err = capsys.readouterr().err
-    assert "OPYT_SERVICE_TOKEN" in err and "opyt-keys" in err
 
 
 def test_an_unset_service_url_falls_back_to_the_hosted_service(publisher):

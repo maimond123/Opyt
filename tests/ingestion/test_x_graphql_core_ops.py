@@ -217,3 +217,128 @@ def test_the_posts_timeline_is_the_default_and_unchanged(monkeypatch):
 def test_an_unknown_timeline_raises_rather_than_silently_walking_posts(monkeypatch):
     with pytest.raises(ValueError, match="timeline must be one of"):
         core.fetch_user_tweets({}, {}, "42", timeline="likes")
+
+
+# ── The per-operation request budget ─────────────────────────────────────────
+# Every X read passes through `graphql_get`, so this is where the budget belongs. What is pinned
+# here is that it reads the SERVER's meter rather than a constant, that each operation gets its
+# own bucket, and that a spent bucket is refused LOCALLY — the request X would 429 is never
+# issued, so it never counts against the window we are protecting.
+
+class _Resp:
+    def __init__(self, status=200, headers=None, payload=None):
+        self.status_code = status
+        self.headers = headers or {}
+        self._payload = payload if payload is not None else {"data": {}}
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _clear_rate_state():
+    core._RATE_STATE.clear()
+    yield
+    core._RATE_STATE.clear()
+
+
+def _drive(monkeypatch, responses):
+    """Point `graphql_get` at a canned response sequence and hand back the issued-op log."""
+    issued = []
+
+    class _Cffi:
+        @staticmethod
+        def get(url, **kw):
+            issued.append(url.rsplit("/", 1)[-1])
+            return responses.pop(0)
+
+    import sys, types
+    mod = types.ModuleType("curl_cffi")
+    mod.requests = _Cffi
+    monkeypatch.setitem(sys.modules, "curl_cffi", mod)
+    return issued
+
+
+def test_the_budget_is_read_off_the_servers_own_headers(monkeypatch):
+    """Self-calibrating: nothing here encodes X's numbers, so a change to them needs no code
+    change. An absent header must leave the state untouched rather than record a zero — an
+    unmetered response and a spent bucket are opposite facts."""
+    issued = _drive(monkeypatch, [
+        _Resp(headers={"x-rate-limit-remaining": "37", "x-rate-limit-reset": "9999999999"}),
+        _Resp(headers={}),
+    ])
+    core.graphql_get("UserTweets", "q", {}, {}, {})
+    assert core.rate_budget("UserTweets") == (37, 9999999999.0)
+    core.graphql_get("UserTweets", "q", {}, {}, {})
+    assert core.rate_budget("UserTweets") == (37, 9999999999.0)   # unmetered != spent
+    assert issued == ["UserTweets", "UserTweets"]
+
+
+def test_a_spent_bucket_refuses_before_the_request_goes_out(monkeypatch):
+    """THE assertion. Once the meter reads 0 before the reset instant, no request is ISSUED —
+    refusing locally is what keeps the 429 (which X counts) from ever being sent."""
+    import time
+    reset = time.time() + 600
+    issued = _drive(monkeypatch, [
+        _Resp(headers={"x-rate-limit-remaining": "0", "x-rate-limit-reset": str(reset)}),
+    ])
+    core.graphql_get("UserTweets", "q", {}, {}, {})
+    assert issued == ["UserTweets"]
+
+    with pytest.raises(core.XRateLimited) as e:
+        core.graphql_get("UserTweets", "q", {}, {}, {})
+    assert issued == ["UserTweets"]                  # nothing new went out
+    assert e.value.op == "UserTweets" and e.value.reset_at == pytest.approx(reset)
+
+
+def test_each_operation_holds_its_own_bucket(monkeypatch):
+    """A single global pacer is wrong in both directions — 10x too slow for a 500/window
+    operation, and no protection at all against a 51-request burst on a 50/window one."""
+    import time
+    reset = time.time() + 600
+    issued = _drive(monkeypatch, [
+        _Resp(headers={"x-rate-limit-remaining": "0", "x-rate-limit-reset": str(reset)}),
+        _Resp(headers={"x-rate-limit-remaining": "480", "x-rate-limit-reset": str(reset)}),
+        _Resp(headers={"x-rate-limit-remaining": "479", "x-rate-limit-reset": str(reset)}),
+    ])
+    core.graphql_get("UserTweets", "q", {}, {}, {})
+    core.graphql_get("TweetResultsByRestIds", "q", {}, {}, {})
+
+    with pytest.raises(core.XRateLimited):
+        core.graphql_get("UserTweets", "q", {}, {}, {})
+    core.graphql_get("TweetResultsByRestIds", "q", {}, {}, {})   # its own bucket: unaffected
+    assert issued == ["UserTweets", "TweetResultsByRestIds", "TweetResultsByRestIds"]
+
+
+def test_the_bucket_reopens_once_its_reset_instant_passes(monkeypatch):
+    """`x-rate-limit-reset` is a fixed wall-clock instant, not a rolling window, so a spent
+    bucket has a known end. Refusing past it would be a deadlock: only a request can refill the
+    meter, and the refusal is what prevents the request."""
+    import time
+    issued = _drive(monkeypatch, [
+        _Resp(headers={"x-rate-limit-remaining": "0", "x-rate-limit-reset": str(time.time() - 1)}),
+        _Resp(headers={"x-rate-limit-remaining": "49", "x-rate-limit-reset": "9999999999"}),
+    ])
+    core.graphql_get("UserTweets", "q", {}, {}, {})
+    core.graphql_get("UserTweets", "q", {}, {}, {})               # reset passed → allowed
+    assert issued == ["UserTweets", "UserTweets"]
+    assert core.rate_budget("UserTweets") == (49, 9999999999.0)
+
+
+def test_a_429_still_records_its_reset_instant(monkeypatch):
+    """The one response whose reset we most need. Reading the headers only on success is how a
+    spent bucket stays invisible and the next call issues another 429."""
+    import time
+    reset = time.time() + 300
+    _drive(monkeypatch, [
+        _Resp(status=429, headers={"x-rate-limit-remaining": "0",
+                                   "x-rate-limit-reset": str(reset)}),
+    ])
+    with pytest.raises(core.XRateLimited) as e:
+        core.graphql_get("UserTweets", "q", {}, {}, {})
+    assert e.value.reset_at == pytest.approx(reset)
+    assert core.rate_budget("UserTweets") == (0, pytest.approx(reset))

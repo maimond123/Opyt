@@ -8,7 +8,7 @@ An `Edge` is a directed claim "source links to target" discovered by some probe.
 binary trusted/untrusted, plus the human-readable reasons and the supporting
 edges so the decision is auditable rather than asserted.
 
-See `trust_graph.propagate()` for the four reachability rules these feed.
+See `trust_graph.propagate()` for the trust rules these feed.
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ class TrustEvidence:
     """The trust verdict for one canonical URL.
 
     trusted: binary outcome (this model does not score).
-    reasons: why — e.g. ["X-attested (root)"] or ["Cited by 2 trusted sources"].
-    edges:   the supporting edges as plain dicts, so the GUI / CLI can render
+    reasons: why — e.g. ["Confirmed root"] or ["Cited by 2 trusted sources"].
+    edges:   the supporting edges as plain dicts, so discovery can report
              "Linked from X bio" / "Bidirectional with someuser.ai" without
              re-deriving anything.
     """
@@ -46,6 +46,3 @@ class TrustEvidence:
     trusted: bool = False
     reasons: list = field(default_factory=list)
     edges: list = field(default_factory=list)
-
-    def as_dict(self) -> dict:
-        return {"trusted": self.trusted, "reasons": list(self.reasons), "edges": list(self.edges)}

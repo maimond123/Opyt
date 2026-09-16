@@ -78,7 +78,7 @@ def split_text(text: str) -> list[tuple[int, str, int, int]]:
             try:
                 from pipeline.ingestion.utils import log
                 log(f"[chunk] snapshot exceeds MAX_CHUNKS={MAX_CHUNKS} "
-                    f"({len(text)} chars) — tail from char {pos} DROPPED (not embedded).")
+                    f"({len(text)} chars) — tail from char {chunks[-1][3]} DROPPED (not embedded).")
             except Exception:
                 pass
     return chunks

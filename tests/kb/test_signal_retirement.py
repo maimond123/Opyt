@@ -169,6 +169,36 @@ def test_no_clock_at_all_retires_nobody(conn):
     assert len(screen.rank_candidates(conn)) == 3
 
 
+def test_a_programming_error_is_not_reported_as_nobody_retired(conn, monkeypatch):
+    """⚠️ FIXED 2026-09-04. A bare `except Exception: return set()` wrapped the whole function,
+    including its imports and its field reads. Retirement permanently disabled by a rename or a
+    bad import therefore looked IDENTICAL to a healthy store with nobody to retire — the one
+    outcome this feature's own docstring says must never be silent. The four named fail-safe
+    paths (no clock, unreadable clock, untrustworthy walk, unparseable stamp) are handled
+    explicitly and keep working; everything else now surfaces."""
+    for uid in "123":
+        _person(conn, uid)
+        schema.set_signal(conn, f"x:user:{uid}", "follow", "x")
+    _walk(conn, ["1"], at=T0, prev_found=3)
+
+    monkeypatch.setattr(cs, "walk_is_trustworthy",
+                        lambda run: (_ for _ in ()).throw(AttributeError("renamed field")))
+    with pytest.raises(AttributeError):
+        screen.rank_candidates(conn)
+
+
+def test_a_store_without_the_retirement_tables_still_retires_nobody(conn, monkeypatch):
+    """The fail-safe that survives the narrowing: a missing//unreadable store is not a
+    programming error and must still degrade to the empty set."""
+    import sqlite3
+    for uid in "123":
+        _person(conn, uid)
+        schema.set_signal(conn, f"x:user:{uid}", "follow", "x")
+    monkeypatch.setattr(cs, "get_run",
+                        lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("no table")))
+    assert len(screen.rank_candidates(conn)) == 3
+
+
 # ── the migration hazard ────────────────────────────────────────────────────────
 def test_upgrading_an_existing_store_retires_nobody(conn):
     """⚠️ THE hazard. Pre-existing rows have no `last_confirmed_at`. If NULL compared as "older
@@ -242,3 +272,32 @@ def test_include_retired_returns_them_flagged(conn):
     everyone = screen.rank_candidates(conn, include_retired=True)
     assert len(everyone) == 3
     assert [c.canonical_id for c in everyone if c.retired] == ["x:user:3"]
+
+
+def test_the_maintained_collector_is_named_not_inferred_from_its_signal_type(conn):
+    """Two collectors now write a `follow` signal — `x_following` and `substack_follows` — so a
+    signal type no longer identifies one collector's walk.
+
+    This is a regression test for a SILENT failure. `_retired_ids` used to pick its spec with
+    `next(s for s in specs if s.signal_type == 'follow')`, which started resolving to whichever
+    spec came first in the registry the day the Substack rename landed. Retirement then compared
+    every X follow against a Substack clock that had never run, returned the empty set, and
+    retired nobody — with nothing raising and no count to notice.
+    """
+    from pipeline.kb.ingest_curation import SPEC_BY_COLLECTOR
+
+    follow_specs = [s.collector for s in SPEC_BY_COLLECTOR.values() if s.signal_type == "follow"]
+    assert len(follow_specs) > 1, "the ambiguity this test defends against is gone — re-read it"
+    assert screen.MAINTAINED_COLLECTOR in SPEC_BY_COLLECTOR
+
+    # A Substack follow must not enter the retired set, and must not rescue a stale X follow.
+    _person(conn, 1)
+    schema.upsert_entity(conn, "substack:pub", name="Pub")
+    schema.set_signal(conn, "substack:pub", "follow", "substack")
+    _walk(conn, [1], at=T0)
+
+    assert screen._retired_ids(conn) == set()
+    assert not any(r["signal_type"] == "follow" and r["platform"] == "substack"
+                   for r in conn.execute("SELECT signal_type, platform FROM curation_signals "
+                                         " WHERE entity_id IN (SELECT entity_id FROM entities "
+                                         "   WHERE entity_id LIKE 'x:%')"))

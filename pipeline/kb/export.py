@@ -49,11 +49,15 @@ _CARRY: dict[str, tuple[str, ...] | None] = {
     # It is `text` with OPYT's renderer output stripped, i.e. a strict SUBSET of a column the
     # export already carries, so this removes bytes and never content.
     "chunks": ("chunk_id", "atom_id", "seq", "char_start", "char_end", "text", "vector"),
-    # `identity_links` is read only by screen.py and oracles.py — neither is a read tool.
+    # `identity_links` has five readers — screen.py, oracles.py, resolve.py,
+    # oracle_refresh_state.py and expand.py — and NONE of them is a read tool, which is the
+    # reason it is dropped. The sentence here named two of the five until 2026-09-06; the
+    # conclusion never depended on the count, and the sibling comment above records the sweep
+    # that actually established it.
     "entities": ("entity_id", "name", "canonical_id", "profile"),
     # `aggregate`'s trust-coverage count joins atoms → entities → oracles (opyt_core/kb.py). Only
-    # the join key and the label are needed; `source`, `ingest_from`, `ingest_to` and `paused` are
-    # collection mechanics that tell a reader nothing about the corpus.
+    # the join key and the label are needed; `source` and `paused` are collection mechanics that
+    # tell a reader nothing about the corpus.
     "oracles": ("canonical_id", "name", "confirmed_at"),
     # REQUIRED, not optional: the vector arm reads `storage_dtype` to decode the blobs, and
     # decoding a float16 blob as float32 is silent garbage rather than an error.
@@ -87,7 +91,11 @@ CREATE TABLE kb_raw (
 # arm of `resolve_who` that covers X (whose ids are numeric, so the handle lives only here).
 
 _PAYLOAD_KEYS = frozenset({
-    # read by code — dropping any of these breaks a filter, not just a display field
+    # read by code, not just displayed. NOT "dropping any of these breaks a filter": `body_state`
+    # and `body_basis` have never had one. `754a6440` says so at birth — "this describes what an
+    # adapter ended up with, it does not decide what gets stored" — and they are carried because a
+    # reader of an exported atom needs to know whether its body is whole, which is a fact about
+    # the atom rather than a query surface.
     "source_tags", "body_state", "body_basis",
     # x
     "like_count", "reply_count", "is_quote", "is_thread", "is_article", "has_media",

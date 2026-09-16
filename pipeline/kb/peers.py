@@ -29,10 +29,12 @@ apart. THIS MODULE OPENS ONLY THE FIRST KIND — a remote peer is routed over HT
 `opyt_core/kb_remote.py`, before an entry point reaches `open_peer`, which is the whole reason
 the seam was drawn at the store-opening boundary rather than inside `retrieve.py`.
 
-WHO WRITES A ROW HERE. `mcp_server/share_tools.accept` is the surface a person reaches — it
-redeems an invite and registers the peer in one call, because a reader who has to open a shell is
-a reader the design does not get. `opyt-redeem` does the same thing from a terminal and stays as
-the operator rail. `service/uploads.Receiver.commit` writes the SERVICE's own row for the export
+WHO WRITES A ROW HERE. `mcp_server/share_tools.accept` is the ONLY surface that writes a reader's
+row — it redeems an invite and registers the peer in one call, because a reader who has to open a
+shell is a reader the design does not get. `opyt-redeem` did the same thing from a terminal until
+it was deleted on 2026-09-05; `accept` finds the code inside a link, a fragment or a bare paste
+and infers the service, where the command made the reader type the URL as a positional argument.
+`service/uploads.Receiver.commit` writes the SERVICE's own row for the export
 it just received, which is a different job under the same schema. A file peer on this disk still
 takes a Python prompt, and has no other caller:
 

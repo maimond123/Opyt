@@ -9,7 +9,7 @@ same host must not.
 The unit is platform-specific because where "identity" lives differs:
   - substack:           the SUBDOMAIN owns identity   → someuser.substack.com
   - github/x/medium:    host + first path SEGMENT      → github.com/someuser
-  - youtube:            the channel handle/id          → youtube.com/@andrejsomeuser
+  - academic profiles:  the platform account ID (query or path)
   - everything else:    the bare host                  → someuser.ai
 
 This is the squatter-defense primitive: `github.com/someuser` and
@@ -22,35 +22,70 @@ scheme, lowercases the host, aliases twitter↔x, extracts the path unit).
 
 from __future__ import annotations
 
-from urllib.parse import urlparse
+import re
+from urllib.parse import parse_qs, urlparse
 
 # Hosts where the first path segment is the identity (the account handle).
 _PATH_PLATFORMS = {"github.com", "x.com", "medium.com", "gitlab.com"}
 
-# Hosts treated as YouTube; channel identity lives in the path.
-_YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+# Excluded platforms must not fall through to the personal-blog default.
+_EXCLUDED_HOSTS = {
+    "youtube.com", "youtu.be", "linkedin.com", "spotify.com",
+    "podcasts.apple.com", "apple.co", "pod.link", "overcast.fm", "pca.st",
+}
+
+
+def parse_url(url: str):
+    """Parse a web URL or bare host at the identity boundary; reject unusable inputs."""
+    if not url or not url.strip():
+        return None
+    raw = url.strip()
+    if "://" not in raw and (":" in raw or raw.startswith(("/", "#"))):
+        return None
+    if any(c.isspace() for c in raw):
+        return None
+    try:
+        parsed = urlparse(raw if "://" in raw else "https://" + raw)
+        host = parsed.hostname
+        _ = parsed.port  # validate a supplied port at the same boundary
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not host:
+        return None
+    if "://" not in raw and "." not in host:
+        return None
+    if any(host == excluded or host.endswith("." + excluded) for excluded in _EXCLUDED_HOSTS):
+        return None
+    return parsed
+
+
+def excluded_platform(url: str) -> str | None:
+    """The excluded host this URL belongs to, or None — `_EXCLUDED_HOSTS` asked by NAME.
+
+    Same fact `parse_url` already acts on, exposed because two callers need it for opposite
+    reasons. `parse_url` folds it into "unusable" and returns None, which is right for identity:
+    a youtube URL names no trust unit. But a caller deciding WHAT TO SAY needs to tell "this is
+    a video platform we do not read" apart from "this is not a URL", and an empty identity cannot.
+
+    Added 2026-09-15 for `hopper`, which had no way to ask. Its router falls everything unknown
+    through to `article`, so a youtube link was fetched as if it were a blog post and came back
+    "the content-quality gate found no substantive units (nav / promo / boilerplate)" — which
+    reads as OPYT judging the video worthless rather than as OPYT not doing video. The comment
+    above `_EXCLUDED_HOSTS` had stated the rule since it was written; nothing let Hopper read it.
+    """
+    parsed = urlparse(url.strip() if url else "")
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if not host:
+        return None
+    return next((e for e in _EXCLUDED_HOSTS if host == e or host.endswith("." + e)), None)
 
 
 def canonical_identity(url: str) -> str:
-    """Return the platform-aware trust unit for `url` (no scheme, lowercased host).
-
-    Returns "" for falsy/unparseable input so callers can filter cheaply.
-    """
-    if not url or not url.strip():
+    """Return the account's trust unit, or an empty string for unusable/excluded URLs."""
+    parsed = parse_url(url)
+    if parsed is None:
         return ""
-
-    u = url.strip()
-    if "://" not in u:
-        u = "https://" + u  # urlparse needs a scheme to populate netloc
-
-    parsed = urlparse(u)
-    host = (parsed.netloc or "").lower()
-    if not host:
-        return ""
-    host = host.split("@")[-1]   # drop any user:pass@ prefix
-    host = host.split(":")[0]    # drop :port
-    if host.startswith("www."):
-        host = host[4:]
+    host = parsed.hostname.removeprefix("www.")
 
     # twitter.com and x.com are the same platform — alias to x.com.
     if host == "twitter.com" or host == "mobile.twitter.com":
@@ -58,19 +93,30 @@ def canonical_identity(url: str) -> str:
 
     segs = [s for s in parsed.path.split("/") if s]
 
+    # Academic account identifiers live in queries or deeper paths, not the bare host.
+    if host == "scholar.google.com":
+        user = (parse_qs(parsed.query).get("user") or [None])[0]
+        return f"{host}/citations?user={user}" if user else ""
+    if host == "semanticscholar.org" or host.endswith(".semanticscholar.org"):
+        return f"semanticscholar.org/author/{segs[-1]}" if len(segs) >= 2 and segs[0] == "author" else ""
+    if host == "orcid.org":
+        return f"{host}/{segs[0]}" if segs and re.fullmatch(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", segs[0]) else ""
+    if host == "dblp.org" or host.endswith(".dblp.org"):
+        return "dblp.org/" + "/".join(segs).removesuffix(".html") if len(segs) >= 2 and segs[0] in {"pid", "pers"} else ""
+    if host == "researchgate.net" or host.endswith(".researchgate.net"):
+        return f"researchgate.net/profile/{segs[1].lower()}" if len(segs) >= 2 and segs[0] == "profile" else ""
+    if host == "academia.edu" or host.endswith(".academia.edu"):
+        if segs and not segs[0].isdigit():
+            return f"{host}/{segs[0].lower()}"
+        return host if host != "academia.edu" and not segs else ""
+    if host == "arxiv.org" and len(segs) >= 2 and segs[0] == "a":
+        return f"{host}/a/{segs[1]}"
+    if host == "github.com" and len(segs) >= 2 and segs[0] == "orgs":
+        return f"{host}/{segs[1].lower()}"
+
     # Substack / Medium subdomain forms: the subdomain IS the identity.
     if host.endswith(".substack.com") or host.endswith(".medium.com"):
         return host
-
-    # YouTube: identity is the channel handle (@x), or /channel|c|user/<id>.
-    if host in _YOUTUBE_HOSTS:
-        if segs:
-            first = segs[0].lower()
-            if first.startswith("@"):
-                return f"youtube.com/{first}"
-            if first in ("channel", "c", "user") and len(segs) >= 2:
-                return f"youtube.com/{first}/{segs[1].lower()}"
-        return "youtube.com"
 
     # Handle-on-path platforms: host + first segment.
     if host in _PATH_PLATFORMS and segs:
@@ -78,33 +124,3 @@ def canonical_identity(url: str) -> str:
 
     # Default: the bare host is the identity (personal sites, blogs).
     return host
-
-
-def resolve_channel_url(url: str) -> str | None:
-    """Resolve any YouTube URL to its canonical channel URL.
-
-    Discovery surfaces watch/playlist URLs (a video the person linked), but a YouTube
-    IDENTITY is the channel — so `discover_profile` resolves before trust runs, or two
-    links to the same creator's videos read as two different sources. Short-circuits with
-    NO network when the URL is already channel-shaped (/@handle, /channel, /c, /user).
-    Returns None when it cannot resolve; the caller keeps the original URL (fail-safe:
-    a failed lookup must not lose the link it was handed).
-    """
-    cid = canonical_identity(url)
-    if cid and cid != "youtube.com":
-        return url  # already channel-specific — no fetch needed
-
-    import yt_dlp
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
-            "extract_flat": "in_playlist", "playlistend": 1}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception:
-        return None
-    ch = info.get("channel_url") or info.get("uploader_url")
-    if not ch:
-        entries = info.get("entries") or []
-        if entries:
-            ch = entries[0].get("channel_url") or entries[0].get("uploader_url")
-    return ch

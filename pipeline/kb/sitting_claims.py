@@ -16,8 +16,6 @@ lens, and records a `failed` run — same contract as `sitting_reader.read_sitti
 
 from __future__ import annotations
 
-import argparse
-import json
 from datetime import datetime
 from pipeline.timeparse import utc_iso, utc_now
 
@@ -78,7 +76,7 @@ Return ONE JSON object, nothing else:
 """
 
 
-def read_claims(conn=None, sitting_id: str = "", *, force: bool = False, dry_run: bool = False,
+def read_claims(conn=None, sitting_id: str = "", *, dry_run: bool = False,
                 prompt_only: bool = False, now: datetime | None = None) -> dict:
     """Read one sitting and extract its claims. Never raises.
 
@@ -86,22 +84,30 @@ def read_claims(conn=None, sitting_id: str = "", *, force: bool = False, dry_run
     what would be sent, same contract as `sitting_reader.read_sitting`'s flag of the same name.
     `dry_run` makes the call and returns the result but writes nothing, leaving the sitting unread
     for this lens.
+
+    A `force` here bypassed `_read`'s once-only guard and was deleted on 2026-09-08, unused by
+    every caller it ever had. Do NOT bring it back to recover a failed read: the guard it
+    bypassed keys on a `sitting_reads` row that only a SUCCESSFUL read writes, so there is
+    nothing for it to bypass after a failure, and calling this function is already the retry.
+    Two docstrings below promised `--force` as the recovery path for a deterministic failure;
+    both were wrong about the mechanism, not merely stale about the CLI that carried the flag.
     """
     ref = now or utc_now()
     own = conn is None
     if own:
         conn = schema.connect()
     try:
-        return _read(conn, sitting_id, force=force, dry_run=dry_run, prompt_only=prompt_only,
-                     ref=ref)
+        return _read(conn, sitting_id, dry_run=dry_run, prompt_only=prompt_only, ref=ref)
     except Exception as e:
         detail = f"{type(e).__name__}: {e}"
         log(f"[sitting-claims] run errored: {detail}")
         try:
             fq.record_run(conn, generator=f"{sr.GENERATOR_PREFIX}:?", sitting_id=sitting_id or None,
                           lens=LENS, status="failed", reason=detail)
-        except Exception:
-            pass
+        except Exception as e2:
+            # `_fail` logs this exact failure of this exact call; staying silent here meant a store
+            # that cannot write run rows AT ALL left no trace anywhere.
+            log(f"[sitting-claims] could not record failed run: {e2}")
         return {"status": "failed", "reason": detail}
     finally:
         if own:
@@ -114,13 +120,19 @@ def collect_notebook_debt(conn, sitting_id: str, *, now: datetime | None = None)
     THE INVARIANT: the queries read closes a part; the claims receipt is a DEBT every chain walk
     collects. Splitting it that way is what keeps a claims failure from blocking a part —
     `sitting_reader` stamps `read_at` on its own success and this runs afterwards, so a bad claims
-    call costs a notebook entry, not the part.
+    call leaves a notebook entry unresolved, not the part.
 
     An ancestor with `sittings.read_at` set and no ok `sitting_reads(sitting_id, 'claims')` row owes
-    its entry. That state is REACHABLE two ways and both are ordinary: a claims call that failed,
-    and every part read before the notebook existed. Collecting here means the debt is paid at the
-    moment it starts to matter — just before part N+1 is rendered and would otherwise show a hole
-    in its own memory.
+    its entry. That state is REACHABLE three ways: a claims call that failed before spending, a
+    claims call that failed after spending, and every part read before the notebook existed.
+    Collecting here means the debt is paid at the moment it starts to matter — just before part N+1
+    is rendered and would otherwise show a hole in its own memory.
+
+    Only the transient ones are collected HERE. A failure that REACHED THE MODEL is dropped by
+    `_debtors` — see `_called_and_failed` — so nothing pays that hole down on its own. It is
+    retried by asking for the sitting BY NAME: `sitting(action='read', lens='claims',
+    sitting_id=…)` reaches `read_claims` directly, and nothing gates it, because `_read`'s
+    once-only guard keys on a `sitting_reads` row that the failed read never wrote.
 
     `read_claims` carries its own once-only guard, so calling it for an already-extracted ancestor
     is a free `skipped`. Returns one result per ancestor it attempted.
@@ -160,13 +172,41 @@ def _debtors(conn, sitting_id: str) -> list[str]:
         row = conn.execute("SELECT read_at FROM sittings WHERE sitting_id = ?", (sid,)).fetchone()
         if row is None or not row["read_at"]:
             continue                       # never read → owes nothing; it is not part of the story
-        state = sst.lens_read_state(conn, sid, LENS)
-        if not state or state.get("read_status") != "ok":
-            out.append(sid)
+        # Presence is the whole test, and since 2026-09-06 there is nothing else to test: this
+        # read `state.get("read_status") != "ok"` as well until 2026-09-04, which disagreed with
+        # `_read` below — that treats ANY row as already read and skips. The column went with
+        # `schema._drop_read_status`, so the two cannot drift apart again.
+        if sst.lens_read_state(conn, sid, LENS) is not None:
+            continue
+        if _called_and_failed(conn, sid):
+            continue
+        out.append(sid)
     return out
 
 
-def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: bool,
+def _called_and_failed(conn, sitting_id: str) -> bool:
+    """True when a `claims` read of this sitting reached the model and still produced nothing.
+
+    The failure-side twin of `_read`'s once-only guard, which keys on a `sitting_reads` row a
+    failed read never writes — so without this, every later part re-attempted every failed
+    ancestor at cost, O(N^2) over a chain.
+
+    `model IS NOT NULL` is exactly the two `_fail(usage=...)` sites: an unparseable body and a
+    valid-but-empty one. Both are DETERMINISTIC — the same input and model produce them again — so
+    an automatic retry buys nothing — which is the whole reason this check exists, since a
+    changed prompt or a changed model is what makes retrying one worthwhile, and neither is
+    something a walk of the chain can detect. Everything else stays collectable because it is
+    transient: degrade-open, HTTP 402, and a transport exception all record no `model`. Naming
+    the sitting on the tool retries either kind; see `collect_notebook_debt` for why that path
+    is not gated.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM frontier_reader_runs WHERE sitting_id = ? AND lens = ? "
+        "AND status = 'failed' AND model IS NOT NULL LIMIT 1", (sitting_id, LENS)).fetchone()
+    return row is not None
+
+
+def _read(conn, sitting_id: str, *, dry_run: bool, prompt_only: bool,
           ref: datetime) -> dict:
     s = sst.get_sitting(conn, sitting_id)
     if s is None:
@@ -174,9 +214,11 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
     gen = sr.generator_for(s["seed_ref"])
 
     # 1. Never re-read what this lens already read. Independent of `queries`' own read state —
-    #    see the module docstring for why the two must not gate each other.
+    #    see the module docstring for why the two must not gate each other. This fires on
+    #    SUCCESS ONLY: `mark_lens_read` is the sole writer of that row and a failed read never
+    #    reaches it, so a failure is retried by calling in again and this never sees it.
     state = sst.lens_read_state(conn, sitting_id, LENS)
-    if state and not force:
+    if state:
         reason = f"already read at {state['read_at']}"
         fq.record_run(conn, generator=gen, sitting_id=sitting_id, lens=LENS, status="skipped",
                       reason=reason, ran_at=utc_iso(ref))
@@ -199,21 +241,21 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
     reason = core.preflight(backend)
     if reason:
         log(f"[sitting-claims] skipped (degrade-open): {reason}")
-        return _fail(conn, gen, sitting_id, ref, reason, spent=False)
+        return _fail(conn, gen, sitting_id, ref, reason)
 
     try:
         resp = core.call(backend, _SYSTEM, user_msg)
     except Exception as e:
         if getattr(e, "status", None) == 402:
-            reason = (f"OUT OF CREDITS (HTTP 402) — prompt rejected, nothing spent. Add credits, "
-                      f"or lower OPYT_SITTING_MAX_INPUT_CHARS (currently {sr.MAX_INPUT_CHARS}). "
+            reason = (f"provider rejected the prompt (HTTP 402). Lower "
+                      f"OPYT_SITTING_MAX_INPUT_CHARS (currently {sr.MAX_INPUT_CHARS}), "
                       f"Upstream: {e}")
             log(f"[sitting-claims] {reason}")
-            return _fail(conn, gen, sitting_id, ref, reason, spent=False)
-        return _fail(conn, gen, sitting_id, ref, f"{type(e).__name__}: {e}", spent=True)
+            return _fail(conn, gen, sitting_id, ref, reason)
+        return _fail(conn, gen, sitting_id, ref, f"{type(e).__name__}: {e}")
 
     usage = {"model": resp.model, "in_tokens": resp.input_tokens,
-             "out_tokens": resp.output_tokens, "cost_usd": resp.cost_usd,
+             "out_tokens": resp.output_tokens,
              "atoms_read": s["atoms"]}
     obj = core.parse_response(resp.text)
     if obj is None:
@@ -221,7 +263,7 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
         if core.finish_reason(resp) == "length":
             reason = (f"response truncated at max_tokens ({usage['out_tokens']} out) — "
                       f"raise max_tokens for role {core.ROLE!r}")
-        return _fail(conn, gen, sitting_id, ref, reason, spent=True, usage=usage)
+        return _fail(conn, gen, sitting_id, ref, reason, usage=usage)
 
     # THE CITATION GATE IS WIDENED TO THE WHOLE CHAIN (decided 2026-08-25). The notebook preamble
     # asks this read to confirm, revise or refute claims made by EARLIER parts, and the honest way
@@ -247,9 +289,8 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
 
     if not claims:
         # An explicit reject on zero claims: a well-formed but empty response can pass parsing
-        # and finish_reason checks while still billing (see bakeoff doc for the incident).
-        return _fail(conn, gen, sitting_id, ref, "no valid claims after validation",
-                     spent=True, usage=usage)
+        # and finish_reason checks (see bakeoff doc for the incident).
+        return _fail(conn, gen, sitting_id, ref, "no valid claims after validation", usage=usage)
 
     if dry_run:
         return {"status": "dry-run", "sitting_id": sitting_id, "generator": gen,
@@ -259,49 +300,18 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
     fq.record_run(conn, generator=gen, sitting_id=sitting_id, lens=LENS, status="ok",
                   ran_at=utc_iso(ref), emitted=len(claims), middle_share=cov["middle_share"],
                   reason="; ".join(notes) or None, **usage)
-    sst.mark_lens_read(conn, sitting_id, LENS, status="ok", at=ref)
+    sst.mark_lens_read(conn, sitting_id, LENS, at=ref)
     return {"status": "ok", "sitting_id": sitting_id, "generator": gen, "claims": claims,
             "notes": notes, "coverage": cov, **usage}
 
 
-def _fail(conn, generator: str, sitting_id: str, ref: datetime, reason: str, *, spent: bool,
+def _fail(conn, generator: str, sitting_id: str, ref: datetime, reason: str, *,
           usage: dict | None = None) -> dict:
     """Record a failed run. Writes no claims and leaves the sitting unread for this lens."""
     fields = dict(usage or {})
-    if spent:
-        fields.setdefault("cost_usd", 0.0)
     try:
         fq.record_run(conn, generator=generator, sitting_id=sitting_id, lens=LENS,
                       status="failed", reason=reason, ran_at=utc_iso(ref), **fields)
     except Exception as e:
         log(f"[sitting-claims] could not record failed run: {e}")
     return {"status": "failed", "reason": reason}
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Read one sitting and extract its falsifiable claims")
-    ap.add_argument("--sitting", required=True, help="sitting_id to read")
-    ap.add_argument("--show-prompt", action="store_true", dest="prompt_only",
-                    help="print the exact prompt and its token estimate; calls nothing, spends "
-                         "nothing")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="make the call and print the result; write nothing (this DOES spend)")
-    ap.add_argument("--force", action="store_true", help="re-read a sitting already read for claims")
-    args = ap.parse_args(argv)
-
-    conn = schema.connect()
-    try:
-        res = read_claims(conn, args.sitting, force=args.force, dry_run=args.dry_run,
-                          prompt_only=args.prompt_only)
-        if res.get("status") == "prompt-only":
-            print(res.pop("prompt"))
-            print("\n" + json.dumps(res, indent=2, default=str))
-        else:
-            print(json.dumps(res, indent=2, default=str))
-        return 0 if res.get("status") in {"ok", "dry-run", "skipped", "prompt-only"} else 1
-    finally:
-        conn.close()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

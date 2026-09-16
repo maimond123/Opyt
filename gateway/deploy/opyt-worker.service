@@ -1,0 +1,48 @@
+[Unit]
+Description=OPYT hosted rail worker
+After=network.target
+
+[Service]
+User=opyt
+# No EnvironmentFile, because this unit holds no secret. Each rail child loads its own user's
+# keys from that home's .env (pipeline/kb/rail_runtime.load_rail_env), so the worker process
+# never has a credential to leak and these three values can be world-readable.
+Environment=OPYT_HOMES_ROOT=/srv/homes
+# Every rail child on this box is a hosted process, and `hosted_browser.enabled()` is how the
+# X and Substack readers know to use the per-home Chrome profile instead of reading a local
+# browser. The gateway sets it for MCP children (gateway/children.py); the worker must set it for
+# RAIL children, which are a different process tree. Without it a rail falls through to the local
+# cookie reader, finds no browser on a server, and raises "No OPYT-managed X session found" while
+# X is in fact connected — measured 2026-09-07, `bookmark_catchup` failing twice on a home whose
+# session was live. The variable name predates the second site; renaming it would couple a code
+# change to reinstalling this unit, so it stays.
+Environment=OPYT_HOSTED_X=1
+Environment=OPYT_WORKER_DB=/var/lib/opyt-worker/rail_jobs.db
+# The starting hypothesis from ruling F4, not a measured result. Stage 7's capacity gate sets
+# the real value from CPU, RAM, and queue delay on this box.
+Environment=OPYT_WORKER_MAX_CHILDREN=8
+# Creates /var/lib/opyt-worker owned by `opyt`. The gateway unit declares the same directory,
+# so a child can queue work whether or not this unit has ever started.
+StateDirectory=opyt-worker
+WorkingDirectory=/srv/opyt-src
+ExecStart=/srv/opyt-src/.venv/bin/opyt-worker
+Restart=always
+# Bounds all eight rail children in the cgroup below, browsers included when a rail pulls
+# through hosted Chrome. 8G of the measured 31 GB, against 20G for the gateway and ~3G for the
+# OS. Same ruling as the gateway unit: without a per-service ceiling the kernel picks an OOM
+# victim by RSS from every process on the box, so a runaway rail can kill a user's sign-in.
+# MemoryHigh is deliberately absent — there is no swap to reclaim into.
+MemoryMax=8G
+# REQUIRED alongside MemoryMax. systemd defaults OOMPolicy to `stop`, which with
+# KillMode=control-group below would take ALL rail children down for one OOM-killed child.
+# `continue` is safe here because RailWorker.reap_finished polls every child's exit code
+# "regardless of its result": an OOM-killed rail returns -9, gets recorded by store.finish, and
+# is rescheduled by its cadence. No claim is orphaned. This does not affect a DELIBERATE
+# restart, which still takes the cgroup down and recovers claims — see KillMode below.
+OOMPolicy=continue
+# Must not change: rail children live in this cgroup, so a restart takes them down with the
+# worker and the next lifetime recovers their interrupted claims rather than racing them.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

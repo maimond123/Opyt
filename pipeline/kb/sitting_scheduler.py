@@ -3,7 +3,7 @@ pipeline/kb/sitting_scheduler.py — WHICH region gets read next, and what makes
 
 The rail's disposer: nothing else decides, unattended, that a built region is owed a read.
 
-Four channels propose, one scheduler disposes, at most one paid read per run:
+Four channels propose, one scheduler disposes, at most one paid REGION read per run:
 
     1  pointed     an unread region whose read was ATTEMPTED and failed  -> retry it
     2  new_mass    a read region that has gained material                -> regrow, read that
@@ -14,20 +14,31 @@ Consumption subscribes, construction does not — a bare `preview` or hand-run `
 but queues nothing. `pointed` is a retry lane only (needs a prior failed `frontier_reader_runs`
 row); `sub_region` claims only a fracture child whose parent has a `read_at`.
 
-One scheduler ranks all four channels rather than four independent spawners, because they compete
+One scheduler ranks all four channels rather than four independent rails, because they compete
 for the same paid reader and a priority order ("read what was asked for before fracture leftovers",
-D16) can't be expressed by racing spawners. Priority ranks by what rots (`pointed`, `new_mass`)
-ahead of what doesn't (`sub_region`, `remainder`, oldest-first between the two).
+D16) cannot be expressed by four rails racing for one budget. Priority ranks by what rots
+(`pointed`, `new_mass`) ahead of what doesn't (`sub_region`, `remainder`, oldest-first between
+the two).
 
-At most one paid read per run is the bound, not one unit of bookkeeping — a `remainder` claim may
-write several sub-sittings before reading one.
+At most one paid REGION read per run is the bound — not one unit of bookkeeping, and (CORRECTED
+2026-09-05) not one model CALL: the `claims` lens rides along, so a run costs 2 + K, where K is
+notebook debt that drains (`sitting_claims._called_and_failed`).
 
 Selection (this module) uses `first_seen`; membership uses no clock; render order uses `when_ts`
 (Amendment 3) — the date filter computed here crosses into the builder as a plain id set only.
 
 Never raises. Every outcome is a dict and a row in `frontier_reader_runs`.
 
-Full design rationale (D16 ranking, D15/D8/D9/D10 decisions, the clock-rule detail):
+This rail is ONE registry entry in `rail_worker.RAILS` covering four channels, and that is the
+narrow exception worth stating. The eight rails are otherwise independent: they fail for different
+reasons, spend on different things, and the worker keeps one home's failure off every other rail.
+These four channels are not independent. They are four reasons to make the SAME paid call against
+the same reader, and they compete for it. Four registry entries racing over one budget could not
+express "read the region David asked for BEFORE the fracture leftovers", which is the entire
+content of D16. One disposer that ranks them can.
+
+It is also a PRODUCER: a read is the only thing that writes standing queries, so a read that adds
+one makes `frontier_execute` due (see `main`).
 """
 
 from __future__ import annotations
@@ -39,8 +50,7 @@ from pipeline.timeparse import utc_iso, utc_now
 
 import numpy as np
 
-from pipeline.kb.rail_runtime import (COALESCE_DEFAULT, load_rail_env,
-                                      models_unroutable, spawn_rail)
+from pipeline.kb.rail_runtime import load_rail_env, models_unroutable
 from pipeline.ingestion.utils import log
 
 from . import frontier_queries as fq
@@ -205,6 +215,8 @@ def _new_mass_claims(conn) -> list[dict]:
             continue
         try:
             anchor = sst.ensure_seed_vector(conn, row["sitting_id"])
+            # `ChainError` is a KeyError, so the clause below already covers a corrupted chain.
+            chain = set(sb.chain_atom_ids(conn, row["sitting_id"]))
         except (KeyError, sb.SeedError) as e:
             # Fail-safe: a region whose anchor can't be rebuilt is skipped, never crashed on.
             log(f"[sitting-scheduler] no anchor for region {r['region_key']}: {e}")
@@ -215,7 +227,7 @@ def _new_mass_claims(conn) -> list[dict]:
         regions.append({"region_key": r["region_key"], "seed_ref": row["seed_ref"],
                         "sitting_id": row["sitting_id"], "floor": row["floor"],
                         "last_read": last, "last_read_raw": r["last_read"],
-                        "size": size, "anchor": anchor})
+                        "size": size, "anchor": anchor, "chain": chain})
     if not regions:
         return []
 
@@ -228,8 +240,12 @@ def _new_mass_claims(conn) -> list[dict]:
 
     out = []
     for i, x in enumerate(regions):
+        # `not in x["chain"]` keeps this scan agreeing with the build it triggers: `build_sitting`
+        # subtracts the chain, so an already-read atom counted here buys a regrow of nothing.
+        # Reached via a promoted frontier atom, whose fresh `promoted_at` reads as an arrival.
         mass = sum(1 for a, v in scores.items()
-                   if arrivals[a] > x["last_read"] and float(v[i]) >= x["floor"])
+                   if a not in x["chain"] and arrivals[a] > x["last_read"]
+                   and float(v[i]) >= x["floor"])
         want = max(float(NEW_MASS_FLOOR), NEW_MASS_FRACTION * x["size"])
         if mass < want:
             continue
@@ -250,7 +266,7 @@ def claims(conn, *, cheap_only: bool = False) -> list[dict]:
     """Every channel's proposals, best first. Reads nothing paid and writes nothing.
 
     `cheap_only` drops the new-mass channel (the only one that scans the chunk table): a tool call
-    can't create new-mass work, so skipping it there is safe — the session-open spawner covers it.
+    can't create new-mass work, so skipping it there is safe — the rail's own cadence covers it.
     """
     out = _unread_claims(conn) + _remainder_claims(conn)
     if not cheap_only:
@@ -317,13 +333,13 @@ def _fracture_or_continue(conn, sitting_id: str, *, ref: datetime) -> dict:
     survivors = [s for s in trial["sub"] if s["kept"] and s["tier"] == "standalone"]
     if len(survivors) > 1:
         rep = sz.zoom(conn, sitting_id, persist=True, now=ref)
+        # `written` is `survivors` re-derived after the exact replay, so it cannot be empty here:
+        # `zoom` persists on `keep and tier == "standalone"`, the predicate `survivors` just counted.
         written = [s for s in rep["sub"] if s["persisted"]]
-        if written:
-            # Read the biggest sub-region now rather than waiting a coalesce window; siblings
-            # become `sub_region` claims.
-            pick = max(written, key=lambda s: s["atoms"])
-            return {"action": "fracture", "sitting_id": pick["sitting_id"], "report": rep}
-        return {"action": "fracture", "sitting_id": None, "report": rep}
+        # Read the biggest sub-region now rather than waiting a coalesce window; siblings
+        # become `sub_region` claims.
+        pick = max(written, key=lambda s: s["atoms"])
+        return {"action": "fracture", "sitting_id": pick["sitting_id"], "report": rep}
 
     row = sst.get_sitting(conn, sitting_id)
     part = sb.build_sitting(conn, _stored_seed(conn, row), continues=sitting_id, now=ref,
@@ -331,7 +347,7 @@ def _fracture_or_continue(conn, sitting_id: str, *, ref: datetime) -> dict:
     return {"action": "continue", "sitting_id": part["sitting_id"], "report": trial}
 
 
-def _act(conn, claim: dict, *, ref: datetime) -> tuple[str | None, dict]:
+def _act(conn, claim: dict, *, ref: datetime) -> tuple[str, dict]:
     """Turn a claim into the sitting_id that should be read, plus whatever it did on the way."""
     ch = claim["channel"]
     if ch in ("pointed", "sub_region"):
@@ -356,23 +372,37 @@ def _breaker():
                           cooldown=BREAKER_COOLDOWN_S)
 
 
-def run_sitting_scheduler(conn=None, *, force: bool = False, plan_only: bool = False,
+def run_sitting_scheduler(conn=None, *, plan_only: bool = False,
                           now: datetime | None = None) -> dict:
     """One scheduler pass: rank the claims, take the best one, read it. Never raises.
 
-    `force` bypasses only the breaker. `plan_only` ranks and returns claims without spending —
+    There is no breaker override. The breaker exists to stop a failing loop from burning money,
+    and the only thing an override ever answered to was a hand-typed command line — which is not
+    a caller this product has. `plan_only` ranks and returns claims without spending —
     deliberately not named `dry_run` like the reader's, since that one still makes the paid call.
+
+    ⚠️ IT IS ALSO THE PRODUCER OF `frontier_execute`, AND THAT CHAINING LIVES HERE rather than in
+    `main()`. There is no in-process caller of this one today — which is exactly why it moved:
+    the other two rails in this chain each grew one and silently lost their successor, and a
+    side-effect that only the CLI wrapper performs is one refactor away from the same failure.
+    `tests/kb/test_rail_activation.py` now fails any rail that puts a `request_now` back inside a
+    `main()`.
+
+    `read.new` counts the queries this pass genuinely added — a refreshed query is already
+    standing and already scheduled, so re-queueing on it would make every read restart stage 2.
+    `plan_only` spends nothing and writes nothing, so it queues nothing.
     """
     load_rail_env()
-    # `plan_only` spends nothing, so the routability gate would only block a free report.
-    if not plan_only and (reason := models_unroutable(GENERATOR)) is not None:
-        return {"status": "models_unroutable", "reason": reason}
     ref = now or utc_now()
     own = conn is None
     if own:
         conn = schema.connect()
     try:
-        return _run(conn, force=force, plan_only=plan_only, ref=ref)
+        res = _run(conn, plan_only=plan_only, ref=ref)
+        if not plan_only and (res.get("read") or {}).get("new", 0) > 0:
+            from pipeline.kb.rail_jobs import request_now
+            request_now("frontier_execute")
+        return res
     except Exception as e:                                    # last resort: never propagate
         detail = f"{type(e).__name__}: {e}"
         log(f"[sitting-scheduler] run errored: {detail}")
@@ -388,7 +418,15 @@ def run_sitting_scheduler(conn=None, *, force: bool = False, plan_only: bool = F
             conn.close()
 
 
-def _run(conn, *, force: bool, plan_only: bool, ref: datetime) -> dict:
+def _run(conn, *, plan_only: bool, ref: datetime) -> dict:
+    # `plan_only` spends nothing, so the routability gate would only block a free report.
+    if not plan_only and (reason := models_unroutable(GENERATOR)) is not None:
+        # A ROW, unlike `plan_only` below: `health()` derives `ever_ran` from COUNT(*) here, so a
+        # silent return made a routing outage report "the scheduler has never run".
+        fq.record_run(conn, generator=GENERATOR, status="skipped", reason=reason,
+                      ran_at=utc_iso(ref))
+        return {"status": "models_unroutable", "reason": reason}
+
     queue = claims(conn)
     if plan_only:
         # No row, no breaker touch: recording a plan as a run would make health() report a live
@@ -401,7 +439,7 @@ def _run(conn, *, force: bool, plan_only: bool, ref: datetime) -> dict:
         return {"status": "skipped", "reason": "nothing claimable", "claims": []}
 
     breaker = _breaker()
-    if not force and not breaker.allow():
+    if not breaker.allow():
         reason = (f"breaker OPEN after {BREAKER_THRESHOLD} consecutive failures — "
                   f"retry in ~{breaker.retry_after():.0f}s")
         fq.record_run(conn, generator=GENERATOR, status="skipped", reason=reason, ran_at=utc_iso(ref))
@@ -418,14 +456,6 @@ def _run(conn, *, force: bool, plan_only: bool, ref: datetime) -> dict:
         fq.record_run(conn, generator=GENERATOR, sitting_id=claim.get("sitting_id"),
                       status="failed", reason=detail, ran_at=utc_iso(ref))
         return {"status": "failed", "reason": detail, "claim": claim}
-
-    if target is None:
-        # Reachable from a fracture whose pieces were all sprouts. Not a failure.
-        reason = f"{claim['channel']}: nothing readable came out of it"
-        breaker.record_success()
-        fq.record_run(conn, generator=GENERATOR, sitting_id=claim.get("sitting_id"),
-                      status="skipped", reason=reason, ran_at=utc_iso(ref))
-        return {"status": "skipped", "reason": reason, "claim": claim, **did}
 
     # `read_part` owns the ORDER (notebook debt → queries read → claims receipt, RULED 2026-08-24)
     # and both doors into a read call it, so the two can never drift apart.
@@ -470,7 +500,8 @@ def health(conn) -> dict:
     out["needs_attention"] = bool(waiting and (runs == 0 or open_))
     if waiting and runs == 0:
         out["note"] = (f"{waiting} region(s) are waiting to be read and the sitting scheduler has "
-                       f"never run. Its trigger fires on session open; if that is not happening, "
+                       f"never run. The resident worker launches it; if that is not happening, "
+                       f"check that `opyt-worker` is running (`opyt-install-worker` installs it), "
                        f"run `python -m pipeline.kb.sitting_scheduler --once` to drain one, or "
                        f"read a specific region with sitting(action='read', sitting_id=...).")
     elif waiting and open_:
@@ -480,31 +511,21 @@ def health(conn) -> dict:
     return out
 
 
-# ── The detached spawn ──────────────────────────────────────────────────────────
-def spawn_sitting_scheduler(force: bool = False, coalesce_window: float = COALESCE_DEFAULT) -> bool:
-    """Fire the scheduler as a detached, non-blocking child and return immediately.
-
-    `force=True` (called from inside a tool call) ignores the coalesce window, not the breaker —
-    it's how a just-pointed-at region gets read promptly instead of waiting out a coalesced
-    session-open spawn. The child re-reads its own guards, so a forced spawn onto a tripped
-    breaker still exits without spending.
-    """
-    return spawn_rail("pipeline.kb.sitting_scheduler", slug="sitting_scheduler",
-                      force=force, coalesce=coalesce_window)
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Decide which sitting gets read next, and read it")
     ap.add_argument("--once", action="store_true", help="run one pass against $OPYT_HOME")
     ap.add_argument("--plan", action="store_true", dest="plan_only",
                     help="rank the claims and print them; take no action, spend nothing. (Named "
                          "apart from the reader's --dry-run, which DOES make the paid call.)")
-    ap.add_argument("--force", action="store_true", help="ignore an open breaker")
     args = ap.parse_args(argv)
     if not (args.once or args.plan_only):
         ap.print_help()
         return 2
-    res = run_sitting_scheduler(force=args.force, plan_only=args.plan_only)
+    # NOTHING IS QUEUED HERE, deliberately. A read is the only producer of standing queries and
+    # so the only event that can make Frontier stage 2 due — but that belongs to the RUN, not to
+    # the CLI wrapper around it, or the next caller to reach `run_sitting_scheduler` in-process
+    # loses it silently. See `run_sitting_scheduler`.
+    res = run_sitting_scheduler(plan_only=args.plan_only)
     print(json.dumps(res, indent=2, default=str))
     return 0 if res.get("status") in {"ok", "plan", "skipped"} else 1
 

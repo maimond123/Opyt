@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections import Counter
 
 from opyt_core import kb_remote
+from pipeline.kb import corpus_census as census
 from pipeline.kb import peers, schema
 from pipeline.kb.derive import slugify
 from pipeline.kb.embed import (
@@ -157,13 +158,30 @@ def _query_embedder(conn, *, foreign: bool):
         return None, _vector_arm_notice(e)
 
 
-def _vector_arm_notice(e: Exception) -> dict:
+def _vector_arm_notice(e: Exception | str, *, quote_cause: bool = True) -> dict:
     """The one degrade sentence for "the vector arm cannot run on this foreign read", emitted by
     BOTH transports — `_query_embedder` for a file peer, `kb_remote._query_vector` for a served
     one — so hosts treat the two identically. The CODE is the contract; the wording may change,
-    but only here."""
+    but only here.
+
+    A THIRD CALLER SINCE 2026-09-15: a query the provider refused to embed at all
+    (`retrieve.QueryVectorError`), which is the shape a spent model allowance takes on the most-
+    used tool in the product. Same sentence, because it is the same fact for the reader — one
+    half of the search ran — and the reason string is what differs. `str` is accepted alongside
+    an exception for that caller, which carries the cause out on `SearchRun` rather than as a
+    live exception.
+
+    ⚠️ `quote_cause=False` FOR THAT THIRD CALLER, and the reason is what it interpolates. A
+    `SubspaceError` reads as a sentence ("kb_meta says 768, the blobs say 1024") and belongs in
+    the copy. A refused provider does not: it arrives as
+    `EmbedError: HTTP 403: {"error":{"message":"Key limit exceeded (total limit)"}}`, and a host
+    reading this field out lands a raw JSON blob in front of a person who wanted to search their
+    library. The cause still travels on `reason` for anyone debugging, and the notice riding
+    BESIDE this one says what happened in words a person can act on.
+    """
+    cause = f": {e}" if quote_cause else "."
     return {"code": "vector_arm_unavailable", "reason": str(e),
-            "message": f"Only the keyword half of this search ran: {e} Results are "
+            "message": f"Only the keyword half of this search ran{cause} Results are "
                        f"BM25-ranked, so a question phrased conceptually rather than "
                        f"with the words the source used may find nothing."}
 
@@ -233,9 +251,9 @@ def _build_insights(conn, hits, *, resolved, filter_cost: dict) -> dict:
     return out
 
 
-def _build_notices(conn, run, *, tags, slugs, who, resolved, k: int,
+def _build_notices(conn, run, *, tags, slugs, who, resolved,
                    filter_cost: dict, applied: dict,
-                   kb_name: str = LOCAL_KB, kb_label: str | None = None) -> list[dict]:
+                   kb_name: str, kb_label: str | None) -> list[dict]:
     """Facts about what the QUERY did, as finished SENTENCES meant to be repeated to the user
     verbatim (unlike `insights`/`trace`, which are bare values). Reports filters, resolution and
     truncation; never judges evidence quality — that's `insights`.
@@ -285,23 +303,6 @@ def _build_notices(conn, run, *, tags, slugs, who, resolved, k: int,
                                    "these results may miss what they published recently."})
     except Exception:
         pass          # Fail-safe: a freshness hiccup must never break a search
-
-    # A paused rail otherwise goes quiet with no visible symptom besides stale results; surface
-    # it here, gated on a real pause (not unconditional). Skipped on a foreign read: these are the
-    # READER's rails and the reader's spend ceiling, and reporting them inside somebody else's
-    # results says their corpus is missing material when nothing of the sort is true.
-    try:
-        from pipeline.kb import rail_budgets
-        paused = [] if foreign else rail_budgets.paused_today()
-        if paused:
-            names = ", ".join(p["label"] for p in paused)
-            out.append({"code": "rails_budget_paused", "rails": paused,
-                        "message": f"Background collection is paused for the rest of today: "
-                                   f"{names} reached its daily spend ceiling. Nothing new is "
-                                   f"being brought in from those sources until it resets at UTC "
-                                   f"midnight, so these results may be missing recent material."})
-    except Exception:
-        pass          # Fail-safe: a spend-meter hiccup must never break a search
 
     if who and not resolved:
         out.append({"code": "who_unresolved", "who": who, "kb": kb_name,
@@ -557,10 +558,15 @@ def run_kb_search(query: str, tags: list[str] | None = None, what_kind: str | No
             costs.pop("entry_mode", None)
         insights = _build_insights(conn, hits, resolved=resolved, filter_cost=costs)
         notices = _build_notices(conn, run, tags=tags, slugs=slugs, who=who, resolved=resolved,
-                                 k=k, filter_cost=costs, applied=applied,
+                                 filter_cost=costs, applied=applied,
                                  kb_name=kb_name, kb_label=kb_label)
         if degraded is not None:
             notices.append(degraded)
+        elif run.vector_arm_error is not None:
+            # `elif`: `degraded` means the embedder never resolved, in which case `mode` was
+            # forced to bm25 above and the vector arm was never attempted — so the two are
+            # mutually exclusive and saying it twice would read as two separate faults.
+            notices.append(_vector_arm_notice(run.vector_arm_error, quote_cause=False))
     finally:
         conn.close()
 
@@ -591,7 +597,59 @@ def run_kb_search(query: str, tags: list[str] | None = None, what_kind: str | No
     return out
 
 
-def _hit_card(h, kb_name: str = LOCAL_KB) -> dict:
+# ── `cite`: the link, pre-rendered so using it costs the host nothing ───────────
+# RULED 2026-09-15, on a MEASURED failure rather than a worry. `source_url` has been on every hit
+# since the card existed and is populated for all 1,801 atoms in the live store, and on
+# 2026-09-15 a docstring rule was added telling the host to always show it. Two hosted searches
+# from a phone (Sonnet 5 Medium, 23:21 and 23:29, the second provably against a child spawned
+# from the deployed rule) came back as tidy bullets with no link anywhere.
+#
+# The diagnosis is about COST, not comprehension. The host was writing a terse digest —
+# "Earth Day 2025 — satellite naming tool" — and a raw URL appended to each bullet roughly
+# doubles its width on a phone. The instruction asked for work that visibly spends output space,
+# so brevity won. Telling it harder was not going to change that arithmetic.
+#
+# So the fix makes the link FREE: a ready-made markdown link whose label is the title the host
+# was already going to write. `[Earth Day 2025](https://x.com/...)` renders exactly as wide as
+# `Earth Day 2025`. The ask stops being "add a URL" and becomes "wrap the words you are already
+# writing", which is the cheapest instruction this surface can give.
+#
+# `source_url` STAYS. `cite` is presentation and may be relabelled or dropped by the host; the
+# raw pointer is the one a caller programs against, and collapsing them would make a formatting
+# choice load-bearing for every non-host consumer.
+def _md_link(label: str | None, source_url: str | None) -> str | None:
+    """`[label](url)`, or None when there is no URL to point at.
+
+    Fail-safe by returning None rather than a link to nowhere: a link a host pastes verbatim
+    must never render as a dead `[label]()`, which looks like a citation and is not one.
+
+    Both halves are escaped because both are user-controlled text that lands inside markdown
+    punctuation. A display name containing `]` (X allows it) would otherwise close the label
+    early and leave the rest of the name loose in the output; a URL containing a space or a
+    paren — Wikipedia's `(disambiguation)` being the standard example — would end the target
+    early, producing a link that silently points somewhere shorter than intended. The label is
+    stripped of brackets and the target is wrapped in angle brackets, which is the markdown
+    spelling that survives both.
+    """
+    if not source_url:
+        return None
+    text = (label or "source").replace("[", "").replace("]", "").strip() or "source"
+    target = source_url.strip()
+    if any(c in target for c in " ()<>"):
+        target = f"<{target.replace('<', '').replace('>', '')}>"
+    return f"[{text}]({target})"
+
+
+def _cite(source_url: str | None, who_name: str | None, source_type: str | None,
+          when_ts: str | None) -> str | None:
+    """The labelled, paste-ready form — author and day, so a host pasting it verbatim still
+    attributes the source. See `_md_link` for the escaping this relies on."""
+    label = (who_name or source_type or "source")
+    day = (when_ts or "")[:10]
+    return _md_link(f"{label} · {day}" if day else label, source_url)
+
+
+def _hit_card(h, kb_name: str) -> dict:
     return {
         "citation_id": h.citation_id,
         "atom_id": h.atom_id,
@@ -610,6 +668,9 @@ def _hit_card(h, kb_name: str = LOCAL_KB) -> dict:
         "snippet": h.snippet,
         "chunk_span": list(h.chunk_span) if h.chunk_span else None,
         "source_url": h.source_url,
+        # The same pointer, pre-rendered — see `_cite`. Sits next to `source_url`, never instead
+        # of it: one is for the host's prose, the other for anything that programs against a hit.
+        "cite": _cite(h.source_url, h.who_name, h.source_type, h.when_ts),
         "raw_ref": h.raw_ref,
         "score": round(h.score, 4),
         # On the card, not only in `insights`: `entry_mode` is user-facing POLICY since the
@@ -622,6 +683,28 @@ def _hit_card(h, kb_name: str = LOCAL_KB) -> dict:
         "body_basis": h.body_basis,
         "payload": h.payload,         # source-shaped extras, verbatim (no allowlist)
     }
+
+
+def _deepen_paper(conn, row) -> bool:
+    """Pull the full PDF for an abstract-only paper the reader just opened. True when it grew.
+
+    A thin guard around `ingest_papers.upgrade_to_fulltext`, and the guard is the point: this sits
+    inside `open()`, so it may not raise, may not need a key it hasn't got, and may not cost
+    anything for the 99% of opens that are not an abstract-only paper. The cheap column test runs
+    before the import so a tweet never pays for the paper adapter at all.
+
+    The embedder is a zero-arg closure, so a paper with no reachable open PDF never constructs one
+    (that needs an API key and a network). `assert_model` still guards the subspace — an upgrade
+    writes chunks into the same store the local search arm reads, so it must fail loudly on model
+    drift rather than quietly mixing two vector spaces. That raise is caught here and degrades to
+    the abstract, which is the same outcome as any other failed deepen."""
+    if row["source_type"] != "paper":
+        return False
+    try:
+        from pipeline.kb.ingest_papers import upgrade_to_fulltext
+        return upgrade_to_fulltext(conn, get_kb_embedder, row["atom_id"])
+    except Exception:
+        return False      # an open() must return the body we already hold, whatever else broke
 
 
 def kb_open(atom_id: str, kb: str | None = None, as_kb: str | None = None) -> dict:
@@ -645,12 +728,41 @@ def kb_open(atom_id: str, kb: str | None = None, as_kb: str | None = None) -> di
         # The same sentence `search` gives, including which names DO resolve — a host that
         # guessed one has no other way to find the real ones and would otherwise guess again.
         return {"atom_id": atom_id, "kb": kb, "error": _kb_unavailable_notice(kb, e)["message"]}
+    # LEFT, never INNER, for the reason `retrieve` spells at its own join: an atom whose author
+    # entity row is missing must still come back (unnamed), not vanish from a direct open. The
+    # name is needed only to label `cite` — nothing else on this path reads it.
+    sel = ("SELECT a.atom_id, a.source_type, a.what_kind, a.who_id, a.when_ts, a.when_precision, "
+           "a.source_url, a.raw_ref, a.description, a.payload, e.name AS _who_name "
+           "FROM atoms a LEFT JOIN entities e ON e.entity_id = a.who_id WHERE a.atom_id=?")
     try:
-        row = conn.execute(
-            "SELECT atom_id, source_type, what_kind, who_id, when_ts, when_precision, "
-            "source_url, raw_ref, description, payload FROM atoms WHERE atom_id=?",
-            (atom_id,),
-        ).fetchone()
+        row = conn.execute(sel, (atom_id,)).fetchone()
+        # THE DEEPEN STEP — the one write on this read path, and the reason it is here rather than
+        # in an adapter. A scholar Oracle's back catalogue lands abstract-only on purpose (see
+        # `ingest_scholar_footprint`), so "tell me about this paper in depth" reached a 2,000-char
+        # abstract and stopped: Policy B skips a present paper before the fetch, so no re-ingest
+        # could deepen it either. Opening an atom is the exact moment a reader declares which of
+        # those papers is worth a PDF, so it is the moment we go and get it.
+        #
+        # THE OWNING STORE ONLY — which is not the same as "on this desk". A hosted claude.ai
+        # user reaches their OWN store through their own `opyt-mcp` child (`gateway/children.py`
+        # sets that child's `OPYT_HOME`), so `kb` is None, this is `LOCAL_KB`, and they deepen
+        # exactly like a desktop session. What is excluded is deepening SOMEONE ELSE's KB.
+        #
+        # Excluded for a structural reason before a policy one. The served route
+        # (`service/app.py::open_atom`) arrives with `kb=<owner>` — a path segment, never `"me"` —
+        # and what it opens is an EXPORT, which inlines its bodies as a `kb_raw` table and travels
+        # with no filesystem beside it (`raw_store.read_body`). An upgrade there would call
+        # `write_snapshot`, land a file under the SERVING machine's home, rewrite the row and the
+        # chunks — and then `read_body` would still read the untouched table and hand back the
+        # abstract, having pointed `raw_ref` at a path that means nothing to that export. Paid in
+        # full, wrong at the end. The policy reason rides along behind it: an export is rebuilt on
+        # the next upload, so the write is discarded anyway, and the download spends its owner's
+        # bandwidth on a reader's open loop. A foreign atom returns whatever its owner holds.
+        #
+        # Fail-safe end to end: `_deepen_paper` swallows everything, so the worst case is the
+        # abstract this call would have returned anyway.
+        if row is not None and kb_name == LOCAL_KB and _deepen_paper(conn, row):
+            row = conn.execute(sel, (atom_id,)).fetchone()
         # Inside the connection, not after it: where a body LIVES is a fact about the store, and
         # an export keeps its bodies in a table rather than in files beside it. `read_body` reads
         # the store to find out, so it needs the store still open.
@@ -671,6 +783,9 @@ def kb_open(atom_id: str, kb: str | None = None, as_kb: str | None = None) -> di
         "when_ts": row["when_ts"],
         "when_precision": row["when_precision"],
         "source_url": row["source_url"],          # the LIVE pointer (re-fetch for the freshest)
+        # Same pre-rendered link a hit carries, so the surface where a claim actually gets
+        # asserted spells its citation the same way the surface that routed you there did.
+        "cite": _cite(row["source_url"], row["_who_name"], row["source_type"], row["when_ts"]),
         # A path on THIS machine's filesystem, so it is a lie about a foreign atom: `resolve_ref`
         # rehydrates against the reader's own `opyt_home()`, and a peer's snapshots were never
         # written there. `raw` already carries the body either way.
@@ -686,11 +801,23 @@ def kb_open(atom_id: str, kb: str | None = None, as_kb: str | None = None) -> di
 
 
 def kb_aggregate(scope: dict | None = None, kb: str | None = None,
-                 as_kb: str | None = None) -> dict:
+                 as_kb: str | None = None, sample: int = 0) -> dict:
     """A pure-SQL state-of-play skeleton for a dossier: counts by kind/source, trust coverage,
-    topic/entity distribution, and top atom DESCRIPTIONS. The host drafts from this, then
-    `open()`s pivotal atoms to ground each claim in raw text. `scope` filters like search:
+    author distribution, and top atom DESCRIPTIONS. The host drafts from this, then `open()`s
+    pivotal atoms to ground each claim in raw text. `scope` filters like search:
     {tags, what_kind, source_type, who_id, date_from, date_to} (same date-bound semantics).
+
+    ⚠️ THERE IS NO `top_topics` HERE, AND RE-ADDING ONE NEEDS A REASON THIS DOES NOT HAVE.
+    It counted `payload.source_tags` — the author's own hashtags and GitHub repo labels, a
+    faithful CAPTURE field that was never a taxonomy. It became "your topics" by gap-filling
+    when the real topic layer was retired (`89d3dc0a`, then `834e68ef`), not by design. On the
+    live store (2026-09-16) it answered "what is my corpus about" with five hashtags carried by
+    five atoms out of 1,801 — each with count 1. The failure that mattered was not that it was
+    thin; it was that five hashtags READ AS A FINDING about a corpus, and nothing downstream
+    could check it. A wrong confident answer is worse than no answer, so there is no answer.
+    `source_tags` is still captured and `scope={"tags": …}` still filters on it: recording what
+    a source declared is correct, and so is filtering by it. Presenting that space as the
+    store's subject matter is what was wrong. See docs/plans/2026-09-16-real-topics-handoff.md.
 
     No handle resolution here — resolve via `search(who=...)`'s `insights.resolved_who[].who_ids`
     and pass `who_id=` here, so resolution has one home rather than two that can drift.
@@ -698,7 +825,14 @@ def kb_aggregate(scope: dict | None = None, kb: str | None = None,
     `kb` picks which knowledge base to summarize — omitted (or "me") is your own; any other name
     is a registered peer's. `scope` stays filters-only: which store to read is not a filter.
 
-    `as_kb` renames that store in the returned dict and nowhere else — see `_label_as`."""
+    `as_kb` renames that store in the returned dict and nowhere else — see `_label_as`.
+
+    `sample` > 0 adds `corpus_sample`: a breadth-first spread of that many atom DESCRIPTIONS,
+    walking authors in rounds, for the host to read and name subjects from. That is the only
+    answer to "what is this corpus about" this surface offers, and it is deliberately raw —
+    `pipeline/kb/corpus_census.py` carries the argument for why the naming happens in the
+    host's response and not in a stored label. OFF BY DEFAULT because it is the one expensive
+    key here (~137 chars per row), so every existing caller's payload is byte-identical."""
     scope = scope or {}
     tags = _slug_tags(scope.get("tags"))
     what_kind = scope.get("what_kind")
@@ -739,10 +873,6 @@ def kb_aggregate(scope: dict | None = None, kb: str | None = None,
             f"JOIN entities e ON e.entity_id = a.who_id "
             f"JOIN oracles o ON o.canonical_id = COALESCE(e.canonical_id, e.entity_id) "
             f"WHERE 1=1{frag}", params).fetchone()[0]
-        topics = [{"topic": r[0], "count": r[1]} for r in conn.execute(
-            f"SELECT js.value, COUNT(*) c FROM atoms a, "
-            f"json_each(json_extract(a.payload, '$.source_tags')) js "
-            f"WHERE 1=1{frag} GROUP BY js.value ORDER BY c DESC LIMIT 15", params)]
         entities = [{"who_id": r[0], "count": r[1]} for r in conn.execute(
             f"SELECT a.who_id, COUNT(*) c {base} GROUP BY a.who_id ORDER BY c DESC LIMIT 15",
             params)]
@@ -750,6 +880,11 @@ def kb_aggregate(scope: dict | None = None, kb: str | None = None,
                for r in conn.execute(
                    f"SELECT a.atom_id, a.description, a.who_id, a.when_ts {base} "
                    f"ORDER BY a.when_ts DESC LIMIT 12", params)]
+        # `recent_descriptions` above answers "what is NEW" — 12 atoms by date, which on an
+        # X-heavy store is a handful of posts from this week. It was the only description
+        # channel here, and reading it as a census is how a corpus gets characterised by
+        # whatever its loudest voice published on Tuesday. The census is a separate draw.
+        spread = census.corpus_sample(conn, sample, frag, params)
     finally:
         conn.close()
 
@@ -761,7 +896,7 @@ def kb_aggregate(scope: dict | None = None, kb: str | None = None,
         "by_what_kind": by_kind,
         "by_source_type": by_source,
         "trusted_atoms": trusted,          # atoms whose author is a confirmed Oracle
-        "top_topics": topics,
         "top_entities": entities,
         "recent_descriptions": top,        # mechanical cards; open() to ground any claim
+        **({"corpus_sample": spread} if spread else {}),
     }

@@ -13,6 +13,9 @@ the source didn't structurally state).
 from __future__ import annotations
 
 import re
+from datetime import datetime
+
+from pipeline.ingestion.url_canon import canonical_identity
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 
@@ -37,7 +40,7 @@ def _slugs(items) -> list[str]:
 # ── X bookmarks → opinion-atom metadata ─────────────────────────────────────────
 
 def derive_x(norm: dict) -> dict:
-    """Structural fields off a normalized bookmark (x_graphql._normalize output).
+    """Structural fields off a normalized bookmark (x_graphql_core.normalize output).
 
     `who_id` is the AUTHOR entity (`x:user:{id}`) — a bookmark records who SAID it, not
     who saved it (that's `entry_mode="user-saved"`). Hashtags are AUTHOR-DECLARED, so they
@@ -92,10 +95,22 @@ _URL_HOST = re.compile(r"https?://([^/]+)", re.I)
 def substack_entity_id(handle: str | None = None, publication_url: str | None = None) -> str:
     """The Substack join key: `substack:{author_handle}`, falling back to
     `substack:{subdomain}` from a publication URL when the handle is absent (the
-    subscriber-lists endpoint drops the handle, so subs land on the subdomain id while
-    saved-posts land on the handle id). The residual handle-vs-subdomain split for a pub
-    the user BOTH saved-from AND subscribes-to is resolved in Stage-3 via the publication
-    URL both sides store in `identity_links` — do NOT try to unify it here."""
+    ACCOUNT-LEVEL reads drop the handle, so they land on the subdomain id while saved-posts
+    land on the handle id). Both Substack account reads have that limitation: `subscriber-lists`
+    returns {name, url} only, and `subscriptions/page_v2` carries a numeric `author_id` but no
+    handle — resolving it would cost one request per publication against a rate-limited host.
+    A custom domain has no subdomain either, so it keys on its HOST (20 of 36 subscriptions
+    measured 2026-09-08). The residual handle-vs-subdomain split for a pub the user BOTH
+    saved-from AND subscribes-to is resolved in Stage-3 via the publication URL both sides store
+    in `identity_links` — do NOT try to unify it here.
+
+    One Substack read DOES carry a handle and still passes None: `substack.parse_recommendations`
+    gets a full nested `author` object, handle included, at no extra request. It drops it on
+    purpose. Keying a recommendation on the handle would mint a second id for a publication the
+    subscription list already keyed on its URL, leaving two candidates carrying one signal each
+    below the >=2-signal bar until resolution merged them. Measured 2026-09-08 on the live store:
+    one of six recommended publications was already subscribed, and passing None is what made it
+    corroborate on the spot instead of splitting. Having the handle is not a reason to use it."""
     h = (handle or "").strip().lstrip("@").lower()   # handles are case-insensitive → canonicalize
     if h:
         return f"substack:{h}"
@@ -112,10 +127,9 @@ def _iso_day(iso: str) -> str:
     if not iso:
         return ""
     try:
-        from datetime import datetime
         return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%Y-%m-%d")
     except (ValueError, TypeError):
-        return iso[:10] if len(iso) >= 10 else ""
+        return ""       # a non-ISO value is not a date; never fabricate one from a prefix
 
 
 def derive_substack(rec: dict) -> dict:
@@ -187,7 +201,6 @@ def blog_entity_id(blog_url: str | None) -> str:
     stored home as `self` without false-merging two people. Distinct from the PER-POST atom id
     (`_canon_post_url` in ingest_blog), which keeps the path so posts don't collapse to the host.
     Empty/garbage URL → `blog:unknown` (a stable, never-merging singleton)."""
-    from pipeline.ingestion.url_canon import canonical_identity
     host = canonical_identity(blog_url or "")
     return f"blog:{host}" if host else "blog:unknown"
 
@@ -198,7 +211,6 @@ def org_entity_id(org_url: str | None) -> str:
     as an affiliation fact-node — this `org:` id PREFIX is the marker, there being no type column on
     `entities` (one was deleted 2026-08-23) — NEVER a source of opinion atoms. Unique per host,
     so it never false-merges two orgs. Empty/garbage URL → `org:unknown`."""
-    from pipeline.ingestion.url_canon import canonical_identity
     host = canonical_identity(org_url or "")
     return f"org:{host}" if host else "org:unknown"
 
@@ -211,7 +223,6 @@ def derive_blog(article: dict, *, blog_url: str, handle: str | None = None,
     `who_id` is the blog HOME (`blog:{host}`) — the same for every post of one blog, so the whole
     footprint attributes to one Oracle. `when_ts` is the post's date (day precision).
     `description` is mechanical (name · title · date)."""
-    from pipeline.ingestion.url_canon import canonical_identity
     who_id = blog_entity_id(blog_url)
     name = (author_name or (f"@{handle.lstrip('@')}" if handle else "")
             or canonical_identity(blog_url or "") or "blog")

@@ -33,6 +33,13 @@ def conn(kb_home):
     c.close()
 
 
+@pytest.fixture(autouse=True)
+def managed_x_session(monkeypatch):
+    """The X-adapter seam tests exercise an established X connection."""
+    from pipeline.ingestion import x_graphql
+    monkeypatch.setattr(x_graphql, "has_managed_x_session", lambda: True)
+
+
 # ── the shapes `main`'s adapters actually return ───────────────────────────────
 
 def _blocked():
@@ -251,6 +258,85 @@ def test_x_timeline_success_still_records_ingested(conn, monkeypatch):
     assert x["action"] == "ingested"
 
 
+# ── a thin meter STARTS the walk now (2026-09-14) ─────────────────────────────
+#
+# ⚠️ THIS BLOCK IS THE INVERSE OF WHAT IT SAID FOR ONE DAY. A reservation here refused an X walk
+# whenever the bucket was below a fixed floor, and it was CORRECT given its premise:
+# `_pull_own_timeline` was all-or-nothing, so a walk that ran dry mid-way raised with nothing
+# written and its requests bought nothing. Refusing first reached the same state for free.
+#
+# The premise was the defect. Measured twice on 2026-09-14 against the live store, a foreground
+# ingest over four confirmed Oracles covered two of them and left ~25 requests unspent — and
+# re-running on a refilled meter changed nothing, because `_ordered_picks` is stable and strands
+# the same two forever. Durable partial walks removed the premise, so the reserve went with it,
+# in both of the places it had been written (`oracle_refresh._budget_spent` was the other).
+#
+# What remains is `x_graphql_core._refuse_if_spent` — which refuses a request x.com has already
+# said it will 429. Evidence, not prediction.
+
+def _x_oracle(conn, monkeypatch, calls, summary=None):
+    import importlib
+    dp = importlib.import_module("pipeline.ingestion.discover_profile")
+    monkeypatch.setattr(dp, "discover_profile",
+                        lambda seed, seed_type="x", **kw: {"username": seed, "sources": []})
+    monkeypatch.setattr(ingest_x_footprint, "sync_x_footprint",
+                        lambda conn, embedder, **kw: calls.append(kw)
+                        or (summary if summary is not None else _ok(source="x-footprint")))
+    return _confirmed_oracle(conn)
+
+
+def test_a_thin_meter_starts_the_walk_and_keeps_what_it_gets(conn, monkeypatch):
+    """The whole inversion in one assertion: the walk is ATTEMPTED. Nothing in `_ingest_oracle`
+    predicts the meter any more, so the requests that used to go unspent are spent."""
+    import time
+    from pipeline.ingestion import x_graphql_core as core
+
+    calls = []
+    o = _x_oracle(conn, monkeypatch, calls,
+                  summary={"source": "x-footprint", "added": 7, "fetched": 12,
+                           "partial": True, "covered_from": None})
+    monkeypatch.setattr(core, "rate_budget", lambda op: (1, time.time() + 600))
+
+    out = oracles._ingest_oracle(conn, None, o)
+
+    assert len(calls) == 1                   # the decisive one: the walk was ATTEMPTED
+    x = [r for r in out["results"] if r["type"] == "x"][0]
+    assert x["action"] == "ingested" and x["partial"] is True
+    assert x["covered_from"] is None         # …and claims nothing it cannot defend
+
+
+def test_only_x_com_refusing_still_defers(conn, monkeypatch):
+    """The one route to `deferred` that remains, and the reason the user-facing wording about a
+    window running out stopped being half-wrong: now it really has."""
+    from pipeline.ingestion import x_graphql_core as core
+
+    import importlib
+    dp = importlib.import_module("pipeline.ingestion.discover_profile")
+    monkeypatch.setattr(dp, "discover_profile",
+                        lambda seed, seed_type="x", **kw: {"username": seed, "sources": []})
+
+    def _refused(conn, embedder, **kw):
+        raise core.XRateLimited("nothing observed")
+    monkeypatch.setattr(ingest_x_footprint, "sync_x_footprint", _refused)
+
+    out = oracles._ingest_oracle(conn, None, _confirmed_oracle(conn))
+
+    x = [r for r in out["results"] if r["type"] == "x"][0]
+    assert x["action"] == "deferred" and out["deferred"] == 1
+
+
+def test_the_reserve_exists_in_neither_copy(conn):
+    """One bucket, one answer. `_x_budget_spent` and `oracle_refresh._budget_spent` were the same
+    function written twice, sharing one justification — so removing one and keeping the other
+    would have recreated the split that `test_the_reserve_is_the_refresh_rail_s_own_number` was
+    written to catch. They went together."""
+    from pipeline.kb import oracle_refresh
+
+    assert not hasattr(oracles, "_x_budget_spent")
+    assert not hasattr(oracle_refresh, "_budget_spent")
+    assert not hasattr(oracle_refresh, "BACKFILL_MIN_BUDGET")
+
+
 # ── the UN-MOCKED path: real adapter, only the NETWORK faked ───────────────────
 # Everything above hand-copies the adapter's return shape into `_blocked()`/`_ok()`, so it would
 # keep passing if the adapter changed what it returns — a contract test whose copy of the contract
@@ -333,3 +419,94 @@ def test_x_dispatched_does_not_pollute_the_post_dispatch_total(conn, monkeypatch
     assert out.get("dispatched", 0) == 0    # X's link-dispatch count must not leak into the total
     x = [r for r in out["results"] if r["type"] == "x"][0]
     assert x["stats"]["dispatched"] == 9    # still visible where its context disambiguates it
+
+
+# ── the per-source stamp (2026-09-13) ──────────────────────────────────────────
+#
+# ⚠️ THE BUG THIS PINS. `_record_coverage` and `oracle_reviews.record_outcomes` both fired ONCE,
+# after the last source, while `AtomSink` flushes incrementally. A live `oracle(action='ingest')`
+# killed 62s into Dwarkesh's 187-post archive therefore left atoms in the store with zero record of
+# what had been attempted and an empty `oracle_sources` — a store that cannot say what it is
+# missing, which is the one thing a resumable backfill has to be able to say.
+
+def _stamped(conn):
+    return {f"{r['source_type']}:{r['source_key']}"
+            for r in conn.execute("SELECT source_type, source_key FROM oracle_sources "
+                                  "WHERE last_pulled_at IS NOT NULL")}
+
+
+def _two_source_oracle(conn, monkeypatch):
+    """An Oracle whose cluster owns BOTH a Substack and a blog, so the router routes two sources in
+    a known order. The identity links are what `resolve` merges the discovered members on."""
+    import importlib
+    dp = importlib.import_module("pipeline.ingestion.discover_profile")
+    schema.upsert_entity(conn, "x:user:1", name="Carol", profile={"handle": "carol"},
+                         identity_links=[_SUB, _BLOG])
+    resolve.resolve_entities(conn)
+    oracles.confirm(conn, canonical_ids=["x:user:1"])
+    monkeypatch.setattr(dp, "discover_profile",
+                        lambda seed, seed_type="x", **kw: {
+                            "username": seed,
+                            "sources": [_src("substack", _SUB), _src("blog", _BLOG)]})
+    monkeypatch.setattr(expand, "_x_handle_to_pull", lambda root, profile: None)
+    _pass_gate(monkeypatch)
+    return [o for o in oracles.confirmed_oracles(conn) if o["canonical_id"] == "x:user:1"][0]
+
+
+def test_a_finished_source_is_stamped_before_the_next_one_starts(conn, monkeypatch):
+    """The kill test. The blog adapter dies the way a killed process does — a BaseException that no
+    `except Exception` in the router or the engine catches — and the Substack that already finished
+    must ALREADY be recorded. Under the end-of-run stamp, nothing was."""
+    def _ran(conn, embedder, **kw):
+        # What the real adapter does BEFORE its archive walk: mint the publication entity with its
+        # identity link, which is the pair `_record_coverage` joins the outcome back onto.
+        from pipeline.kb import derive
+        schema.upsert_entity(conn, derive.substack_entity_id(publication_url=_SUB),
+                             name="Carol", identity_links=[_SUB])
+        return _ok(source="substack-footprint")
+
+    monkeypatch.setattr(ingest_substack, "sync_substack_footprint", _ran)
+
+    def _killed(conn, embedder, **kw):
+        raise KeyboardInterrupt("process killed mid-archive")
+
+    monkeypatch.setattr(ingest_blog, "sync_blog_footprint", _killed)
+
+    o = _two_source_oracle(conn, monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        oracles._ingest_oracle(conn, None, o)
+
+    stamped = _stamped(conn)
+    assert any(k.startswith("substack:") for k in stamped), stamped
+    assert not any(k.startswith("blog:") for k in stamped), stamped
+
+
+def test_a_needs_review_source_is_queued_before_the_next_one_starts(conn, monkeypatch):
+    """`record_outcomes` fired end-of-run too, so a kill also lost the review queue — the record of
+    a source discovery FOUND and deliberately did not ingest."""
+    from pipeline.kb import oracle_reviews
+
+    def _killed(conn, embedder, **kw):
+        raise KeyboardInterrupt("process killed mid-archive")
+
+    monkeypatch.setattr(ingest_blog, "sync_blog_footprint", _killed)
+
+    import importlib
+    dp = importlib.import_module("pipeline.ingestion.discover_profile")
+    schema.upsert_entity(conn, "x:user:1", name="Carol", profile={"handle": "carol"},
+                         identity_links=[_BLOG])
+    resolve.resolve_entities(conn)
+    oracles.confirm(conn, canonical_ids=["x:user:1"])
+    monkeypatch.setattr(dp, "discover_profile",
+                        lambda seed, seed_type="x", **kw: {
+                            "username": seed,
+                            "sources": [_src("substack", _SUB, trusted=False),
+                                        _src("blog", _BLOG)]})
+    monkeypatch.setattr(expand, "_x_handle_to_pull", lambda root, profile: None)
+    _pass_gate(monkeypatch)
+
+    o = [x for x in oracles.confirmed_oracles(conn) if x["canonical_id"] == "x:user:1"][0]
+    with pytest.raises(KeyboardInterrupt):
+        oracles._ingest_oracle(conn, None, o)
+
+    assert [r["source_url"] for r in oracle_reviews.list_open(conn)] == [_SUB]

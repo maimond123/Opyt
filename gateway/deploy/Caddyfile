@@ -1,0 +1,13 @@
+mcp.useopyt.com {
+	handle /icon.png {
+		# website/, not mcpb/: the Claude Desktop bundle was deleted 2026-09-14 and the mark
+		# moved with the rest of the repo's rasters. Record:
+		# docs/plans/2026-09-14-the-install-must-carry-fixes.md
+		root * /srv/opyt-src/website
+		file_server
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+	}
+}

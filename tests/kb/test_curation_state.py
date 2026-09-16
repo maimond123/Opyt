@@ -31,7 +31,7 @@ def _iso(dt: datetime) -> str:
 # ── schema ──────────────────────────────────────────────────────────────────────
 def test_ddl_layers_onto_a_plain_schema_connect(conn):
     """A caller hands us whatever connection it already has. `schema.connect` has never seen this
-    table, so every public entrypoint runs the DDL itself rather than trusting `connect()`."""
+    table, so every public state entrypoint runs the DDL itself."""
     assert cs.list_runs(conn) == []
     cs.record_run(conn, "x_lists", status="ok")
     assert [r.collector for r in cs.list_runs(conn)] == ["x_lists"]
@@ -43,16 +43,6 @@ def test_ddl_is_idempotent(conn):
     cs.record_run(conn, "x_lists", status="ok")
     cs.init_state_schema(conn)
     assert cs.get_run(conn, "x_lists").last_status == "ok"
-
-
-def test_connect_layers_the_table_on_the_shared_store(kb_home):
-    c = cs.connect()
-    try:
-        assert c.execute("SELECT COUNT(*) FROM collector_runs").fetchone()[0] == 0
-        # ...and it is the SAME db as the atom store, not a second file.
-        assert c.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
-    finally:
-        c.close()
 
 
 # ── roundtrip ───────────────────────────────────────────────────────────────────
@@ -77,16 +67,28 @@ def test_a_second_run_overwrites_in_place(conn):
     assert row.found == 101 and row.last_ok_at == _iso(T0 + timedelta(hours=6))
 
 
+def test_a_collapsed_walk_cannot_replace_its_last_accepted_baseline(conn):
+    """A repeated truncation stays untrustworthy instead of teaching the next walk its low count."""
+    for hours, found in ((0, 100), (6, 100), (12, 10), (18, 10)):
+        walked = T0 + timedelta(hours=hours)
+        cs.record_run(conn, "x_following", status="ok", found=found, stored_after=100,
+                      now=_iso(walked), started_at=_iso(walked))
+
+    row = cs.get_run(conn, "x_following")
+    assert (row.found, row.prev_found) == (10, 100)
+    assert cs.walk_is_trustworthy(row) is False
+
+
 # ── never-run ───────────────────────────────────────────────────────────────────
 def test_a_never_run_collector_is_due_and_infinitely_stale(conn):
     """The invisible-freeze case. A collector with no row must sort FIRST, not be skipped for
     lacking a timestamp to compare against."""
-    row = cs.get_run(conn, "substack_subs")
+    row = cs.get_run(conn, "substack_follows")
     assert row is None
     assert cs.hours_since_attempt(row) == float("inf")
     assert cs.hours_since_ok(row) == float("inf")
     assert cs.is_due(row, floor_hours=6.0) is True
-    assert cs.is_stale(row) is True
+    assert cs.status_summary(conn, ("substack_follows",))["collectors"][0]["stale"] is True
 
 
 # ── THE split: attempt vs ok ────────────────────────────────────────────────────
@@ -104,11 +106,11 @@ def test_an_error_advances_the_attempt_and_leaves_last_ok_alone(conn):
     assert row.ok is False
 
 
-def test_skipped_tier_is_an_attempt_that_saw_nothing_too(conn):
-    """A tier skip is not a failure, but for STALENESS it is identical to one: the collector never
-    ran, so the list is exactly as old as it was. Only the floor cares about the difference."""
+def test_a_non_ok_status_is_an_attempt_that_saw_nothing(conn):
+    """A collector that attempted and observed nothing must not advance `last_ok_at`: the list is
+    exactly as old as it was. Only the retry FLOOR cares which non-ok status it is."""
     now = T0 + timedelta(hours=10)
-    for status in ("error", "skipped_tier", "no_viewer_id"):
+    for status in ("error", "no_viewer_id"):
         cs.record_run(conn, status, status="ok", now=_iso(T0))       # one row per status, seeded ok
         cs.record_run(conn, status, status=status, now=_iso(now))
         row = cs.get_run(conn, status)
@@ -124,7 +126,7 @@ def test_a_first_ever_run_that_fails_leaves_last_ok_null(conn):
     row = cs.get_run(conn, "x_likes")
     assert row.last_ok_at is None
     assert cs.hours_since_ok(row, T0) == float("inf")
-    assert cs.is_stale(row) is True
+    assert cs.status_summary(conn, ("x_likes",))["collectors"][0]["stale"] is True
     assert cs.is_due(row, floor_hours=6.0, now=T0 + timedelta(hours=1)) is False  # ...throttled
 
 
@@ -165,7 +167,7 @@ def test_the_floor_counts_attempts_not_successes(conn):
     collector that raises every time still costs a request each time it is asked."""
     cs.record_run(conn, "x_likes", status="error", now=_iso(T0))
     row = cs.get_run(conn, "x_likes")
-    assert cs.is_stale(row) is True                                        # never seen
+    assert cs.status_summary(conn, ("x_likes",))["collectors"][0]["stale"] is True
     assert cs.is_due(row, floor_hours=6.0, now=T0 + timedelta(hours=1)) is False   # still throttled
 
 
@@ -179,7 +181,8 @@ def test_an_unparseable_stamp_reads_as_never(conn):
 
 
 # ── status_summary ──────────────────────────────────────────────────────────────
-_ALL = ("x_lists", "x_following", "x_likes", "substack_subs")
+_ALL = ("x_lists", "x_following", "x_likes", "substack_follows",
+        "substack_subscriptions")
 
 
 def test_status_summary_reports_a_collector_that_has_no_row(conn):
@@ -190,13 +193,13 @@ def test_status_summary_reports_a_collector_that_has_no_row(conn):
 
     out = cs.status_summary(conn, _ALL, now=T0)
 
-    assert out["tracked"] == 4
+    assert out["tracked"] == len(_ALL)
     assert [e["collector"] for e in out["collectors"]] == list(_ALL)
     never = [e for e in out["collectors"] if e["collector"] == "x_likes"][0]
     assert never["never_ran"] is True and never["stale"] is True
     fresh = [e for e in out["collectors"] if e["collector"] == "x_lists"][0]
     assert fresh["stale"] is False and fresh["hours_since_ok"] == 0.0
-    assert out["stale_collectors"] == 3 and out["never_succeeded"] == 3
+    assert out["stale_collectors"] == len(_ALL) - 1 and out["never_succeeded"] == len(_ALL) - 1
 
 
 def test_status_summary_is_quiet_when_everything_is_fresh(conn):
@@ -230,5 +233,5 @@ def test_status_summary_goes_stale_after_the_window(conn):
     for name in _ALL:
         cs.record_run(conn, name, status="ok", now=_iso(T0))
     out = cs.status_summary(conn, _ALL, now=T0 + timedelta(hours=cs.STALE_AFTER_HOURS))
-    assert out["stale_collectors"] == 4 and out["needs_attention"] is True
+    assert out["stale_collectors"] == len(_ALL) and out["needs_attention"] is True
     assert out["oldest_ok_at"] == out["newest_ok_at"] == _iso(T0)

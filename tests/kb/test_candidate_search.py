@@ -38,8 +38,9 @@ def _seed(conn, embedder, *, trusted=(), probe=()):
 class _Cand:
     """A ranked candidate, as `screen.rank_candidates` hands them over."""
 
-    def __init__(self, uid: str, sig: int = 3):
-        self.canonical_id, self.members = f"p:{uid}", [f"x:user:{uid}"]
+    def __init__(self, uid: str, sig: int = 3, *, canonical_id=None, members=None):
+        self.canonical_id = canonical_id or f"p:{uid}"
+        self.members = members or [f"x:user:{uid}"]
         self.name = self.handle = f"c{uid}"
         self.distinct_signals = sig
         self.retired = False
@@ -91,6 +92,43 @@ def test_a_saved_only_candidate_is_reachable_at_all(kb_home, fake_embedder, popu
     out = candidate_search.candidates_payload(conn, "crypto rollup", fake_embedder)
     assert [r["who_id"] for r in out["candidates"]] == ["x:user:0"]
     assert out["searchable_by_saved_post"] == 1
+    conn.close()
+
+
+def test_saved_writing_groups_resolved_identities_even_without_x(kb_home, fake_embedder,
+                                                                 monkeypatch):
+    """Saved evidence belongs to the resolved person, not only to their X identity."""
+    from pipeline.kb import screen
+
+    conn = schema.connect()
+    saved = AtomSink(conn, fake_embedder)
+    saved.submit({"atom_id": "x:alice", "source_type": "x", "who_id": "x:user:1",
+                  "description": "d", "raw_hash": "alice-x"}, "a shared research thread")
+    saved.submit({"atom_id": "substack:alice", "source_type": "substack",
+                  "who_id": "substack:alice", "description": "d", "raw_hash": "alice-sub"},
+                 "a shared research essay")
+    saved.submit({"atom_id": "substack:bob", "source_type": "substack",
+                  "who_id": "substack:bob", "description": "d", "raw_hash": "bob-sub"},
+                 "a shared research essay")
+    saved.close()
+    candidates = [
+        _Cand("alice", canonical_id="x:user:1",
+              members=["x:user:1", "substack:alice"]),
+        _Cand("bob", canonical_id="substack:bob", members=["substack:bob"]),
+    ]
+    monkeypatch.setattr(screen, "rank_candidates", lambda c, **kw: candidates)
+    monkeypatch.setattr(schema, "is_oracle", lambda c, cid: False)
+
+    out = candidate_search.candidates_payload(conn, "shared research", fake_embedder)
+    by_who = {row["who_id"]: row for row in out["candidates"]}
+    assert set(by_who) == {"x:user:1", "substack:bob"}
+    assert by_who["x:user:1"]["basis"] == "saved"
+    assert by_who["x:user:1"]["atoms"] == 2
+    assert {e["atom_id"] for e in by_who["x:user:1"]["evidence"]} == {
+        "x:alice", "substack:alice"}
+    assert all("trusted" in e["provenance"].lower()
+               for e in by_who["x:user:1"]["evidence"])
+    assert out["searchable_by_saved_post"] == 2 and out["no_local_material"] == 0
     conn.close()
 
 

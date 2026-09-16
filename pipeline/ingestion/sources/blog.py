@@ -123,18 +123,7 @@ def _fetch_sitemap_urls(blog_url: str) -> list[dict]:
         except Exception as e:
             continue
 
-    # Fallback 1: trafilatura sitemap/link discovery
-    if not urls:
-        log(f"  No sitemap found, trying trafilatura discovery...")
-        try:
-            discovered = trafilatura.sitemaps.sitemap_search(blog_url)
-            if discovered:
-                urls = [{"url": u, "lastmod": ""} for u in discovered]
-                log(f"  Trafilatura found {len(urls)} URLs")
-        except Exception:
-            pass
-
-    # Fallback 2: RSS/Atom feed discovery
+    # Fallback: RSS/Atom feed discovery
     if not urls:
         import feedparser
         base = blog_url.rstrip("/")
@@ -156,7 +145,7 @@ def _fetch_sitemap_urls(blog_url: str) -> list[dict]:
             except Exception:
                 continue
 
-    # Fallback 3: HTML link crawling (scrape homepage for internal links)
+    # Fallback 2: HTML link crawling (scrape homepage for internal links)
     if not urls:
         log(f"  No sitemap or RSS, trying HTML link crawling...")
         try:

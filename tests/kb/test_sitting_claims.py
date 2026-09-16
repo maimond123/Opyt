@@ -91,7 +91,7 @@ def _body(claims) -> str:
 class _Resp:
     def __init__(self, text):
         self.text, self.model = text, "fake-model"
-        self.input_tokens, self.output_tokens, self.cost_usd = 100, 20, 0.01
+        self.input_tokens, self.output_tokens = 100, 20
         self.raw = {}
 
 
@@ -115,7 +115,7 @@ def test_a_successful_read_writes_claims_and_stamps_the_lens(conn, sitting, read
     _answer(monkeypatch, _body([_c("x402 processed $1.6M/month"), _c("ERC-8004 hit 97,713 agents")]))
     res = scl.read_claims(conn, sitting, now=_NOW)
     assert res["status"] == "ok" and len(res["claims"]) == 2
-    assert sst.lens_read_state(conn, sitting, "claims")["read_status"] == "ok"
+    assert sst.lens_read_state(conn, sitting, "claims") is not None   # presence IS the stamp
     assert len(sst.get_claims(conn, sitting)) == 2
 
 
@@ -185,14 +185,14 @@ def test_a_failed_call_leaves_the_lens_unread_and_writes_no_claims(conn, sitting
     assert row["status"] == "failed" and row["lens"] == "claims" and row["sitting_id"] == sitting
 
 
-def test_out_of_credits_is_named_rather_than_reported_as_a_broken_call(conn, sitting, ready,
-                                                                       monkeypatch):
+def test_a_provider_rejection_is_named_rather_than_reported_as_a_broken_call(conn, sitting, ready,
+                                                                               monkeypatch):
     class _402(RuntimeError):
         status = 402
     monkeypatch.setattr(llm_client, "call",
                         lambda role, **kw: (_ for _ in ()).throw(_402("no credit")))
     res = scl.read_claims(conn, sitting, now=_NOW)
-    assert "OUT OF CREDITS" in res["reason"]
+    assert "provider rejected the prompt" in res["reason"]
     assert sst.lens_read_state(conn, sitting, "claims") is None
 
 
@@ -361,3 +361,84 @@ def test_an_unread_ancestor_owes_nothing(conn, sitting, ready, monkeypatch):
     monkeypatch.setattr(llm_client, "call",
                         lambda *a, **kw: pytest.fail("paid to distil an unread ancestor"))
     assert scl.collect_notebook_debt(conn, p2, now=_NOW) == []
+
+
+def test_a_paid_claims_failure_is_attempted_once_not_on_every_later_part(conn, sitting, ready,
+                                                                        monkeypatch):
+    """THE SPEND BOUND. `_read`'s once-only guard fires on SUCCESS — it keys on the `sitting_reads`
+    row, and a failed claims read deliberately writes none. Without a matching stop for a failure
+    that BILLED, every later part re-attempts every failed ancestor: measured at 9 billed failures
+    over a 4-part chain before this, O(N^2) in chain length.
+    """
+    calls: list[str] = []
+
+    def _deterministic_failure(role, *, system, user, **kw):
+        calls.append(role)
+        return _Resp(_body([]))          # well-formed and empty: parses, records a model, yields nothing
+    monkeypatch.setattr(llm_client, "call", _deterministic_failure)
+
+    sst.mark_read(conn, sitting)                       # the queries read closed part 1
+    p2 = _part(conn, continues=sitting, tag="two")
+
+    assert [d["status"] for d in scl.collect_notebook_debt(conn, p2, now=_NOW)] == ["failed"]
+    assert len(calls) == 1, "part 1's debt was never attempted"
+
+    assert scl.collect_notebook_debt(conn, p2, now=_NOW) == []
+    assert len(calls) == 1, "a PAID claims failure was billed again by a later part read"
+
+
+def test_naming_the_sitting_retries_a_paid_failure_the_chain_walk_will_not(conn, sitting, ready,
+                                                                            monkeypatch):
+    """THE DOOR OUT of the stop above, and the property two docstrings got wrong until 2026-09-08.
+    Both said the recovery path was `--force`; it never was. `_read`'s once-only guard keys on a
+    `sitting_reads` row that only a SUCCESSFUL read writes, so after a failure there is nothing
+    for a bypass to bypass — asking for the sitting by name is already the retry, and `force` was
+    deleted for having no caller and no effect here.
+
+    This matters because the stop is right and permanent: a deterministic failure repeats, so no
+    walk of the chain should re-attempt it. What makes it worth retrying is a changed prompt or a
+    changed model, which is a judgement only a person makes.
+    """
+    calls: list[str] = []
+
+    def _deterministic_failure(role, *, system, user, **kw):
+        calls.append(role)
+        return _Resp(_body([]))
+    monkeypatch.setattr(llm_client, "call", _deterministic_failure)
+
+    sst.mark_read(conn, sitting)
+    p2 = _part(conn, continues=sitting, tag="two")
+    assert [d["status"] for d in scl.collect_notebook_debt(conn, p2, now=_NOW)] == ["failed"]
+    assert scl.collect_notebook_debt(conn, p2, now=_NOW) == [], "the chain walk must stay stopped"
+
+    def _ok(role, *, system, user, **kw):
+        calls.append(role)
+        return _Resp(_body([_c("x402 processed $1.6M/month")]))
+    monkeypatch.setattr(llm_client, "call", _ok)
+
+    assert scl.read_claims(conn, sitting, now=_NOW)["status"] == "ok"
+    assert len(calls) == 2, "naming the sitting did not reach the model"
+    assert sst.lens_read_state(conn, sitting, scl.LENS) is not None
+
+
+def test_an_unpaid_claims_failure_stays_collectable(conn, sitting, ready, monkeypatch):
+    """THE OTHER HALF, and the reason the stop is not just `status = 'failed'`. The degrade-open
+    path (no key, no credits) never reaches the model, so its failed run records no `model` — it is
+    TRANSIENT, and retrying it is free. Skipping it would strand the notebook permanently for
+    anyone who configures a key after their first sitting.
+    """
+    monkeypatch.setattr(scl.core, "preflight", lambda backend: "no API key configured")
+    sst.mark_read(conn, sitting)
+    p2 = _part(conn, continues=sitting, tag="two")
+    assert [d["status"] for d in scl.collect_notebook_debt(conn, p2, now=_NOW)] == ["failed"]
+
+    calls: list[str] = []
+
+    def _ok(role, *, system, user, **kw):
+        calls.append(role)
+        return _Resp(_body([_c("x402 processed $1.6M/month")]))
+    monkeypatch.setattr(scl.core, "preflight", lambda backend: None)
+    monkeypatch.setattr(llm_client, "call", _ok)
+
+    assert [d["status"] for d in scl.collect_notebook_debt(conn, p2, now=_NOW)] == ["ok"]
+    assert len(calls) == 1, "an unspent failure was treated as a permanent stop"

@@ -20,10 +20,10 @@ from pipeline.ingestion.url_canon import canonical_identity as ci
     ("https://twitter.com/karpathy", "x.com/karpathy"),
     ("https://x.com/karpathy/status/123", "x.com/karpathy"),
     ("https://mobile.twitter.com/karpathy", "x.com/karpathy"),
-    # YouTube channel forms.
-    ("https://www.youtube.com/@AndrejKarpathy", "youtube.com/@andrejkarpathy"),
-    ("https://youtube.com/channel/UCABC123", "youtube.com/channel/ucabc123"),
-    ("https://www.youtube.com/watch?v=xyz", "youtube.com"),   # a video, not a channel
+    # YouTube URLs have no identity in OPYT.
+    ("https://www.youtube.com/@AndrejKarpathy", ""),
+    ("https://youtube.com/channel/UCABC123", ""),
+    ("https://www.youtube.com/watch?v=xyz", ""),
     # Medium.
     ("https://medium.com/@someone/post-title", "medium.com/@someone"),
     ("https://someone.medium.com/post", "someone.medium.com"),

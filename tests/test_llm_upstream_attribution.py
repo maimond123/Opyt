@@ -1,6 +1,6 @@
 """Which UPSTREAM served each call gets RECORDED — the audit trail for `provider.sort`.
 
-Why this needs pinning at all: `sort: "throughput"` re-ranks against OpenRouter's live
+Why this needs pinning at all: `sort` (latency-ranked) re-ranks against OpenRouter's live
 measurements, so the upstream it picks legitimately differs run to run (Groq on 2026-07-31,
 SambaNova on 2026-08-01). That makes "routing quietly started choosing something slow, or
 something that grades badly" a change with NO other symptom — the same shape as the Cloudflare
@@ -10,8 +10,6 @@ failure that billed 70 tokens per call and returned zero parseable verdicts.
 call does not record it, the information is gone the moment the response is discarded.
 """
 from __future__ import annotations
-
-import json
 
 import pytest
 
@@ -32,12 +30,10 @@ class _PassthroughBreaker:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_stats(tmp_path, monkeypatch):
-    """Stats + latency are process-global accumulators; give each test its own."""
-    llm_client._override_stats_file_for_tests(tmp_path / "api_stats.json")
+def _isolated_latency():
+    """Latency samples are process-global; give each test a clean measurement window."""
     llm_client.reset_latency()
     yield
-    llm_client._override_stats_file_for_tests(None)
     llm_client.reset_latency()
 
 
@@ -55,12 +51,10 @@ def _fake_openrouter(monkeypatch, *, served_by: str | None, elapsed: float = 0.5
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
 
-def test_serving_upstream_lands_in_stats_and_latency(monkeypatch):
+def test_serving_upstream_lands_in_latency(monkeypatch):
     _fake_openrouter(monkeypatch, served_by="Groq", elapsed=0.8)
     llm_client.call("vision", system="", user="hi")
 
-    assert llm_client._STATS["by_upstream"]["Groq"]["calls"] == 1
-    assert llm_client._STATS["by_upstream"]["Groq"]["input_tokens"] == 10
     assert llm_client.upstream_distribution()["Groq"]["count"] == 1
     assert llm_client.upstream_distribution()["Groq"]["p50"] == 0.8
 
@@ -88,7 +82,6 @@ def test_unattributable_call_is_bucketed_not_dropped(monkeypatch):
     _fake_openrouter(monkeypatch, served_by=None)
     llm_client.call("vision", system="", user="hi")
 
-    assert llm_client._STATS["by_upstream"]["unknown"]["calls"] == 1
     assert "unknown" in llm_client.upstream_distribution()
 
 
@@ -102,7 +95,7 @@ def test_non_openrouter_provider_is_attributed_to_itself(monkeypatch):
         "anthropic", lambda model, system, user, max_tokens, **kw: ("ok", 5, 1, 0.3, {}))
     llm_client.call("summarize", system="", user="hi")
 
-    assert llm_client._STATS["by_upstream"]["anthropic"]["calls"] == 1
+    assert llm_client.upstream_distribution()["anthropic"]["count"] == 1
 
 
 def test_reset_latency_clears_upstreams_too(monkeypatch):
@@ -114,13 +107,6 @@ def test_reset_latency_clears_upstreams_too(monkeypatch):
 
     llm_client.reset_latency()
     assert llm_client.upstream_distribution() == {}
-
-
-def test_stats_shape_has_one_definition():
-    """`_override_stats_file_for_tests` used to hand-copy the `_STATS` literal, so adding a
-    bucket to production KeyError'd whichever tests reset it. Both must come from one factory."""
-    llm_client._override_stats_file_for_tests(None)
-    assert set(llm_client._STATS) == set(llm_client._fresh_stats())
 
 
 def test_run_summary_helper_reports_both_views(monkeypatch):

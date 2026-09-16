@@ -32,7 +32,7 @@ Every bookmark, follow and subscription was you deciding whose thinking is worth
 - **It grows on the days you never open it.** Reading a topic end to end emits standing questions. Those questions keep running against arXiv, GitHub and OpenAlex, and stage what they find for you to review when you feel like it.
 - **Full archives, not the three posts you bookmarked.** Confirm one person and Opyt finds their other platforms, verifies them, and pulls years of posts, repos and essays in full text.
 - **Free of new subscriptions.** Reading and reasoning run on the AI client you already have. One metered key covers classification and embeddings, on cheap open models.
-- **One local SQLite file.** Everything lives in `~/.opyt/opyt.db`. No vault of markdown, no dashboard, no daemon, no account.
+- **One local SQLite file.** Your whole knowledge base lives in `~/.opyt/opyt.db`. No vault of markdown, no dashboard, no account. One background process, `opyt-worker`, runs the ingest jobs on a schedule; it opens no port and keeps only its own small job queue beside the store.
 - **Any MCP client.** Claude Code, Claude Desktop, Cursor, Windsurf, Codex, or anything else that speaks MCP over stdio.
 - **MIT licensed.** [Read the source](https://github.com/maimond123/Opyt).
 
@@ -49,21 +49,21 @@ Every bookmark, follow and subscription was you deciding whose thinking is worth
 # once per machine, if you do not already have uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-claude mcp add Opyt -- uvx --from opyt==0.1.0a4 opyt-mcp
+claude mcp add Opyt -- uvx --from opyt@latest opyt-mcp
 ```
 </details>
 
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Without a terminal: download [`opyt-0.1.0a4.mcpb`](https://github.com/maimond123/Opyt/releases), double-click it, and review the install screen Desktop shows you. The bundle carries its own Python and every package it needs, so it wants no `uv`, makes no network call at launch, and starts in about eleven seconds. That is why it is a 198 MB download.
+Without typing anything: download [`opyt-install.command.zip`](https://useopyt.com/opyt-install.command.zip) and open it — it unzips to `opyt-install.command`. **Right-click that and choose Open**, not a double-click: macOS blocks a downloaded file until you approve it once that way. Terminal opens, asks which app to install into, and runs the two commands below for you. (It ships zipped because a browser download drops the execute bit, and macOS will not run a `.command` without it.)
 
-Or from a terminal:
+Or run them yourself:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # absolute path: uv edited your shell profile, not this shell
-~/.local/bin/uvx --from opyt==0.1.0a4 opyt-install-client --claude-desktop
+~/.local/bin/uvx --from opyt@latest opyt-install-client --claude-desktop
 ```
 </details>
 
@@ -72,7 +72,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-~/.local/bin/uvx --from opyt==0.1.0a4 opyt-install-client --cursor
+~/.local/bin/uvx --from opyt@latest opyt-install-client --cursor
 ```
 
 This merges Opyt into `~/.cursor/mcp.json` beside whatever servers are already there, and copies the old file aside first. Running it twice changes nothing, and `--uninstall` removes the entry and leaves the rest.
@@ -83,7 +83,7 @@ This merges Opyt into `~/.cursor/mcp.json` beside whatever servers are already t
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-~/.local/bin/uvx --from opyt==0.1.0a4 opyt-install-client --windsurf
+~/.local/bin/uvx --from opyt@latest opyt-install-client --windsurf
 ```
 
 Merges into `~/.codeium/windsurf/mcp_config.json`, backing up the old file first.
@@ -99,7 +99,7 @@ Install `uv`, run `which uvx` to get its absolute path, and add this to whatever
   "mcpServers": {
     "Opyt": {
       "command": "/Users/you/.local/bin/uvx",
-      "args": ["--from", "opyt==0.1.0a4", "opyt-mcp"]
+      "args": ["--from", "opyt@latest", "opyt-mcp"]
     }
   }
 }
@@ -116,13 +116,15 @@ Paste this into the client you want Opyt in:
 > Install the Opyt MCP server for this client, from useopyt.com/docs.html.
 </details>
 
-> `0.1.0a4` is a pre-release, so the version is pinned explicitly. Drop the pin once a stable release exists.
+> `opyt@latest` and not a version, so a published fix reaches you on your next client restart with nothing to re-run. It is also not a bare `opyt`: `uvx` reuses its cached environment for a bare requirement and would never look for a newer build. Offline, `@latest` falls back to the copy you already have rather than failing to start.
 >
-> Opyt does not run at claude.ai. Your client starts Opyt as a process on your own machine and pipes to it, and a browser tab cannot start a process on your machine. Claude Desktop is the same account and the same models, and takes one double-click.
+> **On macOS, also run `~/.local/bin/uvx --from opyt@latest opyt-install-worker` once.** That installs `opyt-worker` as a LaunchAgent, which is the only thing that runs the background rails. Skip it and every tool still works, but nothing refreshes on its own. It opens no port and starts at login.
+>
+> On claude.ai or ChatGPT there is nothing to install at all: add `https://mcp.useopyt.com/mcp` as a custom connector and Opyt runs hosted. The [website](https://useopyt.com) walks through both. The hosted home is its own store, separate from a local install.
 
 ### 2. Say `onboard`
 
-Restart your client. Opyt appears as twelve tools. Then:
+Restart your client. Opyt appears as thirteen tools. Then:
 
 ```
 you › onboard
@@ -160,7 +162,7 @@ Confirm the ones you want and Opyt pulls each person's whole archive: their X po
 
 ## The tools
 
-Twelve tools. Every argument, its type and default, what each call returns and what it costs are in the [full reference](https://useopyt.com/docs.html). The docstring on each tool in `mcp_server/` is the authoritative version of the same thing.
+Thirteen tools. Every argument, its type and default, what each call returns and what it costs are in the [full reference](https://useopyt.com/docs.html). The docstring on each tool in `mcp_server/` is the authoritative version of the same thing.
 
 | Tool | Effect | What it does |
 |---|---|---|
@@ -176,8 +178,9 @@ Twelve tools. Every argument, its type and default, what each call returns and w
 | [`share`](#share-a-knowledge-base) | two-phase · publishes | Shows you what is in your store, then hands you a link that lets someone search it. |
 | [`accept`](#share-a-knowledge-base) | single-phase · writes | Registers a knowledge base somebody shared with you, from the link they sent. |
 | [`unshare`](#share-a-knowledge-base) | two-phase · deletes | Cuts off one reader, or every reader plus the served copy. |
+| `forget` | two-phase · removes | Removes one atom and its references, or ends one Oracle subscription while keeping existing atoms. |
 
-The server owns only the last segment of each name. A client that namespaces adds its own prefix, so `search` reaches Claude Code as `mcp__Opyt__search`. All twelve return a JSON object.
+The server owns only the last segment of each name. A client that namespaces adds its own prefix, so `search` reaches Claude Code as `mcp__Opyt__search`. All thirteen return a JSON object.
 
 `search`, `open` and `aggregate` are the LLM-free retrieval core: they return data and your host model does the reasoning. They are also the only three that take `kb=`, which reads [a knowledge base someone shared with you](#share-a-knowledge-base).
 
@@ -226,7 +229,7 @@ claude › Eleven claims came back, each paired with what would break it
    drug, not how well it works.
 ```
 
-A sitting is the complement to a search. Search returns the best few; a sitting walks every document on the topic in publication order, so a position that changed over time reads as a change instead of a contradiction. Five lenses read the same material differently:
+A sitting is the complement to a search. Search returns the best few; a sitting walks every document on the topic in publication order, so a position that changed over time reads as a change instead of a contradiction. Six lenses read the same material differently:
 
 | Lens | What it returns |
 |---|---|
@@ -235,6 +238,7 @@ A sitting is the complement to a search. Search returns the best few; a sitting 
 | `trajectory` | The phases the thinking moved through, in publication order. |
 | `disconfirmation` | The case against a claim you name, from your own sources only. |
 | `gaps` | Whether your material answers a question, and the nearest misses if not. |
+| `sprouts` | Everything no sitting has ever read — your blind spots. Needs no topic. |
 
 Every sitting also emits standing questions, which is what feeds the next section.
 
@@ -328,20 +332,20 @@ Content enters the store as **atoms**, Opyt's unit of stored content, one per po
 
 Everything lands in one SQLite database at `~/.opyt/opyt.db`: atoms, their chunks, a full-text index, and the entity and trust edges between tracked people. The MCP server is the only interface, and it creates its own store on first use.
 
-Several background rails also spawn per session, refreshing tracked people's sources, running Frontier's stages, pulling new X bookmarks. Each is independently gated, so a stalled or failing rail never blocks the others or the server itself.
+Nine background rails do the unattended work — refreshing tracked people's sources, running Frontier's stages, pulling new X bookmarks. A resident process, `opyt-worker`, is the only thing that launches them; run `opyt-install-worker` once and macOS starts it at login. Each rail is independently gated and its exit code is recorded, so a stalled or failing rail never blocks the others or the server itself. The worker restarts itself every few hours, so a published fix reaches the rails too, not just the tools. Without the worker installed, the MCP tools still work and nothing runs unattended.
 
 ---
 
-## What it costs
+## How calls run
 
-Opyt is free and MIT-licensed. The expensive part is the reading and reasoning, and that runs on the AI subscription you already pay for.
+Opyt is free and MIT-licensed. Configure one OpenRouter key for the model calls that classify, extract, embed, and read incoming material.
 
-| | For | Cost |
+| | For | Access |
 |---|---|---|
-| **Your AI client** | every question, every answer, all the reasoning | your existing subscription |
-| **OpenRouter** | sorting and extracting what comes in, on a cheap open model, plus the embeddings search ranks with | pay-as-you-go credits |
-| **X** | posts, timelines, profiles, threads | free, through your own browser |
-| **Everything else** | papers, blogs, GitHub, Substack, any URL you hand it | free |
+| **Your AI client** | every question, every answer, all the reasoning | your configured client |
+| **OpenRouter** | sorting, extracting, embedding, and reading incoming material | configured API key |
+| **X** | posts, timelines, profiles, threads | your OPYT-managed browser session |
+| **Everything else** | papers, blogs, GitHub, Substack, any URL you hand it | public source access |
 
 `opyt-keys --list` shows which credentials are set, never their values. `.env.example` documents each one.
 
@@ -395,13 +399,13 @@ claude › Registered. Ask me anything and I can search David's reading too,
 
 Publishing is self-service: no invitation and no account. The served copy refreshes itself when somebody has read it since your last push *and* your store has changed since then, so an unchanged store never re-uploads and a knowledge base nobody reads costs nothing. `unshare(reader="Leo")` cuts off one person and leaves the copy serving; `unshare()` cuts off everyone and deletes it.
 
-Under it, a push is a full replace: an export is a projection of a store, not a log of changes to one, so the newest upload wins. `opyt-push` and `opyt-redeem <url> <code>` are the same two acts from a terminal, kept as operator rails.
+Under it, a push is a full replace: an export is a projection of a store, not a log of changes to one, so the newest upload wins. Both acts run from your assistant — `share` publishes and mints the invite, `accept` redeems one — and neither has a terminal command any more.
 
 ---
 
 ## Design principles
 
-Three constraints hold across the whole codebase, enforced by an AST-based guard (`scripts/guard.py`) that runs in pre-commit.
+Three constraints hold across the whole codebase.
 
 - **Distributable.** Nothing may assume a specific machine. Paths are derived at runtime from `sys.executable` and `Path(__file__)`, never hardcoded.
 - **Client-agnostic.** The core and every knowledge tool run on any MCP client, not just Claude Code. Claude-Code-specific behavior is opt-in and never load-bearing.

@@ -5,39 +5,47 @@ One-shot loopback HTTP capture for browser-driven credential acquisition.
 Keys enter here over 127.0.0.1 and go straight to `set_key`, so a secret never has to pass
 through chat. Nothing captured is ever returned to an MCP caller, logged, or echoed.
 
-Two routes, one server:
-  • `cb`    — an OAuth redirect target; the credential arrives as a query param.
-  • `paste` — a form page whose POST body carries a key that has no OAuth flow.
+ONE route: `cb`, an OAuth redirect target, where the credential arrives as a query param.
+A second `paste` route served a form for keys with no OAuth flow. Its caller was deleted on
+2026-09-05 under the `retired-key-paste-module` guard, and this half outlived it by four days
+on the strength of one test — its only caller. No remaining credential needs a form path (that
+guard's message says why GitHub and Semantic Scholar are not it), so `do_POST`, the form page
+and the `route`/`label` parameters went on 2026-09-09. The rule, kept where the story is not:
+a form on the loopback is a credential-entry surface any local process can reach, so it needs
+a live caller to exist at all.
 
-Loopback-only, single-request, plain HTTP by design — do not grow this into a UI or add TLS.
+Loopback-only, single-request, plain HTTP by design — no second route, no navigation, no TLS,
+and nothing that fetches a stylesheet or an asset, because a single-request listener cannot
+serve one. The RESPONSE BODY is not covered by that rule: it renders `opyt_core.web_panel`,
+which is one self-contained string. That was settled on 2026-09-09, when the bare `<h2>` this
+used to return turned out to be the first Opyt-served page any local user ever sees.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import secrets
 import socket
 import threading
+import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from opyt_core import web_panel
+
 _DEFAULT_TIMEOUT = 300.0
-_MAX_BODY = 8192          # a key is ~64 bytes; this is a hostile-input cap, not a real limit
 
-_OK_PAGE = ("<!doctype html><meta charset=utf-8><title>OPYT</title>"
-            "<body style='font:16px system-ui;padding:3rem'>"
-            "<h2>Done — you can close this tab.</h2>"
-            "<p>OPYT stored the value locally in <code>~/.opyt/.env</code>. "
-            "It never left this machine.</p>")
 
-_FORM_PAGE = ("<!doctype html><meta charset=utf-8><title>OPYT — paste your key</title>"
-              "<body style='font:16px system-ui;padding:3rem;max-width:34rem'>"
-              "<h2>Paste your {label} key</h2>"
-              "<p>This page is served by OPYT on your own machine "
-              "(<code>127.0.0.1</code>). The value is written to "
-              "<code>~/.opyt/.env</code> and never leaves this computer.</p>"
-              "<form method=post><input name=value type=password style='width:100%;"
-              "padding:.6rem;font:inherit' autofocus autocomplete=off>"
-              "<button style='margin-top:1rem;padding:.6rem 1.2rem;font:inherit'>"
-              "Save</button></form>")
+# NO FILESYSTEM PATH. This page named the keys file until 2026-09-09 — first as a hardcoded
+# `~/.opyt/.env`, which was wrong under `$OPYT_HOME`, then briefly as the resolved path, which
+# was right and still not wanted. Somebody who has just authorised a third party needs the
+# reassurance and the next step, not the location of a dotfile holding a secret. Resolving the
+# path was patching the premise; deleting it is the fix.
+_OK_PAGE = web_panel.render(
+    "Opyt", ok=True,
+    headline="Done — you can close this tab.",
+    detail="Opyt stored the key on this machine and it never left it. Go back to your Claude "
+           "conversation to carry on.")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -63,18 +71,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._send(404, "not found")
         params = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
-        if self.capture.route == "paste" and not params:
-            return self._send(200, _FORM_PAGE.format(label=self.capture.label))
         self._send(200, _OK_PAGE)
-        self.capture._deliver({"params": params, "form": {}})
-
-    def do_POST(self):
-        if not self._authorized():
-            return self._send(404, "not found")
-        n = min(int(self.headers.get("Content-Length") or 0), _MAX_BODY)
-        form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
-        self._send(200, _OK_PAGE)
-        self.capture._deliver({"params": {}, "form": form})
+        self.capture._deliver({"params": params})
 
 
 class Capture:
@@ -82,15 +80,13 @@ class Capture:
 
     Binds TWO sockets on the SAME port — `127.0.0.1` and `::1` — because macOS resolves
     `localhost` to `::1`, and a single dual-stack socket would require the `::` wildcard,
-    exposing the form to the LAN.
+    which would put a credential capture on the LAN.
     """
 
-    def __init__(self, *, route: str, timeout: float = _DEFAULT_TIMEOUT, label: str = ""):
-        if route not in ("cb", "paste"):
-            raise ValueError(f"route must be 'cb' or 'paste', got {route!r}")
-        self.route, self.timeout, self.label = route, timeout, label
+    def __init__(self, *, timeout: float = _DEFAULT_TIMEOUT):
+        self.timeout = timeout
         self.nonce = secrets.token_urlsafe(32)
-        self.path = f"/{route}/{self.nonce}"
+        self.path = f"/cb/{self.nonce}"
         self.port = 0
         self._servers: list[HTTPServer] = []
         self._threads: list[threading.Thread] = []
@@ -149,4 +145,32 @@ class Capture:
             s.server_close()
         for t in self._threads:
             t.join(timeout=2)
+        return False
+
+
+# ── The other half of a browser-driven acquisition, shared by every flow that runs one ────────
+# `Capture` is the loopback END of the round trip; these two are its START. They live here
+# rather than in one flow's module because there are now TWO flows — `openrouter_oauth`
+# (the user's own OpenRouter account) and `trial` (a key the gateway mints for them) — and a
+# second private copy of either is the shape drift starts in. Neither touches a credential:
+# one derives a public challenge, the other opens a URL.
+
+def pkce_pair() -> tuple[str, str]:
+    """A PKCE (verifier, S256 challenge). The VERIFIER never leaves the process that made it.
+
+    RFC 7636 S256: only the challenge travels through the browser, so an authorization code
+    stolen in transit is useless without the verifier that never went anywhere.
+    """
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def open_browser(url: str) -> bool:
+    """Best effort. False is a normal outcome, not an error: a headless box, a locked-down
+    desktop or a remote shell all land here, and every caller degrades to handing the user
+    the URL instead of dead-ending on it."""
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
         return False

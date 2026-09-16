@@ -28,55 +28,22 @@ where the thing is headed; the caller shows that to the user and calls again wit
 """
 
 from __future__ import annotations
-from pipeline.kb.rail_runtime import rail_budget_exhausted
-
 import sqlite3
-
-from opyt_core.credentials_registry import SERVICES as _CRED_ENV
-from pipeline import llm_client
 
 from . import ingest_common
 from . import link_router
-
-# ── the resetting daily seatbelt ────────────────────────────────────────────────
-# A runaway guard, not a considered budget: Hopper is cheap per call, so hitting $1.00/day means
-# something is looping, not that the user saved a lot. Both preview and confirm refuse on trip,
-# since a preview that works while confirm can't is a confusing half-state.
-HOPPER_DAILY_USD = 1.00
-
-# ONE constant, read by BOTH the `@llm_client.rail` decorator on `save` and by
-# `_daily_budget_exhausted` — two matching string literals would drift, and a drifted pair fails
-# silently (the meter fills under one name, the ceiling reads an empty meter under the other).
-RAIL = "hopper"
-
-
-def _daily_budget_exhausted() -> bool:
-    """Has this rail's recorded spend today reached its ceiling? See
-    `rail_runtime.rail_budget_exhausted` for why it is never the global total."""
-    return rail_budget_exhausted(RAIL, HOPPER_DAILY_USD)
-
-# What the paid stage will actually spend, per kind. Shown in the preview so a confirm is an
-# informed one. Deliberately prose, not numbers-except-where-measured: the only hard price here is
-# twitterapi.io's thread call. Everything else is "free fetch + metered LLM/embedding", and a fake
-# precise figure would be worse than an honest shape.
-#
-# The GitHub variable name is read from the credential registry, not spelled here. This blurb is
-# shown to a user deciding whether to confirm a spend, and "set this variable" is the action it
-# implies — so it has to name the variable that actually exists today.
-_COST = {
-    "paper": "free metadata + PDF fetch, then a metered embed. Skips entirely if already stored.",
-    "github": f"2 free GitHub API calls (60/hr unauthenticated, 5000 with "
-              f"{_CRED_ENV['github']}), then a metered embed.",
-    "substack": "free public fetch, then metered image reads + embed. Paywalled posts are skipped.",
-    "article": "free page fetch, then a metered content-quality gate, image reads and embed. "
-               "One extra free RSS fetch only if the page carries no date.",
-    "x": "free reads on your own x.com session (the post itself, plus its conversation), "
-         "then metered image reads + embed. Needs a logged-in X session in a local browser.",
-}
+from ..ingestion import url_canon
 
 _WHY_BASIS = {
-    "sniffed": "the URL host says so — a fact, checked offline",
+    "sniffed": "the URL says so — a known host, or a DOI in its path. A fact, checked offline",
     "hint": "your kind hint; the URL host matched nothing known",
+    # NOT "the page declares a citation_doi", which this said until 2026-09-16. `probed` covers
+    # four different sources now — a declared tag, a DOI the page merely prints, bare `citation_*`
+    # markup, and OpenAlex naming the paper that lives at this url — and the last of those routinely
+    # fires on a page that declared NOTHING (`hal.science` answers 200 with a JS shell; most of the
+    # rest answer 403). Asserting the page said so was then a statement about a page nobody read.
+    "probed": ("it cost a fetch: either the page itself names a DOI, or an index records this url "
+               "as that paper's page. Not derivable from the url alone"),
     "fallback": "nothing matched, so it is treated as a plain article",
 }
 
@@ -115,8 +82,8 @@ def _x_preview_card(url: str) -> tuple[str | None, str | None]:
 
     It exists because x.com serves a JS shell to unauthenticated fetchers, so unlike an
     article/paper/repo/Substack post (which the host model can fetch and describe itself), a bare
-    status link tells the model nothing verifiable. It used to be the one place the preview SPENT
-    (~$0.00015 through twitterapi.io); that is no longer a reason to skip it.
+    status link tells the model nothing verifiable. The preview reads the local X session so it
+    can show the actual post before the user confirms.
 
     Reuses `derive_x`'s mechanical description, so what you approve is literally what gets stored."""
     from . import derive, ingest_x, link_router
@@ -131,7 +98,7 @@ def _x_preview_card(url: str) -> tuple[str | None, str | None]:
                       "likely fail and store nothing.")
     try:
         return derive.derive_x(norm)["description"], None
-    except Exception:                       # a malformed payload costs the card, never the preview
+    except Exception:                       # a malformed payload drops the card, never the preview
         return None, None
 
 
@@ -139,39 +106,81 @@ def preview(conn: sqlite3.Connection, reference: str, *, kind_hint: str | None =
             enrich: bool = True) -> dict:
     """Where would this go, and do we already have it? No writes, ever.
 
-    Cheapness is a contract meaning "cheap enough that nobody skips it", not "literally zero":
-    ZERO network for article/paper/github/substack (the host model already read those), ~$0.00015
-    for an X post since a bare status link is otherwise unverifiable. `enrich=False` disables even
-    that (the confirm path passes it so a save never fetches the same post twice).
+    An X post may add a local-session preview card because a bare status link is otherwise
+    unverifiable. `enrich=False` disables that read because the confirm path fetches the post.
 
-    No TITLE for the four free kinds — a title costs a page fetch that would duplicate what the
-    caller already has."""
+    The other kinds use the reference the caller already supplied; preview does not fetch titles.
+
+    ONE BOUNDED FETCH, and only on the article fallback. A publisher that declares `citation_doi`
+    in its page head is a paper, and nothing about its URL says so — measured 2026-09-09,
+    nature.com filed AlphaFold as `blog:nature.com/articles/…`, `who_id = blog:nature.com`,
+    `what_kind = opinion`, with the author list scraped into the title. That atom never dedups
+    against the same paper saved by DOI and never feeds `sync_paper_author_signals`, so none of
+    its 34 authors becomes a candidate.
+
+    It runs HERE rather than on confirm because the preview is what the user approves, and the
+    whole point of the two-phase split is that a wrong route is silent. `classify_link_deep`
+    bounds itself (5s, 64KB of the head), and it costs nothing on a link that already sniffed or
+    carried a hint. The probe REWRITES `reference` to the `doi.org` form it found, so `save`
+    mints the paper rather than the landing page it was handed.
+    """
     ref = (reference or "").strip()
     kind, basis = link_router.classify_reference(ref, hint=kind_hint)
+    # ⚠️ REFUSE THE PLATFORMS WE CANNOT READ, HERE, BEFORE ANY FETCH. Routing sends everything
+    # unrecognised to `article`, so a youtube/podcast/linkedin link used to be fetched as a blog
+    # post and come back `rejected` — "the content-quality gate found no substantive units (nav /
+    # promo / boilerplate)". On a page that IS nav and promo that verdict is technically right and
+    # reads as OPYT calling the user's video worthless. The honest answer is that OPYT does not
+    # read video, audio or login-walled feeds yet, and it is knowable from the URL alone.
+    #
+    # `url_canon._EXCLUDED_HOSTS` has said which hosts these are since it was written ("Excluded
+    # platforms must not fall through to the personal-blog default") — Hopper simply had no way
+    # to ask, so it fell through. Placed BEFORE `classify_link_deep` because the probe is a real
+    # network read, and reading the head of a page we have already decided not to store is pure
+    # cost. Only the `fallback` route is checked: a DOI on one of these hosts is still a paper.
+    if basis == "fallback" and (platform := url_canon.excluded_platform(ref)):
+        return {"routable": False, "reference": ref, "kind": None, "saw": platform,
+                "error": (f"OPYT cannot read {platform} pages yet — it stores written text, and "
+                          "these carry video, audio or a login-walled feed the page itself does "
+                          "not contain. Nothing was written, and nothing is wrong with the link. "
+                          "If a transcript or write-up of it exists somewhere, that URL works.")}
+    content_type = None
+    if basis == "fallback" and (probed := link_router.classify_link_deep(ref)):
+        kind, ref, content_type = probed
+        basis = "probed"
     if kind is None:
         return {"routable": False, "reference": ref, "kind": None,
                 "saw": ("not an http(s) URL" if ref else "empty reference"),
                 "error": "cannot route this — Hopper takes a URL (an article, a paper, a github "
                          "repo, a Substack post, or an X post). Nothing was written."}
 
-    atom_id = link_router.predicted_atom_id(ref, kind)
+    atom_id = link_router.predicted_atom_id(ref, kind, content_type=content_type)
     present = bool(atom_id) and link_router.atom_present(conn, atom_id)
     out = {
         "routable": True, "reference": ref, "kind": kind, "why": _WHY_BASIS.get(basis, basis),
-        "atom_id": atom_id, "already_present": present,
-        "entry_mode": "user-saved", "cost": _COST.get(kind, "a metered embed."),
+        "atom_id": atom_id, "already_present": present, "entry_mode": "user-saved",
     }
+    if content_type:
+        # Only the probe can assert this — it required a real fetch. Carried so `save` hands the
+        # adapter the same fact the id was predicted from, instead of re-deriving from a url that
+        # by definition does not carry it.
+        out["content_type"] = content_type
     if kind == "substack":
         # The only kind whose id is not derivable offline — it keys on the post's numeric id.
         out["note"] = ("the atom id for a Substack post is only known after the fetch, so "
                        "'already present' cannot be answered here; the adapter dedups on it.")
+    elif kind == "paper" and not atom_id:
+        # A PubMed url: its PMID is not a DOI and the string carries no route to one, so the id is
+        # only known after one lookup — which the free pre-check deliberately does not pay for.
+        out["note"] = ("this paper's id is only known after the lookup, so 'already present' "
+                       "cannot be answered here; the adapter dedups on it.")
     elif kind == "github":
         # The store keys on the API's canonical owner casing, which the URL may not match.
         out["note"] = ("the github atom id uses the API's canonical owner casing, so this id is a "
-                       "best guess from the URL; a casing mismatch costs one re-fetch, not a twin.")
+                       "best guess from the URL; a casing mismatch causes one re-fetch, not a twin.")
     if present:
-        out["note"] = "already in the knowledge base — a confirm would be a no-op, no fetch, no spend."
-        return out                          # nothing to verify, so nothing to spend verifying it
+        out["note"] = "already in the knowledge base — a confirm would be a no-op."
+        return out
     if kind == "x" and enrich:
         card, problem = _x_preview_card(ref)
         if card:
@@ -181,32 +190,20 @@ def preview(conn: sqlite3.Connection, reference: str, *, kind_hint: str | None =
     return out
 
 
-@llm_client.rail(RAIL)
 def save(conn: sqlite3.Connection, embedder, reference: str, *, kind_hint: str | None = None,
-         confirm: bool = False, profile: str | None = None) -> dict:
+         confirm: bool = False) -> dict:
     """Route one reference into the atom KB. Two-phase: `confirm=False` (the default) PREVIEWS and
-    writes nothing; `confirm=True` runs the paid ingest.
-
-    The one in-process rail (the other four run as detached children). `llm_client.rail` restores
-    the PREVIOUS label on exit rather than resetting, so an inner `hopper` call inside a
-    long-lived MCP server can't un-attribute an outer rail's run.
-
-    The label sits here (not on the `hopper` MCP tool) because this is the importable entry every
-    caller goes through, covering the preview and the confirm alike. (It used to be worth naming
-    the preview's own spend, ~$0.00015 for an X read through twitterapi.io; that read is free on
-    the user's own session since 2026-08-30, and only the confirm costs anything now.)
+    writes nothing; `confirm=True` runs the ingest.
 
     Returns the preview dict, or on a confirm `{status, kind, atom_id, entry_mode, …}` where status
     is one of:
-      • "already_present" — the atom was there. No fetch, no spend, nothing written.
+      • "already_present" — the atom was there. Nothing written.
       • "saved"           — a new (or changed) atom is in the store.
       • "rejected"        — fetched fine, but the content gate found no substantive units. Not an
                             error: the page was nav/promo/boilerplate. Nothing stored, by design.
       • "blocked"         — the host stopped us (a bot-check or a challenge shell). Retryable.
       • "failed"          — the fetch failed, or the URL is not what its kind claims.
       • "unroutable"      — not a URL at all.
-      • "budget_paused"   — the daily runaway guard tripped. Nothing fetched, nothing written.
-                            Refuses the PREVIEW too, deliberately — see HOPPER_DAILY_USD.
 
     Fail-safe on every branch: a failure SKIPS. No partial atom, nothing marked processed, no
     guess. The next attempt starts clean.
@@ -216,17 +213,8 @@ def save(conn: sqlite3.Connection, embedder, reference: str, *, kind_hint: str |
     """
     from . import ingest_blog, ingest_x
 
-    # Before the preview, since a preview isn't free either (X reads ~$0.00015). Refusal goes in
-    # the returned payload, not a log — hopper has a human reading its output.
-    if _daily_budget_exhausted():
-        return {"status": "budget_paused", "reference": reference,
-                "message": (f"hopper's ${HOPPER_DAILY_USD:.2f} daily runaway guard has tripped — "
-                            f"that much spend in one day means something is looping, not that you "
-                            f"saved a lot. Nothing was fetched and nothing was written. It resets "
-                            f"at UTC midnight.")}
-
-    # `enrich=not confirm`: on a confirm the adapter is about to fetch the post anyway, so paying
-    # for a preview card here would buy the same tweet twice.
+    # `enrich=not confirm`: on a confirm the adapter is about to fetch the post anyway, so the
+    # preview does not fetch the same tweet twice.
     pre = preview(conn, reference, kind_hint=kind_hint, enrich=not confirm)
     if not pre["routable"]:
         return {**pre, "status": "unroutable"}
@@ -250,10 +238,10 @@ def save(conn: sqlite3.Connection, embedder, reference: str, *, kind_hint: str |
         status, atom_id = ingest_blog.article_atom_from_url(
             conn, embedder, ref, entry_mode="user-saved")
     elif kind == "x":
-        status, atom_id = ingest_x.x_atom_from_url(
-            conn, embedder, ref, entry_mode="user-saved", profile=profile)
+        status, atom_id = ingest_x.x_atom_from_url(conn, embedder, ref)
     else:
-        res = link_router.mint_artifact(conn, embedder, ref, kind, entry_mode="user-saved")
+        res = link_router.mint_artifact(conn, embedder, ref, kind, entry_mode="user-saved",
+                                        content_type=pre.get("content_type"))
         atom_id = res["atom_id"]
         # `mint_artifact` speaks the vouch path's vocabulary; translate it into this surface's.
         # "minted" covers both a fresh write and Substack's mint-or-present collapse — the honest
@@ -269,9 +257,13 @@ def save(conn: sqlite3.Connection, embedder, reference: str, *, kind_hint: str |
         out["detail"] = ("the host served a bot-check or challenge page instead of the article. "
                          "Nothing was stored; it is worth retrying later.")
     elif out["status"] == "failed":
+        # NOT "pass kind_hint to override the route", which this said until 2026-09-06: the hint
+        # is consulted only when the host matches nothing known, so it cannot override anything
+        # that got as far as being identified. `a0ecd0e8` measured that it is live for exactly
+        # ONE kind and wrote the correct version into `hopper_tools`' own docstring in the same
+        # commit, leaving this copy behind.
         out["detail"] = ("could not fetch or identify that as a " + kind +
-                         ". Nothing was stored. If the URL is right, pass kind_hint to override "
-                         "the route.")
+                         ". Nothing was stored.")
     elif out["status"] == "saved":
         warning = _thin_metadata_warning(conn, atom_id)
         if warning:                      # a degraded success is still a success — but say so

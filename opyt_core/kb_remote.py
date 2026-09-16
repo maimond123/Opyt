@@ -50,8 +50,8 @@ class _BadRequest(peers.PeerUnavailable):
 def error_detail(r) -> str:
     """The service's own error sentence when there is one. A reverse proxy answering for a dead
     upstream sends HTML, not the service's JSON — hence the fallback to raw text. Public because
-    every client of the service parses failures the same way — this module and the console
-    scripts (`opyt-redeem`, `opyt-push`)."""
+    every client of the service parses failures the same way — this module, `opyt_core/push.py`
+    and `mcp_server/share_tools.py`."""
     try:
         return str(r.json().get("detail"))
     except Exception:

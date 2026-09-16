@@ -16,6 +16,8 @@ state and regardless of a not-yet-done live capture:
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 from pipeline.ingestion import x_likes as xlk
 
 VIEWER = "1861260702494957568"   # David's rest_id
@@ -201,8 +203,11 @@ def test_fetch_liked_authors_counts_repeat_authors_across_distinct_tweets(monkey
 # ── fail-safe: no viewer id → skip, no crash, no write ───────────────────────
 
 def test_sync_likes_skips_without_viewer_id(monkeypatch):
-    monkeypatch.setattr(xlk.core, "read_x_cookies", lambda **k: {"auth_token": "x"})
+    from pipeline.kb.ingest_curation import sync_likes_signals
+
+    monkeypatch.setattr(xlk.core, "read_x_cookies", lambda: {"auth_token": "x"})
     monkeypatch.setattr(xlk.core, "viewer_id", lambda c: None)
-    out = xlk.sync_likes(dry_run=True)
+    conn = Mock()
+    out = sync_likes_signals(conn)
     assert out["skipped"] == "no_viewer_id"
-    assert out["candidates"] == 0
+    assert conn.mock_calls == []

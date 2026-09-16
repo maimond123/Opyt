@@ -5,7 +5,7 @@ One row per curation collector. `last_attempt_at` advances on any outcome and dr
 floor; `last_ok_at` advances only on success and drives staleness reporting. Mirrors
 `oracle_refresh_state.py` in shape (same DB, own DDL, `schema.connect` layering) but keeps no
 breaker state and no adaptive cadence. Nothing here touches the network or the wall clock except
-via the `now` argument, so callers can test without sleeping. Full design rationale:
+via the `now` argument, so callers can test without sleeping.
 """
 
 from __future__ import annotations
@@ -22,20 +22,22 @@ from . import schema
 # 6h retry floor so a collector mid-cadence isn't flagged — only one that is failing or never ran.
 STALE_AFTER_HOURS = 48.0
 
-# The one status string that advances `last_ok_at`. Every other value — 'error', 'skipped_tier',
+# The one status string that advances `last_ok_at`. Every other value — 'error',
 # 'no_viewer_id' — is an attempt that observed nothing.
 STATUS_OK = "ok"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS collector_runs (
-  collector       TEXT PRIMARY KEY,  -- 'x_lists' | 'x_following' | 'x_likes' | 'substack_subs'
+  collector       TEXT PRIMARY KEY,  -- 'x_lists' | 'x_following' | 'x_likes'
+                                     --   | 'substack_follows' | 'substack_subscriptions'
   last_attempt_at TEXT,              -- ANY outcome  → drives the FLOOR
   last_ok_at      TEXT,              -- SUCCESS only → drives STALENESS
-  last_status     TEXT,              -- 'ok' | 'skipped_tier' | 'error' | 'no_viewer_id'
+  last_status     TEXT,              -- 'ok' | 'error' | 'no_viewer_id'  (free-form; these are
+                                     --   what the collectors write today)
   last_detail     TEXT,
   found           INTEGER,           -- what the COLLECTOR said it saw, as of `last_ok_at`
   stored_after    INTEGER,           -- rows the STORE holds for this signal_type+platform, ditto
-  prev_found      INTEGER,           -- the PREVIOUS ok run's `found` — the collapse guard's input
+  prev_found      INTEGER,           -- the last ACCEPTED `found` — the collapse guard's baseline
   started_at      TEXT               -- when the walk BEGAN — see `record_run`
 );
 """
@@ -97,16 +99,6 @@ def init_state_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def connect(db_path=None, *, read_only: bool = False) -> sqlite3.Connection:
-    """The atom-KB store with `collector_runs` guaranteed present. Reuses `schema.connect`
-    (WAL + busy_timeout + row_factory + `$OPYT_HOME`) and layers this table on top. Read-only
-    opens skip DDL, matching `schema.connect`'s contract."""
-    conn = schema.connect(db_path, read_only=read_only)
-    if not read_only:
-        init_state_schema(conn)
-    return conn
-
-
 # ── persistence ─────────────────────────────────────────────────────────────────
 def record_run(conn: sqlite3.Connection, collector: str, *, status: str,
                detail: str | None = None, found: int | None = None,
@@ -117,12 +109,13 @@ def record_run(conn: sqlite3.Connection, collector: str, *, status: str,
     `last_attempt_at` advances on every outcome so the floor counts failed attempts too.
     `last_ok_at` advances only on `ok`. `started_at` marks when the walk began; retirement compares
     against that instead of the finish stamp. Counts (`found`/`stored_after`) coalesce rather than
-    overwrite, so a failure doesn't blank the last good reading. Full rationale:
+    overwrite, so a failure doesn't blank the last good reading.
     """
     init_state_schema(conn)
     stamp = now or _now()
-    # `prev_found` carries the value `found` is about to overwrite — one step of history, which is
-    # all the collapse guard needs. Only an `ok` run shifts it.
+    # `prev_found` is the last ACCEPTED baseline. A collapsed `ok` result remains visible as
+    # `found`, but cannot become the next baseline: otherwise a second truncated walk would make
+    # itself look trustworthy and retire candidates the collector never observed.
     conn.execute(
         "INSERT INTO collector_runs "
         "(collector, last_attempt_at, last_ok_at, last_status, last_detail, found, stored_after, "
@@ -134,14 +127,18 @@ def record_run(conn: sqlite3.Connection, collector: str, *, status: str,
         "  last_ok_at=COALESCE(excluded.last_ok_at, collector_runs.last_ok_at), "
         "  last_status=excluded.last_status, "
         "  last_detail=excluded.last_detail, "
-        "  prev_found=CASE WHEN excluded.found IS NOT NULL THEN collector_runs.found "
-        "                  ELSE collector_runs.prev_found END, "
+        "  prev_found=CASE "
+        "    WHEN excluded.found IS NULL THEN collector_runs.prev_found "
+        "    WHEN collector_runs.prev_found IS NULL "
+        "      OR collector_runs.found >= collector_runs.prev_found * ? "
+        "      THEN collector_runs.found "
+        "    ELSE collector_runs.prev_found END, "
         "  found=COALESCE(excluded.found, collector_runs.found), "
         "  stored_after=COALESCE(excluded.stored_after, collector_runs.stored_after)",
         (collector, stamp, stamp if status == STATUS_OK else None, status, detail,
          None if found is None else int(found),
          None if stored_after is None else int(stored_after),
-         started_at if status == STATUS_OK else None),
+         started_at if status == STATUS_OK else None, WALK_COLLAPSE_RATIO),
     )
     conn.commit()
 
@@ -190,13 +187,6 @@ def is_due(row: CollectorRun | None, *, floor_hours: float,
     it is asked. Gating on success would remove the floor from exactly the collector that most
     needs one."""
     return hours_since_attempt(row, now) >= floor_hours
-
-
-def is_stale(row: CollectorRun | None, *, stale_after_hours: float = STALE_AFTER_HOURS,
-             now: datetime | None = None) -> bool:
-    """Has this collector's slice of the candidate list gone unrefreshed too long? Never-run counts
-    as stale — no evidence is the worst evidence, and it is the invisible-freeze case."""
-    return hours_since_ok(row, now) >= stale_after_hours
 
 
 # ── read-only report ────────────────────────────────────────────────────────────

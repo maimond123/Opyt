@@ -1,8 +1,9 @@
 """
 pipeline/kb/probe_store.py — the CANDIDATE content store, held outside the trusted KB.
 
-The candidate-list Proposer pulls one shallow page of each candidate's own posts so the question
-"who here works on AI and biology?" can be answered from their words rather than their bio
+The candidate-list Proposer pulls one shallow page of each candidate's own content — X posts, or
+recent papers for someone the user knows only as an author — so the question "who here works on AI
+and biology?" can be answered from their words rather than their bio
 (`docs/plans/2026-08-11-proposer-candidate-loop.md`). A candidate is someone the user engaged with
 once — a follow, a bookmark, a like. That is a real prior, and it is NOT the vouch an Oracle has.
 
@@ -35,14 +36,17 @@ from pipeline.timeparse import parse_ts, utc_now
 # two queries, and no further — see the docstring for the three columns deliberately absent.
 _DDL = """
 CREATE TABLE IF NOT EXISTS probe_atoms (
-  atom_id        TEXT PRIMARY KEY,     -- 'xprobe:{root tweet id}' — its own namespace, so an id
-                                       -- that surfaces in a log is never mistaken for a trusted
-                                       -- 'x:'/'xprofile:' atom
-  source_type    TEXT NOT NULL,        -- 'x' today; the column exists so a second probe source is
-                                       -- additive rather than a schema break
-  who_id         TEXT NOT NULL,        -- 'x:user:{id}' — the CANDIDATE. NOT NULL because this whole
-                                       -- store answers "which candidate said this"; an
-                                       -- unattributed row is unscopeable and therefore useless
+  atom_id        TEXT PRIMARY KEY,     -- 'xprobe:{root tweet id}' / 'oaprobe:{openalex work id}'
+                                       -- — its own namespace per probe source, so an id that
+                                       -- surfaces in a log is never mistaken for a trusted
+                                       -- 'x:'/'xprofile:'/'paper:' atom
+  source_type    TEXT NOT NULL,        -- 'x' | 'paper'. The column anticipated the second source
+                                       -- and got it in 2026-09 (`scholar_probe`), so adding one
+                                       -- was additive rather than a schema break
+  who_id         TEXT NOT NULL,        -- the CANDIDATE: 'x:user:{id}' or 'openalex:{author id}'.
+                                       -- NOT NULL because this whole store answers "which
+                                       -- candidate said this"; an unattributed row is unscopeable
+                                       -- and therefore useless
   when_ts        TEXT,
   when_precision TEXT,
   source_url     TEXT,
@@ -97,6 +101,16 @@ CREATE TABLE IF NOT EXISTS probe_pulls (
   atoms     INTEGER NOT NULL DEFAULT 0,  -- atoms durably written by that attempt
   detail    TEXT                         -- the failure/unavailability reason, verbatim
 );
+
+-- A pull row answers where a candidate stands. This append-only ledger answers a different
+-- question: how many candidate samples consumed today's allowance. Repeated failures overwrite
+-- the former but must each consume the latter.
+CREATE TABLE IF NOT EXISTS probe_attempts (
+  attempt_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  who_id       TEXT NOT NULL,
+  attempted_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_probe_attempts_at ON probe_attempts(attempted_at);
 """
 
 # Retry semantics, keyed by what the last attempt observed. See the DDL comment.
@@ -150,6 +164,12 @@ def probe_tables_exist(conn: sqlite3.Connection) -> bool:
     for, on the one path whose whole job is to leave the store consistent."""
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='probe_chunks'"
+    ).fetchone() is not None
+
+
+def _attempts_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='probe_attempts'"
     ).fetchone() is not None
 
 
@@ -355,6 +375,18 @@ def probed_who_ids(conn: sqlite3.Connection) -> set[str]:
 
 # ── pull state ────────────────────────────────────────────────────────────────
 
+def record_attempt(conn: sqlite3.Connection, who_id: str) -> None:
+    """Record one candidate sampling attempt before its X request.
+
+    This is deliberately separate from `record_pull`: a latest-outcome row is scheduling state,
+    while this ledger is the daily allowance's source of truth. In particular, `failed → failed`
+    must add another attempt without changing how the candidate is scheduled for retry.
+    """
+    init_probe_schema(conn)
+    conn.execute("INSERT INTO probe_attempts (who_id) VALUES (?)", (who_id,))
+    conn.commit()
+
+
 def record_pull(conn: sqlite3.Connection, who_id: str, status: str, *,
                 atoms: int = 0, detail: str | None = None) -> None:
     """Record what one candidate's pull attempt observed. Overwrites in place — this is a current
@@ -370,15 +402,17 @@ def record_pull(conn: sqlite3.Connection, who_id: str, status: str, *,
 
 
 def probed_today(conn: sqlite3.Connection) -> int:
-    """Candidates whose pull was ATTEMPTED today (UTC) — the meter `probe_catchup`'s daily ceiling
-    reads. Counts attempts, not successes: a `failed` candidate still spent the X request the
-    ceiling rations. Derived from `probe_pulls.pulled_at` rather than a separate counter, so it
-    can't drift from what actually ran. Answers 0 without creating tables on a never-probed store —
-"""
+    """Candidate sampling attempts made today (UTC), for `probe_catchup`'s daily ceiling.
+
+    A never-probed store still answers zero without creating tables. An existing store from before
+    the ledger is upgraded before its first meter read, so subsequent retries have one authority.
+    """
     if not probe_tables_exist(conn):
         return 0
+    if not _attempts_table_exists(conn):
+        init_probe_schema(conn)
     return conn.execute(
-        "SELECT COUNT(*) FROM probe_pulls WHERE date(pulled_at) = date('now')").fetchone()[0]
+        "SELECT COUNT(*) FROM probe_attempts WHERE date(attempted_at) = date('now')").fetchone()[0]
 
 
 def pull_states(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -500,5 +534,4 @@ def probe_author_rollup(conn: sqlite3.Connection) -> dict[str, dict]:
         "GROUP BY a.who_id")
     return {r["who_id"]: {"atoms": r["atoms"], "chunks": r["chunks"],
                           "first_ts": r["first_ts"], "last_ts": r["last_ts"]} for r in rows}
-
 

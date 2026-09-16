@@ -94,38 +94,29 @@ def test_arxiv_author_page_is_a_profile_not_a_paper():
 def test_researchgate_and_academia_profiles():
     assert classify_source("https://www.researchgate.net/profile/Jane-Doe").type == "scholar"
     assert classify_source("https://janedoe.academia.edu").is_profile is True
-    assert classify_source("https://www.academia.edu/12345").type == "scholar"
+    assert classify_source("https://www.academia.edu/12345") is None
 
 
-# ── YouTube: channel vs video ─────────────────────────────────────────────────
+# ── YouTube is excluded from profile discovery ───────────────────────────────
 
-def test_youtube_handle_channel_is_a_profile():
-    pl = classify_source("https://www.youtube.com/@AndrejKarpathy")
-    assert (pl.type, pl.is_profile, pl.handle) == ("youtube", True, "andrejkarpathy")
-
-
-def test_youtube_channel_id_is_a_profile():
-    pl = classify_source("https://youtube.com/channel/UC1234")
-    assert pl.is_profile is True and pl.handle == "uc1234"
+def test_youtube_handle_is_excluded():
+    assert classify_source("https://www.youtube.com/@AndrejKarpathy") is None
 
 
-def test_youtube_watch_is_an_artifact():
-    assert classify_source("https://www.youtube.com/watch?v=dQw4w9WgXcQ").is_profile is False
+def test_youtube_channel_id_is_excluded():
+    assert classify_source("https://youtube.com/channel/UC1234") is None
 
 
-# ── LinkedIn: personal vs company ─────────────────────────────────────────────
-
-def test_linkedin_in_is_personal():
-    pl = classify_source("https://www.linkedin.com/in/someone")
-    assert (pl.type, pl.is_profile, pl.shape) == ("linkedin", True, "personal")
+def test_youtube_watch_is_excluded():
+    assert classify_source("https://www.youtube.com/watch?v=dQw4w9WgXcQ") is None
 
 
-def test_linkedin_company_is_org():
-    pl = classify_source("https://linkedin.com/company/anthropic")
-    assert (pl.type, pl.shape) == ("linkedin", "org")
+# ── LinkedIn is excluded ─────────────────────────────────────────────
 
+def test_linkedin_profiles_are_excluded():
+    assert classify_source("https://www.linkedin.com/in/someone") is None
+    assert classify_source("https://linkedin.com/company/anthropic") is None
 
-# ── X / Twitter ───────────────────────────────────────────────────────────────
 
 def test_x_handle_is_a_profile_and_twitter_aliases():
     pl = classify_source("https://twitter.com/willccbb")   # aliases to x

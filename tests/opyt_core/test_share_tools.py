@@ -11,11 +11,12 @@ substitution is the socket, and both installs' homes are kept apart the way two 
 from __future__ import annotations
 
 import re
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from opyt_core import kb as kb_entry, kb_remote, keys
+from opyt_core import config, kb as kb_entry, kb_remote, keys
 from pipeline.kb import peers, push_catchup
 from service import store, uploads
 from tests.opyt_core.conftest import URL
@@ -61,13 +62,26 @@ def owner(publisher, monkeypatch):
 
     monkeypatch.setattr(st, "requests", SimpleNamespace(
         get=_shim(publisher.svc.client.get), post=_shim(publisher.svc.client.post)))
-    # The rail runs in-process here rather than as a detached child: `spawn_rail` would fork a
-    # real subprocess against a real network, and what is under test is that `share` triggers a
-    # publish, not that `Popen` works.
-    monkeypatch.setattr("pipeline.kb.push_catchup.spawn_push_catchup",
-                        lambda force=False: push_catchup.run_push_catchup(force=True)["status"]
-                        == "ok")
+    # `share` only QUEUES the push rail; `run_worker_pass` below stands in for the resident
+    # worker that launches it. Nothing about the rail is stubbed — the queue and the publish are
+    # both real, and the tests below hold them apart so a broken hand-off cannot hide.
     return SimpleNamespace(t=_tools(), publisher=publisher, creds=creds)
+
+
+def _queued_push(home) -> object | None:
+    """The durable push job `share` left behind, as the local worker would find it."""
+    from pipeline.kb.rail_jobs import LOCAL_HOME_ID, RailJobStore
+    return RailJobStore(home / "rail_jobs.db").get(LOCAL_HOME_ID, "push_catchup")
+
+
+def run_worker_pass(owner) -> dict:
+    """Run the queued rail exactly as `rail_worker.RAILS['push_catchup']` would — no `--force`.
+
+    The command carries no override, so this also proves the gate publishes a first share on its
+    own "never published" branch rather than on a word the tool passed it.
+    """
+    assert _queued_push(owner.publisher.home) is not None, "share queued no push job"
+    return push_catchup.run_push_catchup()
 
 
 # ── share ────────────────────────────────────────────────────────────────────────
@@ -98,17 +112,52 @@ def test_the_preview_writes_nothing_and_registers_nothing(owner):
             r for r in store.stored_bytes() if r["owner"] == owner.publisher.svc.owner]
 
 
-def test_a_first_share_registers_publishes_and_returns_a_link(owner):
-    """The whole ask moment, and nobody opened a shell. The token is PERSISTED, so the next
-    session's push rail can find it."""
+def test_a_first_share_registers_queues_the_push_and_returns_a_link(owner):
+    """The whole ask moment, and nobody opened a shell. The token is PERSISTED, so the push rail
+    can find it whenever the worker gets to it — including with no MCP session open at all."""
     out = owner.t.share(confirm=True, as_name="David")
 
     assert out["status"] == "shared"
     assert out["invite"].startswith("https://useopyt.com/invite#")
+    assert out["queued"] is True
     assert owner.creds["opyt_service"]
+    job = _queued_push(owner.publisher.home)
+    assert job.due_at <= time.time() and job.started_at is None
     with owner.publisher.on_service():
         assert store.owner_label(out["owner"]) == "David"
+        # Queued is not published: the export lands when the worker runs the rail, not before.
+        assert not uploads.export_path(out["owner"]).exists()
+
+
+def test_the_queued_rail_is_what_publishes_the_first_share(owner):
+    """The hand-off end to end. `share` writes a job row; the rail's own gate does the upload."""
+    out = owner.t.share(confirm=True, as_name="David")
+
+    assert run_worker_pass(owner)["status"] == "ok"
+
+    with owner.publisher.on_service():
         assert uploads.export_path(out["owner"]).exists()
+
+
+def test_the_queued_rail_name_is_one_the_worker_can_actually_launch(owner):
+    """A name outside the registry is a row nothing ever dispatches, and nothing says so."""
+    from pipeline.kb.rail_worker import RAILS
+
+    owner.t.share(confirm=True, as_name="David")
+
+    assert _queued_push(owner.publisher.home).rail in RAILS
+
+
+def test_a_failed_grant_queues_nothing(owner, monkeypatch):
+    """Order: the grant is durable before the push is asked for. A share nobody can accept must
+    not leave an upload obligation behind for a reader who was never invited."""
+    import mcp_server.share_tools as st
+
+    owner.t.share(confirm=True, as_name="David")
+    monkeypatch.setattr(st, "_call", lambda *a, **kw: {"ok": False, "message": "service down"})
+
+    assert owner.t.share(confirm=True, for_whom="Leo")["status"] == "grant_failed"
+    assert _queued_push(owner.publisher.home).due_at <= time.time()
 
 
 def test_the_first_share_refuses_to_guess_a_name(owner):
@@ -162,6 +211,7 @@ def reader(owner, tmp_path, monkeypatch):
     import mcp_server.share_tools as st
 
     invite = owner.t.share(confirm=True, as_name="David")["invite"]
+    run_worker_pass(owner)          # the owner's worker publishes before anyone can read
     reader_home = tmp_path / "reader"
     reader_home.mkdir()
     monkeypatch.setenv("OPYT_HOME", str(reader_home))
@@ -216,6 +266,22 @@ def test_the_accepted_name_is_the_one_that_reads(reader, monkeypatch):
     assert {h["kb"] for h in hits} == {out["kb"]}
 
 
+def test_an_explicit_name_wins_over_the_owners_suggestion(reader):
+    """`name=` overrides `suggested_name`. The owner's own label is a STARTING POINT and not a
+    contract — after R4 every request sends `as_kb`, so nothing in the envelope depends on which
+    string this install picked.
+
+    This assertion is here because `opyt-redeem` and its `--name` flag were deleted on
+    2026-09-05 and the test that held this property went with them. `accept`'s `name=` is the same
+    override, and no other test in this file asserts it — without this one the property would have
+    left with the command it was written against."""
+    out = reader.t.accept(reader.invite, name="colleague")
+
+    assert out["kb"] == "colleague"
+    assert peers.get("colleague")["location"].endswith(f"/v1/kb/{out['owner']}")
+    assert peers.get("David") is None, "the suggestion registered a second row"
+
+
 def test_a_name_already_taken_is_suffixed_rather_than_overwritten(reader):
     """`peers.token` is the ONLY copy of a reader token in existence, so a second David must
     never replace the first. The tool reports the name it actually got."""
@@ -250,6 +316,82 @@ def test_a_spent_code_is_a_sentence(reader):
     assert len(peers.list_peers()) == before
 
 
+def test_a_malformed_successful_service_body_is_a_failure_envelope(owner, monkeypatch):
+    """JSON decoding belongs to the shared transport boundary, not each decorated tool."""
+    import mcp_server.share_tools as st
+
+    class _UnreadableResponse:
+        status_code = 200
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    monkeypatch.setattr(st.requests, "post", lambda *args, **kwargs: _UnreadableResponse())
+
+    res = st._call("post", "https://service.test/v1/register")
+    assert res["ok"] is False
+    assert owner.t.share(confirm=True, as_name="David")["status"] == "register_failed"
+
+
+@pytest.mark.parametrize(
+    ("invite", "endpoint"),
+    [
+        ("https://useopyt.com/invite#" + "a" * 43, config.DEFAULT_SERVICE_URL),
+        ("https://self-hosted.test:8443/invite#" + "a" * 43,
+         "https://self-hosted.test:8443"),
+        ("https://notuseopyt.com/invite#" + "a" * 43, "https://notuseopyt.com"),
+    ],
+)
+def test_accept_routes_full_invites_by_their_exact_host(reader, monkeypatch, invite, endpoint):
+    """A full link names its issuer; only the public host maps to the public API."""
+    import mcp_server.share_tools as st
+
+    called = []
+
+    def _call(method, url, **kwargs):
+        called.append((method, url))
+        return {"ok": True, "owner": "owner", "suggested_name": "Owner", "token": "reader"}
+
+    monkeypatch.setattr(st, "_call", _call)
+
+    assert reader.t.accept(invite, name="routed")["status"] == "accepted"
+    assert called == [("post", f"{endpoint}/v1/redeem")]
+
+
+def test_the_install_id_is_minted_once_and_reused(reader, monkeypatch):
+    """`redeem.get_install_id` — the only thing left in that module, and `accept` is its only
+    caller. The id is minted on first use and REUSED forever after, so the service can count
+    distinct installations without an account behind it (TELEMETRY.md: `tokens.install_id`).
+    Two accepts on one install must therefore produce two tokens carrying the SAME id.
+
+    It used to reach `get_install_id` through `opyt-redeem`'s `main()`, and moved here on
+    2026-09-05 when that command was deleted. `accept` is the only path to the function now, and
+    this file is where `accept` is tested.
+
+    ⚠️ It re-points `OPYT_HOME` before each accept, and reads the id by its ABSOLUTE path rather
+    than through `opyt_path`. `publisher.on_service()`'s `finally` restores `OPYT_HOME` to the
+    OWNER's home unconditionally, so after the first shimmed request this process is pointed at
+    the owner's install, not the reader's. Every other test in this fixture is indifferent to
+    that because it reads and writes on one side of the split consistently; this one is the first
+    to assert on a file the READER's install owns, so it has to say which home it means."""
+    monkeypatch.setenv("OPYT_HOME", str(reader.home))
+    first = reader.t.accept(reader.invite)
+    iid = (reader.home / "install_id").read_text().strip()
+    assert iid
+
+    second = reader.owner.t.share(confirm=True, for_whom="a second reader")["invite"]
+
+    monkeypatch.setenv("OPYT_HOME", str(reader.home))
+    assert reader.t.accept(second, name="second")["status"] == "accepted"
+
+    assert (reader.home / "install_id").read_text().strip() == iid, "a second id was minted"
+    # The routing key from the accept, not `svc.owner`: the `owner` fixture holds NO service
+    # token, so its first `share` REGISTERS a new owner rather than reusing the seeded one.
+    with reader.owner.publisher.on_service():
+        rows = store.list_tokens(first["owner"])
+    assert len([t for t in rows if t["install_id"] == iid]) == 2
+
+
 def test_something_that_is_not_an_invite_says_so(reader):
     out = reader.t.accept("hey check out https://example.com/blog/post")
     assert out["status"] == "not_an_invite"
@@ -260,6 +402,7 @@ def test_something_that_is_not_an_invite_says_so(reader):
 
 def test_unshare_preview_names_the_reader_count_and_changes_nothing(owner):
     owner.t.share(confirm=True, as_name="David")
+    run_worker_pass(owner)
     owner.t.share(confirm=True, for_whom="Leo")
     with owner.publisher.on_service():
         code = owner.publisher.svc.client.post(
@@ -280,6 +423,7 @@ def test_unshare_preview_names_the_reader_count_and_changes_nothing(owner):
 
 def test_unshare_confirm_empties_the_token_list_and_deletes_the_copy(owner):
     out = owner.t.share(confirm=True, as_name="David")
+    run_worker_pass(owner)
     with owner.publisher.on_service():
         code = owner.publisher.svc.client.post(
             "/v1/grant", json={},
@@ -325,6 +469,7 @@ def _readers(owner, key):
 
 def test_unshare_one_reader_leaves_the_copy_and_the_others_alone(owner):
     out = owner.t.share(confirm=True, as_name="David")
+    run_worker_pass(owner)
     _grant_and_redeem(owner, "Leo", "leo")
     _grant_and_redeem(owner, "Mia", "mia")
 
@@ -383,6 +528,19 @@ def test_an_unlabelled_reader_is_revocable_by_the_id_the_refusal_hands_back(owne
     _grant_and_redeem(owner, None, "anon")
 
     miss = owner.t.unshare(reader="whoever that was")
+    assert miss["status"] == "no_such_reader"
+    assert len(miss["readers"]) == 1
+
+    done = owner.t.unshare(reader=miss["readers"][0]["id"], confirm=True)
+    assert done["status"] == "reader_revoked"
+    assert _readers(owner, out["owner"]) == []
+
+
+def test_an_empty_reader_does_not_match_an_unlabelled_recipient(owner):
+    out = owner.t.share(confirm=True, as_name="David")
+    _grant_and_redeem(owner, None, "anon")
+
+    miss = owner.t.unshare(reader="", confirm=True)
     assert miss["status"] == "no_such_reader"
     assert len(miss["readers"]) == 1
 

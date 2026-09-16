@@ -13,7 +13,7 @@ This loop keys its watermark on `query_id`, which requires stable query strings 
 doc for why that was once unbuildable and is now pinned by a test.
 
 Shape borrowed from `oracle_refresh`: flat jittered TTL, `since` from the watermark minus an
-overlap sliver, a window assertion before spending, bounded ATTEMPTS rather than iterations, and
+overlap sliver, a window assertion before requests, bounded ATTEMPTS rather than iterations, and
 — load-bearing — a failed pull never stamps.
 
 Never raises. Every outcome is a dict and a row in `frontier_exec_runs`.
@@ -26,13 +26,10 @@ import hashlib
 import json
 import os
 import sqlite3
-import subprocess  # unused directly — tests patch fe.subprocess.Popen to intercept spawn_rail()
 from datetime import datetime, timedelta, timezone
 from pipeline.timeparse import utc_iso, utc_now
 
-from pipeline.kb.rail_runtime import (COALESCE_DEFAULT, load_rail_env,
-                                      models_unroutable, rail_budget_exhausted, spawn_rail)
-from pipeline import llm_client
+from pipeline.kb.rail_runtime import load_rail_env
 from pipeline.ingestion.utils import log
 
 from . import frontier_queries as fq
@@ -44,31 +41,16 @@ from .frontier_sources import SourceError, adapters
 # yet). arXiv posts daily; GitHub search is noisier so it gets a slower beat. OpenAlex gets the
 # same slower beat for a different reason: its page is a RANKED SLICE of a 30-day window, not a
 # stream of new items (see `OpenAlexAdapter`), so asking twice a day re-reads the same slice — and
-# its ~100-request daily allowance is the one budget here that is not ours to spend.
+# its ~100-request daily allowance is the one budget here that Opyt does not own.
 TTL_HOURS = {"arxiv": 24.0, "github": 48.0, "openalex": 48.0}
 DEFAULT_TTL_HOURS = 24.0
 JITTER = 0.10               # ±10%, hash-derived and stable per pair
-OVERLAP_HOURS = 6.0         # re-ask a sliver behind the cursor; dedup absorbs it
+OVERLAP_HOURS = 6.0         # re-ask a sliver behind the resume point; dedup absorbs it
 MAX_WINDOW_DAYS = 60        # the window assertion's ceiling
 FIRST_PULL_DAYS = 14        # a never-pulled pair looks back this far, not to the beginning of time
 
 MAX_REQUESTS_PER_RUN = int(os.environ.get("OPYT_FRONTIER_MAX_REQUESTS", 40))
 
-# ── the resetting daily seatbelt ────────────────────────────────────────────────
-# Daily USD ceiling for this rail (start gate, checked once before the pass, not a governor mid-run).
-# Separate from MAX_REQUESTS_PER_RUN, which bounds one pass, not the day across repeated spawns.
-# $1.00 matches the other rails' ceilings; see docs/plans/2026-08-16-per-rail-spend-meters.md.
-FRONTIER_EXECUTE_DAILY_USD = 1.00
-
-# Rail label shared by the `@llm_client.rail` decorator and `_daily_budget_exhausted` — one
-# constant so the two never drift apart silently.
-RAIL = "frontier_execute"
-
-
-def _daily_budget_exhausted() -> bool:
-    """Has this rail's recorded spend today reached its ceiling? See
-    `rail_runtime.rail_budget_exhausted` for why it is never the global total."""
-    return rail_budget_exhausted(RAIL, FRONTIER_EXECUTE_DAILY_USD)
 PER_QUERY_LIMIT = 25
 
 # Keep only candidates scoring at least this fraction of their page's own top `relevance_score`
@@ -103,35 +85,27 @@ def get_pair(conn, query_id: str, source: str) -> sqlite3.Row | None:
 
 
 def record_pull(conn, query_id: str, source: str, *, last_status: str,
-                cursor_ts: str | None = None, stamp: bool = True, now: datetime | None = None):
+                stamp: bool = True, now: datetime | None = None):
     """Write the outcome of one pair's pull.
 
     `stamp=False` is the whole point of this function existing. A failed pull that advances
     `last_pulled_at` buys a full TTL of silence on that pair — one bad night and the query goes
     quiet for a day with nothing to show why.
-
-    `cursor_ts` only ever moves FORWARD. An adapter returning an odd older date must not rewind a
-    watermark and cause a re-pull of everything since.
     """
     stamp_at = utc_iso(now or utc_now()) if stamp else None
     row = get_pair(conn, query_id, source)
     if row is None:
         conn.execute(
             "INSERT INTO frontier_query_sources "
-            "(query_id, source, last_pulled_at, cursor_ts, last_status, error_count) "
-            "VALUES (?,?,?,?,?,?)",
-            (query_id, source, stamp_at, cursor_ts, last_status,
-             0 if last_status in {"ok", "empty"} else 1))
+            "(query_id, source, last_pulled_at, last_status) VALUES (?,?,?,?)",
+            (query_id, source, stamp_at, last_status))
     else:
         conn.execute(
             "UPDATE frontier_query_sources SET "
             "  last_pulled_at = COALESCE(?, last_pulled_at),"
-            "  cursor_ts      = MAX(COALESCE(?, ''), COALESCE(cursor_ts, '')),"
-            "  last_status    = ?,"
-            "  error_count    = CASE WHEN ? THEN 0 ELSE error_count + 1 END "
+            "  last_status    = ? "
             "WHERE query_id=? AND source=?",
-            (stamp_at, cursor_ts, last_status,
-             1 if last_status in {"ok", "empty"} else 0, query_id, source))
+            (stamp_at, last_status, query_id, source))
     conn.commit()
 
 
@@ -171,15 +145,13 @@ def since_for(row: sqlite3.Row | None, *, now: datetime | None = None) -> dateti
     """
     ref = now or utc_now()
     base = _parse(row["last_pulled_at"]) if row and row["last_pulled_at"] else None
-    if base is None and row and row["cursor_ts"]:
-        base = _parse(row["cursor_ts"])
     if base is None:
         return ref - timedelta(days=FIRST_PULL_DAYS)   # bounded first look-back, not all of time
     return base - timedelta(hours=OVERLAP_HOURS)
 
 
 def window_ok(since: datetime, now: datetime) -> bool:
-    """Refuse an absurd window BEFORE spending the request.
+    """Refuse an absurd window BEFORE making the request.
 
     The realistic failure is not volume, it is a threading bug: if `since` fails to reach the
     adapter, the source silently applies its own default and every pull becomes a full-history
@@ -215,34 +187,46 @@ def upsert_candidate(conn, cand, query_id: str, *, now: str) -> bool:
 
 
 # ── The run ─────────────────────────────────────────────────────────────────────
-@llm_client.rail(RAIL)
-def run_frontier_execute(conn=None, *, force: bool = False, dry_run: bool = False,
+def run_frontier_execute(conn=None, *, dry_run: bool = False,
                          registry: dict | None = None, now: datetime | None = None,
-                         sleep=None) -> dict:
+                         sleep=None, query_ids: set[str] | None = None) -> dict:
     """One execution pass. Never raises.
 
     The rail label goes on `run_*` and NOT on `main()` — `main()` only wraps this for the
-    `--once` child, so labelling it would miss every in-process call the MCP side makes directly."""
+    `--once` child, so labelling it would miss every in-process call the MCP side makes directly.
+
+    `query_ids` scopes the pass to just those standing queries — the add-time first pull.
+    A watchlist add runs its own new queries immediately so the user sees the first candidates
+    in the same turn, and the scope is what keeps that call proportionate: without it, one add
+    on an established store would piggyback every other due pair onto a foreground tool call.
+    None (the default, and the scheduled rail's shape) means everything.
+
+    ⚠️ IT IS ALSO THE PRODUCER OF `frontier_admit`, AND THAT CHAINING LIVES HERE — the same
+    reasoning as the rail label one paragraph up, and until 2026-09-16 it sat in `main()` where
+    that reasoning was contradicted. `sitting_tools._start_first_pull` calls this function
+    directly on a thread when a watch is added, so the add-time first pull staged its candidates
+    as `new` and queued nobody to admit them. That recovered only once the whole chain cycled
+    (`sitting_tools` → `sitting_scheduler` → here → admit), which the docstring there promised
+    for the PULL half and not for the ADMIT half. Now both doors chain.
+
+    Conditional and dry-run-aware: stage 3 fetches and embeds, so re-queueing it on a pass that
+    staged nothing is an hourly spend against an empty `new` queue."""
     load_rail_env()
     ref = now or utc_now()
     own = conn is None
     if own:
         conn = schema.connect()
     try:
-        # BEFORE any adapter is asked for anything. `dry_run` is gated too, deliberately: it skips
-        # the WRITE but still calls `adapter.search`, so it makes the same external requests this
-        # ceiling exists to bound. `force` does not bypass it either — force means "ignore the
-        # freshness floor", never "ignore the money", matching `run_bookmark_catchup`.
-        if _daily_budget_exhausted():
-            return _record(conn, ref, "budget_paused", dry_run=dry_run,
-                           reason=(f"today's recorded spend for this rail reached the "
-                                   f"${FRONTIER_EXECUTE_DAILY_USD:.2f} daily frontier-execute "
-                                   f"ceiling. It resets at UTC midnight."))
-        if (reason := models_unroutable(RAIL)) is not None:
-            return _record(conn, ref, "models_unroutable", dry_run=dry_run, reason=reason)
-        return _run(conn, force=force, dry_run=dry_run,
-                    registry=registry if registry is not None else adapters(), ref=ref,
-                    sleep=sleep or _default_sleep)
+        res = _run(conn, dry_run=dry_run,
+                   registry=registry if registry is not None else adapters(), ref=ref,
+                   sleep=sleep or _default_sleep, query_ids=query_ids)
+        # Queued AFTER the pass, so the rows are committed before the successor can be claimed;
+        # the worker never runs two rails for one home at once, so under the worker
+        # `frontier_admit` waits for this process to exit either way.
+        if not dry_run and res.get("candidates_new", 0) > 0:
+            from pipeline.kb.rail_jobs import request_now
+            request_now("frontier_admit")
+        return res
     except Exception as e:
         detail = f"{type(e).__name__}: {e}"
         log(f"[frontier-exec] run errored: {detail}")
@@ -258,8 +242,13 @@ def run_frontier_execute(conn=None, *, force: bool = False, dry_run: bool = Fals
             conn.close()
 
 
-def _run(conn, *, force: bool, dry_run: bool, registry: dict, ref: datetime, sleep) -> dict:
+def _run(conn, *, dry_run: bool, registry: dict, ref: datetime, sleep,
+         query_ids: set[str] | None = None) -> dict:
     queries = fq.active_queries(conn)
+    if query_ids is not None:
+        # Filtered AFTER active_queries, never by its own SQL: a retired or unknown id scopes
+        # to nothing rather than resurrecting a row the human-retirement rule protects.
+        queries = [q for q in queries if q["query_id"] in query_ids]
     if not queries:
         return _record(conn, ref, "skipped", reason="no active standing queries")
 
@@ -274,8 +263,8 @@ def _run(conn, *, force: bool, dry_run: bool, registry: dict, ref: datetime, sle
                             stamp=False, now=ref)
                 continue
             row = get_pair(conn, q["query_id"], source)
-            if force or is_due(row, source, query_id=q["query_id"],
-                               miss_count=q["miss_count"], now=ref):
+            if is_due(row, source, query_id=q["query_id"],
+                       miss_count=q["miss_count"], now=ref):
                 due.append((q, source, row))
 
     # Stalest first, so the request budget delays everyone in turn rather than starving whichever
@@ -332,9 +321,8 @@ def _run(conn, *, force: bool, dry_run: bool, registry: dict, ref: datetime, sle
             else:
                 seen_total += 1
         conn.commit()
-        newest = max((c.published for c in found if c.published), default=None)
         record_pull(conn, q["query_id"], source, last_status="ok" if found else "empty",
-                    cursor_ts=newest, stamp=True, now=ref)
+                    stamp=True, now=ref)
 
     if deferred:
         # Never a silent cap: a run that quietly dropped a third of its work reads exactly like one
@@ -376,10 +364,10 @@ def _relevance_cut(found: list) -> tuple[list, int]:
 
 
 def _lookback_floor(adapter, since: datetime, now: datetime) -> datetime:
-    """Reach further back than the cursor when a SOURCE cannot window on its own index date.
+    """Reach further back than `since_for` when a SOURCE cannot window on its own index date.
 
-    The cursor asks "what appeared since we last looked", and every source answers it with the
-    only date it exposes. Where that date is PUBLICATION date and the source indexes late, the two
+    The resume point asks "what appeared since we last looked", and every source answers it with
+    the only date it exposes. Where that date is PUBLICATION date and the source indexes late, the two
     are not the same question, and the difference is a permanent silent miss — the work is
     published before the window opens and indexed after it closes. `OVERLAP_HOURS` is the wrong
     dial for this: it is hours, and this gap is weeks.
@@ -388,8 +376,8 @@ def _lookback_floor(adapter, since: datetime, now: datetime) -> datetime:
     `window_ok` still validates the window that is actually sent. An adapter that quietly widened
     the `since` it was handed is precisely the bug that assertion exists to catch.
 
-    Optional: an adapter that does not declare one is unchanged, so the cursor stays the only
-    input for every source whose window means what the loop thinks it means.
+    Optional: an adapter that does not declare one is unchanged, so `last_pulled_at` stays the
+    only input for every source whose window means what the loop thinks it means.
     """
     days = float(getattr(adapter, "min_lookback_days", 0.0) or 0.0)
     return since if days <= 0 else min(since, now - timedelta(days=days))
@@ -453,30 +441,19 @@ def _parse(stamp: str | None) -> datetime | None:
     return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d
 
 
-# ── The detached spawn ──────────────────────────────────────────────────────────
-def spawn_frontier_execute(force: bool = False, coalesce_window: float = COALESCE_DEFAULT) -> bool:
-    """Fire one execution pass as a detached, non-blocking child and return immediately.
-
-    This rail owns its spawner (mirrors `spawn_oracle_refresh`) rather than sharing one with stage
-    1, since the two fail for different reasons and need independent kill switches.
-
-    Trigger rate is not request rate: cost is bounded by the per-pair TTL, so an hourly spawn stays
-    cheap — a pass with nothing due exits after one SELECT.
-    """
-    return spawn_rail("pipeline.kb.frontier_execute", slug="frontier_exec",
-                      force=force, coalesce=coalesce_window)
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Frontier stage 2 — execute the standing queries")
     ap.add_argument("--once", action="store_true")
-    ap.add_argument("--force", action="store_true", help="ignore per-pair TTLs")
     ap.add_argument("--dry-run", action="store_true", help="search, but write no candidates")
     args = ap.parse_args(argv)
     if not args.once:
         ap.print_help()
         return 2
-    res = run_frontier_execute(force=args.force, dry_run=args.dry_run)
+    # NOTHING IS QUEUED HERE, deliberately — same rule as the rail label: `main()` only wraps
+    # `run_frontier_execute` for the `--once` child, so any side-effect placed in this body is
+    # lost by every in-process caller. The `frontier_admit` chain lives in `run_frontier_execute`;
+    # `tests/kb/test_rail_activation.py` fails any rail that puts one back inside a `main()`.
+    res = run_frontier_execute(dry_run=args.dry_run)
     print(json.dumps(res, indent=2, default=str))
     return 0 if res.get("status") in {"ok", "dry-run", "skipped"} else 1
 

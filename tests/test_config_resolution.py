@@ -96,12 +96,7 @@ def test_settings_reader_honors_resolver(sentinel_config):
 # bug before its subject was deleted.
 
 
-# ── cookies.profile — the other half of cookies.browser ─────────────────────
-#
-# `cookie_browser()` resolved through settings.yaml while the PROFILE resolved through
-# $X_CHROME_PROFILE only. Two halves of one choice, persisted in two different places, and
-# only one of them survived a reboot. `onboard` needs somewhere durable to write the user's
-# pick, so `cookie_profile()` mirrors `cookie_browser()` exactly.
+# ── cookies.profile — optional generic browser-profile fallback ─────────────
 
 def _settings_with(tmp_path, monkeypatch, cookies: dict):
     """Write a settings.yaml carrying a `cookies:` block and make it the active config.
@@ -114,21 +109,19 @@ def _settings_with(tmp_path, monkeypatch, cookies: dict):
 
 
 def test_cookie_profile_reads_settings(monkeypatch, tmp_path):
-    monkeypatch.delenv("X_CHROME_PROFILE", raising=False)
     _settings_with(tmp_path, monkeypatch, {"browser": "chrome", "profile": "Profile 1"})
     from opyt_core.config import cookie_profile
     assert cookie_profile() == "Profile 1"
 
 
-def test_cookie_profile_env_overrides_settings(monkeypatch, tmp_path):
+def test_cookie_profile_ignores_retired_x_env(monkeypatch, tmp_path):
     _settings_with(tmp_path, monkeypatch, {"profile": "Profile 1"})
-    monkeypatch.setenv("X_CHROME_PROFILE", "Profile 2")
+    monkeypatch.setenv("X_" + "CHROME_PROFILE", "Profile 2")
     from opyt_core.config import cookie_profile
-    assert cookie_profile() == "Profile 2"
+    assert cookie_profile() == "Profile 1"
 
 
 def test_cookie_profile_absent_is_none(monkeypatch, tmp_path):
-    monkeypatch.delenv("X_CHROME_PROFILE", raising=False)
     _settings_with(tmp_path, monkeypatch, {"browser": "auto"})
     from opyt_core.config import cookie_profile
     assert cookie_profile() is None

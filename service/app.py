@@ -1,4 +1,4 @@
-"""service/app.py — the HTTP surface: three read endpoints, an upload, and three credential ones.
+"""service/app.py — the HTTP surface for knowledge-base reads, publication, access, and stats.
 
 A THIN ADAPTER, NOT A SECOND IMPLEMENTATION. Each read handler authenticates, clamps, and then
 calls the exact function a local reader calls against a registered peer —
@@ -310,6 +310,14 @@ def aggregate(owner: str, body: AggregateBody,
     # that can never fire would be a cap in name only. The bound is asserted at this boundary
     # instead — see tests/service/test_caps.py — so a future edit that raises those LIMITs has to
     # decide about this endpoint rather than silently widening it.
+    #
+    # `sample` IS NOT FORWARDED, and its absence is a decision. `kb_aggregate(sample=N)` returns
+    # `corpus_sample`, a spread of up to 500 raw descriptions for a host to read and name
+    # subjects from — that is a question about YOUR OWN corpus ("what have I been collecting"),
+    # and it is the one key here that is not a bounded count. Serving it would put the largest
+    # payload on this surface in aid of a question nobody asks of a peer, and `_attach_suggestions`
+    # already refuses to advise a reader about atoms they do not hold, for the same reason. A
+    # reader who genuinely wants a peer's subject matter can `search` that peer directly.
     envelope = kb_entry.kb_aggregate(scope=body.scope, kb=owner, as_kb=body.as_kb)
     store.record_usage(owner, auth["token_sha256"], "aggregate")
     return envelope
@@ -407,8 +415,8 @@ def grant(body: GrantBody, auth: dict = Depends(_owner_token)) -> dict:
 @app.post("/v1/redeem")
 def redeem(body: RedeemBody) -> dict:
     """Exchange a code for a reader token. THE REAL CLIENT ENTRY POINT: on redemption the client
-    writes its own peer row from what comes back here — `share_tools.accept` in an assistant, or
-    `opyt-redeem` from a terminal.
+    writes its own peer row from what comes back here. `mcp_server/share_tools.accept` is the one
+    client that does so; `opyt-redeem` did too until it was deleted on 2026-09-05.
 
     `owner` is the ROUTING key — opaque, in the URL path, and not something anybody would type.
     `suggested_name` is what the owner called themselves, and it is what the client registers the

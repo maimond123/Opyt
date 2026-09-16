@@ -1,5 +1,5 @@
 {
- "_README": "Frozen 2026-08-30, the last day twitterapi.io existed in this repo. graphql_raw = raw UserTweets result nodes; twitterapi_expected = the 8-field probe of what twitterapi.io answered for the SAME tweets. The test replays the former through x_graphql._normalize and asserts it reproduces the latter, so the parity claim stays checkable with no network and no import of the dead vendor.",
+ "_README": "Frozen 2026-08-30, the last day twitterapi.io existed in this repo. graphql_raw = raw UserTweets result nodes; twitterapi_expected = the 8-field probe of what twitterapi.io answered for the SAME tweets. The test replays the former through x_graphql_core.normalize and asserts it reproduces the latter, so the parity claim stays checkable with no network and no import of the dead vendor.",
  "account": "hypersoren",
  "captured_at": "2026-08-30",
  "fields": [

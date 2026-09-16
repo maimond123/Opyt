@@ -66,11 +66,18 @@ from opyt_core.paths import opyt_path
 # for a stranger to actually have access.
 _TOKEN_BYTES = 32
 
-# A GRANT CODE IS THE ONE CREDENTIAL A PERSON RETYPES INTO A SHELL — `opyt-redeem <url> <code>` —
-# so its alphabet is letters and digits only, where a token's is `secrets.token_urlsafe`'s
-# `-`/`_` included. That is not cosmetic: `token_urlsafe` starts a code with `-` about one time in
-# 64, and argparse reads a leading `-` as an option, so roughly 1.6% of codes were unusable and
-# answered with a usage error naming the wrong problem. Found as a 1-in-64 test flake, 2026-08-27.
+# A GRANT CODE'S ALPHABET IS LETTERS AND DIGITS ONLY, where a token's is `secrets.token_urlsafe`'s
+# `-`/`_` included. `share_tools._CODE` is what depends on it now:
+# `(?<![A-Za-z0-9])([A-Za-z0-9]{43})(?![A-Za-z0-9])` is how `accept` finds the code inside a link,
+# a fragment or a bare paste, so a `-` or `_` in a code would make it unfindable — the invite
+# would simply not work, with no error naming why.
+#
+# The constraint was written for a different reason and outlived it. Until 2026-09-05 the code was
+# retyped into a shell as `opyt-redeem <url> <code>`, an argparse POSITIONAL, and `token_urlsafe`
+# starts a code with `-` about one time in 64 — so roughly 1.6% of codes were answered with a usage
+# error naming the wrong problem. Found as a 1-in-64 test flake, 2026-08-27. That command is gone;
+# do not relax the alphabet on the strength of that, because the regex above is stricter than
+# argparse ever was.
 # 43 characters of this alphabet is ~256 bits, the same as the tokens.
 _CODE_ALPHABET = string.ascii_letters + string.digits
 _CODE_LEN = 43
@@ -549,20 +556,6 @@ def record_usage(owner: str, reader_sha256: str, tool: str, *, zero_results: boo
             (owner, reader_sha256, tool, 1 if zero_results else 0),
         )
         conn.commit()
-    finally:
-        conn.close()
-
-
-def usage_total(owner: str, reader_sha256: str | None = None) -> int:
-    """How many reads this knowledge base has served, optionally for one reader."""
-    conn = connect()
-    try:
-        if reader_sha256 is None:
-            return conn.execute("SELECT COALESCE(SUM(n), 0) FROM usage_daily WHERE owner = ?",
-                                (owner,)).fetchone()[0]
-        return conn.execute(
-            "SELECT COALESCE(SUM(n), 0) FROM usage_daily WHERE owner = ? AND reader = ?",
-            (owner, reader_sha256)).fetchone()[0]
     finally:
         conn.close()
 

@@ -11,7 +11,6 @@ imports this module back for its re-exports, so a top-level import here would de
 
 from __future__ import annotations
 
-from pipeline import llm_spend
 from pipeline.ingestion.utils import load_yaml_config
 
 
@@ -21,25 +20,8 @@ def known_providers() -> set[str]:
     return set(llm_client._BACKENDS)
 
 
-def default_provider() -> str:
-    """The fallback provider for roles that don't name one (settings.yaml)."""
-    cfg = load_yaml_config().get("llm_backends") or {}
-    return cfg.get("default_provider", "openrouter")
-
-
-def configured_providers() -> set[str]:
-    """Every distinct provider referenced across llm_backends.roles (each role
-    defaulting to default_provider) — the set a credential check must cover."""
-    cfg = load_yaml_config().get("llm_backends") or {}
-    default = cfg.get("default_provider", "openrouter")
-    roles = cfg.get("roles") or {}
-    provs = {(r.get("provider") or default) for r in roles.values()}
-    return provs or {default}
-
-
-def _cheapest_configured_model(provider: str) -> str | None:
-    """Cheapest model (by output price) among the roles that use `provider`, so a
-    liveness ping bills the least. None if no configured role uses this provider."""
+def _configured_model(provider: str) -> str | None:
+    """A deterministic configured model for a provider liveness ping."""
     cfg = load_yaml_config().get("llm_backends") or {}
     default = cfg.get("default_provider", "openrouter")
     roles = cfg.get("roles") or {}
@@ -49,8 +31,7 @@ def _cheapest_configured_model(provider: str) -> str | None:
     }
     if not models:
         return None
-    # Unknown-priced models sort last (inf), so a priced one always wins the tie.
-    return min(models, key=lambda m: llm_spend._PRICING.get(m, (0.0, float("inf")))[1])
+    return sorted(models)[0]
 
 
 def validate_provider(provider: str, key: str | None = None, *,
@@ -65,7 +46,7 @@ def validate_provider(provider: str, key: str | None = None, *,
         backend = llm_client._get_backend(provider)  # ValueError on unknown provider
     except ValueError as e:
         return False, str(e)
-    model = model or _cheapest_configured_model(provider)
+    model = model or _configured_model(provider)
     if not model:
         return False, f"no configured model for provider {provider!r} to validate against"
 

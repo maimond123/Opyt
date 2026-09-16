@@ -28,6 +28,13 @@ def conn(kb_home):
     c.close()
 
 
+@pytest.fixture(autouse=True)
+def managed_x_session(monkeypatch):
+    """Existing Oracle-ingest tests exercise the connected-X path unless they opt out."""
+    from pipeline.ingestion import x_graphql
+    monkeypatch.setattr(x_graphql, "has_managed_x_session", lambda: True)
+
+
 class _Cfg:
     """Minimal cfg stub: state_file(name) → a tmp path. Mirrors the one in test_trust_cache.py."""
     def __init__(self, tmp_path):
@@ -49,10 +56,14 @@ def _src(stype, url, trusted, **meta):
 
 @pytest.fixture()
 def stub_footprint(monkeypatch):
-    """Offline footprint engine: the atom-KB adapters + eligibility gate become no-op recorders,
-    and discovery returns an empty source list by default (tests re-patch `_DP.discover_profile`
-    to inject sources). Targets the shared submodules, so it covers BOTH `_ingest_oracle` and the
-    `onboard_footprint` it calls."""
+    """Offline footprint engine: the atom-KB adapters + eligibility become no-op recorders, and
+    discovery returns an empty source list by default (tests re-patch `_DP.discover_profile` to
+    inject sources). Targets the shared submodules, so it covers BOTH `_ingest_oracle` and the
+    `onboard_footprint` it calls.
+
+    BOTH eligibility entry points are stubbed, not just `gate`. `oracles._multi_author_refusal`
+    calls `classify_authorship` directly — it wants the SITE verdict, not the per-run decision —
+    so a stub on `gate` alone leaves the root check reaching a real socket."""
     calls = []
 
     def mk(name):
@@ -67,6 +78,8 @@ def stub_footprint(monkeypatch):
     monkeypatch.setattr(ingest_x_footprint, "sync_x_footprint", mk("x"))
     monkeypatch.setattr(eligibility, "gate",
                         lambda conn, url, **kw: eligibility.GateDecision("ingest", "stub"))
+    monkeypatch.setattr(eligibility, "classify_authorship",
+                        lambda conn, url: eligibility.AuthorshipVerdict("single", reason="stub"))
     monkeypatch.setattr(_DP, "discover_profile", _fake_discover([]))
     return calls
 
@@ -105,7 +118,12 @@ def test_preview_unresolvable_handle_is_reported_not_written(conn, monkeypatch):
     assert schema.list_oracles(conn) == []
 
 
-def test_preview_url_reports_platform_network_free(conn):
+def test_preview_url_reports_the_platform_and_writes_nothing(conn, no_venue):
+    """Renamed 2026-09-08: this was `…_network_free`, and a URL preview is no longer that. Rooting
+    a site asks OpenAlex once whether the host is a research venue, because a preview that said
+    "blog" and then minted a 63,000-work venue would be lying on the consent surface. The
+    invariant that survives — and the one this actually tested — is that a preview WRITES
+    NOTHING."""
     blog = oracles.add_oracle(conn, None, "https://simonwillison.net", confirm=False)
     assert blog["mode"] == "new" and blog["resolved"]["platform"] == "blog"
     assert blog["resolved"]["root_entity"].startswith("blog:")
@@ -165,6 +183,265 @@ def test_ingest_routes_trusted_offx_source(conn, stub_footprint, monkeypatch):
     r = oracles._ingest_oracle(conn, object(), o)
     assert r["ingested"] >= 1
     assert {name for name, _ in stub_footprint} >= {"substack", "x"}   # off-X routed + X root pulled
+
+
+# ── the trust boundary: rejected is REPORTED, never dropped ─────────────────────
+
+def _confirmed(conn, cid="x:user:1", *, name="Carol", handle="carol"):
+    schema.upsert_entity(conn, cid, name=name, profile={"handle": handle})
+    resolve.resolve_entities(conn)
+    oracles.confirm(conn, canonical_ids=[cid])
+    return next(x for x in oracles.confirmed_oracles(conn) if x["canonical_id"] == cid)
+
+
+def test_an_untrusted_source_is_reported_for_review_not_dropped(conn, stub_footprint, monkeypatch):
+    """⚠️ FIXED 2026-09-04. `_ingest_oracle` pre-filtered the discovered sources to the trusted
+    ones before handing them to `onboard_footprint`, which owns the same trust boundary. The
+    rejects therefore reached NOTHING: not the adapters (correct) and not the report (the bug).
+    A dropped URL is invisible; a rejected one is reviewable, and the whole point of returning
+    `needs-review` is that a human can confirm what the graph could not."""
+    monkeypatch.setattr(_DP, "discover_profile", _fake_discover([
+        _src("blog", "https://maybe-carol.dev", False),
+        _src("substack", "https://maybe.substack.com", False),
+    ]))
+    r = oracles._ingest_oracle(conn, object(), _confirmed(conn))
+
+    reviewed = [x for x in r["results"] if x["action"] == "needs-review"]
+    assert {x["url"] for x in reviewed} == {"https://maybe-carol.dev", "https://maybe.substack.com"}
+    # …and still NOT ingested: the boundary moved home, it did not move.
+    assert {name for name, _ in stub_footprint} == {"x"}
+
+
+def test_an_untrusted_source_still_never_reaches_an_adapter(conn, stub_footprint, monkeypatch):
+    """The half that must not regress while fixing the half above."""
+    monkeypatch.setattr(_DP, "discover_profile",
+                        _fake_discover([_src("substack", "https://squatter.substack.com", False)]))
+    oracles._ingest_oracle(conn, object(), _confirmed(conn))
+    assert "substack" not in {name for name, _ in stub_footprint}
+
+
+def test_review_queue_adds_only_the_source_the_user_approved(conn, stub_footprint, monkeypatch):
+    """A review approval must not turn `force` into a broad re-ingest override."""
+    from pipeline.kb import oracle_reviews
+
+    oracle_reviews.record_outcomes(conn, "x:user:1", [{
+        "type": "blog", "url": "https://maybe-carol.dev", "action": "needs-review",
+        "detail": "unverified",
+    }])
+    item = oracle_reviews.list_open(conn)[0]
+    _confirmed(conn)
+
+    listed = oracles.review_sources(conn, None)
+    assert listed["items"][0]["status"] == "needs_confirmation"
+    assert listed["diagnostics"][0]["reason"] == "unverified"
+
+    preview = oracles.review_sources(conn, object(), action="add", review_id=item["review_id"])
+    assert preview["status"] == "preview"
+    assert oracle_reviews.get(conn, item["review_id"])["status"] == "pending"
+
+    added = oracles.review_sources(conn, object(), action="add", review_id=item["review_id"],
+                                   confirm=True)
+
+    assert added["status"] == "added"
+    assert oracle_reviews.get(conn, item["review_id"])["status"] == "approved"
+    blog_calls = [kw for name, kw in stub_footprint if name == "blog"]
+    assert [call["blog_url"] for call in blog_calls] == ["https://maybe-carol.dev"]
+
+    monkeypatch.setattr(_DP, "discover_profile",
+                        _fake_discover([_src("blog", "https://maybe-carol.dev", False)]))
+    oracles._ingest_oracle(conn, object(), _confirmed(conn))
+    assert [kw["blog_url"] for name, kw in stub_footprint if name == "blog"] == [
+        "https://maybe-carol.dev"]
+
+
+def test_review_dismissal_keeps_a_later_trusted_discovery_out(conn, stub_footprint, monkeypatch):
+    """"Not this person" is a user exclusion, so a later trust-cache change cannot undo it."""
+    from pipeline.kb import oracle_reviews
+
+    oracle_reviews.record_outcomes(conn, "x:user:1", [{
+        "type": "blog", "url": "https://maybe-carol.dev", "action": "needs-review",
+        "detail": "unverified",
+    }])
+    item = oracle_reviews.list_open(conn)[0]
+    _confirmed(conn)
+
+    out = oracles.review_sources(conn, object(), action="dismiss", review_id=item["review_id"],
+                                 confirm=True)
+    assert out["status"] == "dismissed"
+    monkeypatch.setattr(_DP, "discover_profile",
+                        _fake_discover([_src("blog", "https://maybe-carol.dev", True)]))
+
+    oracles._ingest_oracle(conn, object(), _confirmed(conn))
+
+    assert oracle_reviews.get(conn, item["review_id"])["status"] == "dismissed"
+    assert "blog" not in {name for name, _ in stub_footprint}
+
+
+def test_review_verification_rechecks_evidence_without_adding_source(conn, stub_footprint,
+                                                                       monkeypatch):
+    """Evidence can make a source ready, but the user still controls the actual ingestion."""
+    from pipeline.kb import oracle_reviews
+
+    oracle_reviews.record_outcomes(conn, "x:user:1", [{
+        "type": "blog", "url": "https://maybe-carol.dev", "action": "needs-review",
+        "detail": "unverified",
+    }])
+    item = oracle_reviews.list_open(conn)[0]
+    _confirmed(conn)
+    seen = {}
+
+    def rechecked(seed, seed_type="x", **kw):
+        seen.update(seed=seed, seed_type=seed_type, **kw)
+        return {"username": seed, "sources": [_src("blog", "https://maybe-carol.dev", True)]}
+
+    monkeypatch.setattr(_DP, "discover_profile", rechecked)
+    out = oracles.review_sources(conn, object(), action="verify", review_id=item["review_id"],
+                                 verification_urls=["https://carol.example/about"])
+
+    assert out["status"] == "verified"
+    assert oracle_reviews.get(conn, item["review_id"])["status"] == "verified"
+    assert seen["reverify"] is True
+    assert seen["extra_source_urls"] == ["https://maybe-carol.dev", "https://carol.example/about"]
+    assert "blog" not in {name for name, _ in stub_footprint}
+
+
+def test_forgetting_an_oracle_removes_its_review_queue(conn):
+    """Review choices belong to an active Oracle subscription, not retained profile history."""
+    from pipeline.kb import oracle_reviews
+
+    _confirmed(conn)
+    oracle_reviews.record_outcomes(conn, "x:user:1", [{
+        "type": "blog", "url": "https://maybe-carol.dev", "action": "needs-review",
+        "detail": "unverified",
+    }])
+
+    out = oracles._forget(conn, "x:user:1", confirm=True)
+
+    assert out["status"] == "forgotten"
+    assert oracle_reviews.list_open(conn) == []
+
+
+def test_review_hold_follows_an_oracle_after_its_cluster_head_changes(conn):
+    """A dismissal/pending hold cannot vanish when resolve picks a different cluster anchor."""
+    from pipeline.kb import oracle_reviews
+
+    schema.upsert_entity(conn, "x:user:1", name="Carol", profile={"handle": "carol"})
+    oracle_reviews.record_outcomes(conn, "x:user:1", [{
+        "type": "blog", "url": "https://maybe-carol.dev", "action": "needs-review",
+        "detail": "unverified",
+    }])
+    conn.execute("UPDATE entities SET canonical_id=? WHERE entity_id=?", ("blog:carol", "x:user:1"))
+
+    assert ("blog", "maybe-carol.dev") in oracle_reviews.held_source_keys(conn, "blog:carol")
+
+    oracle_reviews.record_outcomes(conn, "blog:carol", [{
+        "type": "blog", "url": "https://maybe-carol.dev", "action": "needs-review",
+        "detail": "still unverified",
+    }])
+    items = oracle_reviews.list_open(conn)
+    assert len(items) == 1 and items[0]["canonical_id"] == "blog:carol"
+
+
+def test_a_discovered_x_is_pulled_once_not_recorded_twice(conn, stub_footprint, monkeypatch):
+    """⚠️ FIXED 2026-09-04. A Substack-rooted Oracle's discovered X went to `onboard_footprint`
+    (which has no X adapter, so it recorded `unsupported`) AND to the timeline pull below (which
+    recorded `ingested`) — two contradictory rows for one handle. X is pulled, never routed."""
+    schema.upsert_entity(conn, "substack:carol", name="Carol",
+                         identity_links=["https://carol.substack.com"])
+    resolve.resolve_entities(conn)
+    oracles.confirm(conn, canonical_ids=["substack:carol"])
+    o = next(x for x in oracles.confirmed_oracles(conn) if x["canonical_id"] == "substack:carol")
+    monkeypatch.setattr(_DP, "discover_profile",
+                        _fake_discover([_src("x", "https://x.com/carolx", True)]))
+
+    r = oracles._ingest_oracle(conn, object(), o)
+
+    x_rows = [x for x in r["results"] if x["type"] == "x"]
+    assert len(x_rows) == 1 and x_rows[0]["action"] == "ingested"
+    assert "unsupported" not in {x["action"] for x in r["results"]}
+
+
+def test_substack_only_ingest_leaves_a_discovered_x_profile_optional(conn, stub_footprint,
+                                                                     monkeypatch):
+    """Discovering an X identity is not consent to pull it or schedule it for refresh."""
+    from pipeline.ingestion import x_graphql
+    from pipeline.kb import oracle_refresh_state as rst
+
+    schema.upsert_entity(conn, "substack:carol", name="Carol",
+                         identity_links=["https://carol.substack.com"])
+    resolve.resolve_entities(conn)
+    oracles.confirm(conn, canonical_ids=["substack:carol"])
+    oracle = next(o for o in oracles.confirmed_oracles(conn)
+                  if o["canonical_id"] == "substack:carol")
+    monkeypatch.setattr(_DP, "discover_profile",
+                        _fake_discover([_src("x", "https://x.com/carolx", True)]))
+    monkeypatch.setattr(x_graphql, "has_managed_x_session", lambda: False)
+    monkeypatch.setattr(ingest_x_footprint, "sync_x_footprint",
+                        lambda *a, **kw: pytest.fail("an unconnected X profile must not pull"))
+
+    result = oracles._ingest_oracle(conn, object(), oracle)
+
+    assert result["available_sources"] == [{"source_type": "x", "url": "https://x.com/carolx"}]
+    assert "x" not in {name for name, _ in stub_footprint}
+    assert all(row.source_type != "x" for row in rst.list_sources(conn))
+
+
+def test_unconnected_x_root_creates_no_x_refresh_pair(conn, stub_footprint, monkeypatch):
+    """The registry is a pull queue, so it must not retain an unconnected X root."""
+    from pipeline.ingestion import x_graphql
+    from pipeline.kb import oracle_refresh_state as rst
+
+    monkeypatch.setattr(x_graphql, "has_managed_x_session", lambda: False)
+    result = oracles._ingest_oracle(conn, object(), _confirmed(conn))
+
+    assert result["available_sources"] == [{"source_type": "x", "url": "https://x.com/carol"}]
+    assert "x" not in {name for name, _ in stub_footprint}
+    assert all(row.source_type != "x" for row in rst.list_sources(conn))
+
+
+# ── rooting refuses what it cannot root ────────────────────────────────────────
+
+@pytest.mark.parametrize("url", ["https://github.com/karpathy", "https://x.com/karpathy",
+                                 "https://twitter.com/karpathy", "https://youtube.com/@karpathy",
+                                 "https://m.youtube.com/@karpathy", "https://youtu.be/video"])
+def test_a_platform_profile_url_is_refused_not_minted_as_a_blog(conn, url):
+    """⚠️ FIXED 2026-09-04. Any non-Substack http… reference keyed on `blog:{host}`, so
+    `https://github.com/karpathy` minted `blog:github.com/karpathy` and rooted discovery on it as
+    a personal site. Worst case was an X URL: `blog:x.com/karpathy` for a person who already has
+    an `x:user:` identity, i.e. a second, permanently unmergeable copy of them."""
+    out = oracles.add_oracle(conn, object(), url, confirm=False)
+    assert "error" in out and "cannot add" in out["error"]
+    assert schema.get_entity(conn, "blog:github.com/karpathy") is None
+
+
+def test_an_x_url_says_to_pass_the_handle(conn):
+    """The refusal has to be actionable — there IS a right way to add this person."""
+    out = oracles.add_oracle(conn, object(), "https://x.com/karpathy", confirm=False)
+    assert "@handle" in out["error"]
+
+
+def test_a_real_personal_site_is_still_rootable(conn, no_venue):
+    """The guard names four platform hosts; everything else keeps working — including after the
+    venue branch went in front of the blog fallthrough."""
+    out = oracles.add_oracle(conn, object(), "https://simonwillison.net", confirm=False)
+    assert out["resolved"]["platform"] == "blog"
+
+
+# ── the X window refuses rather than falling through ──────────────────────────
+
+@pytest.mark.parametrize("preset", ["1y", "6m", "2years", "all"])
+def test_an_unknown_x_preset_raises_rather_than_buying_183_days(preset):
+    """⚠️ FIXED 2026-09-04. `X_LOOKBACK_PRESETS.get(preset)` returned None for a typo, and on the
+    X selector None means the adapter's own 183-day default — so `x_lookback='1y'` silently
+    bought the WIDEST pull available. The host supplies this string, so a typo is one call away.
+    Same argument the `since_last` refusal was built on, applied to the same failure."""
+    with pytest.raises(ValueError, match="unknown x_lookback"):
+        oracles._x_since(preset)
+
+
+def test_the_real_presets_still_resolve():
+    assert oracles._x_since(None) is None                    # unset = the adapter's own default
+    assert oracles._x_since("6mo") is not None
 
 
 # ── the trust cache: production OWNS its entries ─────────────────────────────────
@@ -315,7 +592,7 @@ def test_no_followup_when_there_was_nothing_to_discover(conn, stub_footprint):
 def test_discover_profile_marks_a_cache_hit(tmp_path, monkeypatch):
     """`from_cache` is the signal the followup gate reads, so it has to actually be set."""
     cfg = _Cfg(tmp_path)
-    snap = _DP._x_snapshot_hash("Alice", [])
+    snap = _DP._snapshot_hash("Alice", ["x.com/alice"])
     _DP._save_cached_trust("alice", snap, {"username": "alice", "sources": []}, cfg)
     got = _DP._get_cached_trust("alice", snap, cfg)
     assert got is not None and "from_cache" not in got, "the STORED copy must stay clean"
@@ -419,14 +696,14 @@ def test_since_last_refuses_rather_than_falling_back_to_183_days(conn, stub_foot
     monkeypatch.setattr(oracles, "_fetch_x_identity", lambda h: _x_ident("9", "zed"))
     oracles.add_oracle(conn, object(), "@zed", confirm=True, x_lookback="6mo")
     cid = schema.current_canonical(conn, "x:user:9")
-    # Reaching "no basis" takes THREE clears, and that difficulty is itself the good news: a
-    # confirmed Oracle almost always carries either a coverage marker or atoms, so this refusal is
-    # a rare edge. It is tested anyway because the cost of getting it wrong is a 183-day pull.
-    #   1. the pair's own stamp, 2. its corpus-derived cursor, and
-    #   3. `oracles.ingest_to` — which `upsert_source` COALESCEs back in on the next re-seed.
+    # Reaching "no basis" takes TWO clears, and that difficulty is itself the good news: a
+    # confirmed Oracle almost always carries either a pull stamp or atoms, so this refusal is a
+    # rare edge. It is tested anyway because the cost of getting it wrong is a 183-day pull.
+    #   1. the pair's own stamp, and 2. its corpus-derived cursor.
+    # There used to be a third — `oracles.ingest_to`, which `upsert_source` COALESCEd back in on
+    # the next re-seed. That column is gone; coverage is per-pair now and nothing re-seeds it.
     from pipeline.kb import oracle_refresh_state as rst
     rst.seed_from_entities(conn, canonical_ids=[cid])
-    conn.execute("UPDATE oracles SET ingest_to=NULL WHERE canonical_id=?", (cid,))
     cleared = conn.execute("UPDATE oracle_sources SET last_pulled_at=NULL, cursor_ts=NULL "
                            "WHERE canonical_id=? AND source_type='x'", (cid,)).rowcount
     conn.commit()
@@ -497,29 +774,114 @@ def test_the_report_matches_the_datetimes_actually_passed(conn, stub_footprint, 
     assert out["lookback"]["web_since"] == web_kw["since"].isoformat()
 
 
-def test_ingest_records_the_window_it_covered_on_the_oracle_row(conn, stub_footprint, monkeypatch):
-    """`ingest_from`/`ingest_to` stop being inert: they record what a run actually covered so a
-    re-ingest knows what was already paid for. `ingest_from` is the LATER of the two windows —
-    the point from which BOTH pulls are complete — so an unbounded archive walk can never vouch
-    for a 6-month X pull."""
+def _pair(conn, cid, source_type):
+    from pipeline.kb import oracle_refresh_state as rst
+    return next(r for r in rst.list_sources(conn, canonical_ids=[cid])
+                if r.source_type == source_type)
+
+
+def test_ingest_records_what_each_source_covered(conn, stub_footprint, monkeypatch):
+    """Coverage is recorded PER SOURCE, on the `oracle_sources` row, because sources are pulled
+    independently and fail independently. `covered_from` is the backward frontier and widens only.
+    (The web pair's own stamp needs a real adapter to mint its entity — see
+    `test_coverage_joins_a_result_url_back_to_its_registered_pair`, which builds the cluster.)"""
     monkeypatch.setattr(_DP, "discover_profile",
                         _fake_discover([_src("substack", "https://nia.substack.com", True)]))
     monkeypatch.setattr(oracles, "_fetch_x_identity", lambda h: _x_ident("7", "nia"))
     oracles.add_oracle(conn, object(), "@nia", confirm=True,
                        x_lookback="6mo", web_lookback="all")
 
-    row = next(r for r in schema.list_oracles(conn) if r["canonical_id"] == "x:user:7")
-    assert _days_ago(row["ingest_from"]) == pytest.approx(183, abs=1)   # X's window, not the archive's
-    assert _days_ago(row["ingest_to"]) == pytest.approx(0, abs=1)
+    assert _days_ago(_pair(conn, "x:user:7", "x").covered_from) == pytest.approx(183, abs=1)
+    assert _pair(conn, "x:user:7", "x").last_pulled_at is not None
 
     # A LATER, WIDER run widens the record; it must never shrink back to the narrower window.
     oracles.add_oracle(conn, object(), "@nia", confirm=True, x_lookback="2yr", web_lookback="all")
-    row = next(r for r in schema.list_oracles(conn) if r["canonical_id"] == "x:user:7")
-    assert _days_ago(row["ingest_from"]) == pytest.approx(730, abs=1)
+    assert _days_ago(_pair(conn, "x:user:7", "x").covered_from) == pytest.approx(730, abs=1)
 
     oracles.add_oracle(conn, object(), "@nia", confirm=True, x_lookback="6mo", web_lookback="all")
-    row = next(r for r in schema.list_oracles(conn) if r["canonical_id"] == "x:user:7")
-    assert _days_ago(row["ingest_from"]) == pytest.approx(730, abs=1)   # still the wider coverage
+    assert _days_ago(_pair(conn, "x:user:7", "x").covered_from) == pytest.approx(730, abs=1)
+
+
+def test_coverage_joins_a_result_url_back_to_its_registered_pair(conn):
+    """The join is DERIVED, not string-matched: an ingest reports outcomes per URL, the registry
+    keys pairs off entity ids, and `derive.blog_entity_id` is what makes the two meet. A miss
+    would leave the pair unstamped — safe, but it re-pulls a blog every session, and blog is the
+    one source type whose spend scales with how often we poll."""
+    from datetime import datetime, timedelta, timezone
+    from pipeline.kb import oracle_refresh_state as rst
+
+    now = datetime.now(timezone.utc)
+
+    schema.upsert_entity(conn, "x:user:1", name="Will", profile={"handle": "willccbb"},
+                         identity_links=["https://willcb.com", "https://github.com/willccbb"])
+    schema.upsert_entity(conn, "blog:willcb.com", name="Will",
+                         identity_links=["https://willcb.com"])
+    schema.set_canonical_ids(conn, {"x:user:1": "x:user:1", "blog:willcb.com": "x:user:1"})
+    schema.upsert_oracle(conn, "x:user:1", name="Will")
+    rst.seed_from_entities(conn, canonical_ids=["x:user:1"])
+
+    web_since = now - timedelta(days=365)
+    oracles._record_coverage(conn, "x:user:1", [
+        # A trailing slash and a scheme the registry never stored — the derivation absorbs both.
+        {"url": "http://willcb.com/", "type": "blog", "action": "ingested"},
+        {"url": "https://x.com/WillCCBB", "type": "x", "action": "ingested"},
+        {"url": "https://github.com/willccbb", "type": "github", "action": "blocked"},
+    ], x_since=now - timedelta(days=183), web_since=web_since)
+
+    assert _days_ago(_pair(conn, "x:user:1", "blog").covered_from) == pytest.approx(365, abs=1)
+    assert _days_ago(_pair(conn, "x:user:1", "x").covered_from) == pytest.approx(183, abs=1)
+    # GitHub was BLOCKED — nothing written, nothing marked seen, so nothing stamped.
+    assert _pair(conn, "x:user:1", "github").last_pulled_at is None
+
+
+def test_a_rate_limited_x_pull_defers_and_claims_nothing(conn, stub_footprint, monkeypatch):
+    """THE defect this branch exists for. A 429 mid-onboarding used to be recorded as an `error`
+    while the coverage write ran anyway, one line below the except that swallowed it — so the X
+    pair was stamped as freshly pulled with zero X atoms behind it, `is_stale` said no, and no
+    rail ever came back. The web half must still advance; the X half must stay untouched."""
+    from pipeline.ingestion import x_graphql_core as core
+
+    def _rate_limited(conn_, embedder, **kw):
+        raise core.XRateLimited("UserTweets rate-limited (429) by x.com")
+
+    monkeypatch.setattr(_DP, "discover_profile",
+                        _fake_discover([_src("substack", "https://nia.substack.com", True)]))
+    monkeypatch.setattr(oracles, "_fetch_x_identity", lambda h: _x_ident("7", "nia"))
+    monkeypatch.setattr(ingest_x_footprint, "sync_x_footprint", _rate_limited)
+
+    out = oracles.add_oracle(conn, object(), "@nia", confirm=True, x_lookback="6mo")
+
+    ingest = out.get("ingest") or out
+    x_rec = next(r for r in ingest["results"] if r["type"] == "x")
+    assert x_rec["action"] == "deferred" and x_rec["resumes"] == "next-scheduled-run"
+    assert ingest.get("errors", 0) == 0            # a rate window is the job working, not a fault
+
+    x_pair = _pair(conn, "x:user:7", "x")
+    assert x_pair.last_pulled_at is None and x_pair.covered_from is None
+    # …while the off-X half of the same run still ran and reported.
+    assert next(r for r in ingest["results"] if r["type"] == "substack")["action"] == "ingested"
+
+    # …and the recovery that was disabled now fires: infinitely stale, so it sorts first.
+    from pipeline.kb import oracle_refresh_state as rst
+    assert rst.is_stale(x_pair) and rst.staleness_hours(x_pair) == float("inf")
+
+
+def test_an_expired_x_session_requires_reconnect(conn, stub_footprint, monkeypatch):
+    """A dead connection is user action, not work the background rail can complete."""
+    from pipeline.ingestion.utils import SyncAuthError
+
+    monkeypatch.setattr(oracles, "_fetch_x_identity", lambda h: _x_ident("7", "nia"))
+    monkeypatch.setattr(ingest_x_footprint, "sync_x_footprint",
+                        lambda *a, **kw: (_ for _ in ()).throw(SyncAuthError("session expired")))
+
+    out = oracles.add_oracle(conn, object(), "@nia", confirm=True)
+
+    ingest = out["ingest"]
+    x_rec = next(r for r in ingest["results"] if r["type"] == "x")
+    assert x_rec["action"] == "needs_reconnect"
+    assert "deferred" not in ingest
+    x_pair = _pair(conn, "x:user:7", "x")
+    assert x_pair.last_pulled_at is None and x_pair.covered_from is None
 
 
 # ── Mode B (local dedup) + Mode C (canonical promote) ───────────────────────────
@@ -592,9 +954,13 @@ def test_register_exposes_both_tools():
     assert "oracle" in m.tools and "add_oracle" in m.tools
 
 
-def test_mcp_add_oracle_preview_is_network_free(kb_home):
-    """End-to-end through the registered @mcp.tool: a URL preview builds no embedder, touches no
-    network, and writes nothing — exercising the real schema.connect() under the OPYT_HOME sandbox."""
+def test_mcp_add_oracle_preview_builds_no_embedder_and_writes_nothing(kb_home, no_venue):
+    """End-to-end through the registered @mcp.tool: a URL preview builds no embedder and writes
+    nothing — exercising the real schema.connect() under the OPYT_HOME sandbox.
+
+    It DOES make one free OpenAlex call now (the venue check), which is why `no_venue` is here.
+    The embedder is the expensive half: it needs an API key and a model load, and a preview that
+    built one would pay for a pull it is not making."""
     from mcp_server.oracle_tools import register_oracle_tools
     m = _FakeMCP()
     register_oracle_tools(m)

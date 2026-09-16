@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from pipeline.kb import frontier_admit as fa
+from pipeline.kb import rail_runtime
 from pipeline.kb import schema
 
 _SEEN = "2026-08-10T00:00:00+00:00"
@@ -265,59 +266,6 @@ def test_requeue_can_be_narrowed_to_one_reason(conn, monkeypatch):
     assert _row(conn, other)["status"] == "rejected"          # a different reason, left alone
 
 
-# ── The spawn ───────────────────────────────────────────────────────────────────
-@pytest.fixture()
-def spawn_env(tmp_path, monkeypatch):
-    monkeypatch.delenv("OPYT_NO_FRONTIER_ADMIT", raising=False)
-    monkeypatch.setenv("OPYT_FRONTIER_ADMIT_STAMP", str(tmp_path / "stamp"))
-    monkeypatch.setenv("OPYT_FRONTIER_ADMIT_LOG", str(tmp_path / "admit.log"))
-    calls: list = []
-    monkeypatch.setattr(fa.subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
-    return calls
-
-
-def test_the_spawn_is_detached_and_never_writes_to_stdout(spawn_env):
-    """The server's stdout IS the JSON-RPC channel, so an inherited handle corrupts the protocol."""
-    from pathlib import Path
-    assert fa.spawn_frontier_admit() is True
-    cmd, kw = spawn_env[0]
-    assert cmd[1:] == ["-m", "pipeline.kb.frontier_admit", "--once"]
-    assert kw["stdout"] is kw["stderr"] and kw["stdout"] is not None
-    assert kw["stdin"] == fa.subprocess.DEVNULL
-    assert kw["start_new_session"] is True
-    assert (Path(kw["cwd"]) / "pipeline" / "kb").is_dir()
-
-
-def test_the_kill_switch_stops_stage_three_without_touching_stage_two(spawn_env, monkeypatch):
-    """Each rail owns its switch. Stage 2 fails on a flaky upstream index and stage 3 on a PDF
-    fetch or an embed, so either must be disableable alone."""
-    monkeypatch.setenv("OPYT_NO_FRONTIER_ADMIT", "1")
-    assert fa.spawn_frontier_admit(force=True) is False
-    assert spawn_env == []
-
-
-def test_the_coalesce_window_stops_every_session_firing_a_pass(spawn_env):
-    assert fa.spawn_frontier_admit() is True
-    assert fa.spawn_frontier_admit() is False
-    assert fa.spawn_frontier_admit(force=True) is True
-    assert len(spawn_env) == 2
-
-
-def test_a_broken_spawn_is_swallowed_rather_than_raised(spawn_env, monkeypatch):
-    """It is called from the MCP server's startup path — a hiccup must never stop it serving."""
-    def _boom(*a, **kw):
-        raise OSError("no fork for you")
-    monkeypatch.setattr(fa.subprocess, "Popen", _boom)
-    assert fa.spawn_frontier_admit(force=True) is False
-
-
-def test_the_server_wires_the_spawner():
-    """Stage 3 in its OWN try/except beside the others — never a tail of stage 2."""
-    from pathlib import Path
-    src = (Path(__file__).resolve().parents[2] / "mcp_server" / "server.py").read_text()
-    assert "spawn_frontier_admit" in src
-
-
 # ── The finder/minter split ─────────────────────────────────────────────────────
 def test_a_new_paper_finder_needs_no_arm_of_its_own(conn, monkeypatch):
     """WHAT THE SPLIT BOUGHT, asserted as behaviour rather than as shape. `openalex` appears
@@ -378,7 +326,46 @@ def test_the_minter_is_handed_the_metadata_stage_two_already_collected(conn, mon
     assert _row(conn, cid)["status"] == "materialized"
     assert seen["title"] == "Earned Trust"
     assert seen["abstract"] == "A study of verifiable disclosure."
-    # Name only. An OpenAlex author id is not a Semantic Scholar one, and `derive_paper` reads
-    # `authorId` to mint `who_id = scholar:{id}` — supplying one would assert an identity that
-    # does not exist, so the honest `paper-authors:{id}` placeholder is the right outcome.
+    # Name only, and the `list[str]` payload above is the PRE-2026-09-08 shape — this doubles as
+    # the proof that rows staged before the author id landed still read, since a candidate payload
+    # is frozen at stage-2 write time and 118 such rows were in the live queue that day.
     assert seen["authors"] == [{"name": "A. Person"}]
+
+
+def test_the_openalex_author_id_reaches_the_minter_but_never_as_a_scholar_id(conn, monkeypatch):
+    """The whole point of carrying `author.id`: without it the only route back to a PERSON is a
+    `display_name` search, which returned 16 people for "Frances Arnold" on 2026-09-08 — one with
+    928 works and one with 2.
+
+    It rides under `openalexId`, NEVER `authorId`. `derive_paper` reads `authorId` to mint
+    `who_id = scholar:{id}`, so an OpenAlex id there would assert a Semantic Scholar identity that
+    does not exist; `who_id` must still fall to the honest `paper-authors:{id}` placeholder."""
+    import json as _json
+    cid = _candidate(conn, "openalex:W7164878913", "openalex",
+                     "https://doi.org/10.5281/zenodo.20719927",
+                     summary="A study of verifiable disclosure.",
+                     payload=_json.dumps({"authors": [
+                         {"name": "F. Arnold", "openalex_id": "A5043841592",
+                          "orcid": "0000-0002-4027-364X", "position": "middle"},
+                         {"name": "No Id Coauthor"}]}))
+    conn.execute("UPDATE frontier_candidates SET title=? WHERE candidate_id=?",
+                 ("Earned Trust", cid))
+    conn.commit()
+
+    seen = {}
+    from pipeline.kb import ingest_papers as ip
+    monkeypatch.setattr(ip, "_fetch_s2_paper",
+                        lambda lookup: (None, __import__(
+                            "pipeline.kb.ingest_common", fromlist=["x"]).FETCH_ABSENT))
+    monkeypatch.setattr(ip, "atomize_paper",
+                        lambda conn_, emb, paper, **kw: seen.update(paper) or
+                        _seed_atom(conn_, "paper:DOI:10.5281/zenodo.20719927", fa.ENTRY_MODE))
+
+    fa.run_frontier_admit(conn, embedder=object())
+
+    assert seen["authors"] == [
+        {"name": "F. Arnold", "openalexId": "A5043841592",
+         "orcid": "0000-0002-4027-364X", "position": "middle"},
+        {"name": "No Id Coauthor"}]
+    assert not any("authorId" in a for a in seen["authors"])
+    assert ip.derive.derive_paper(seen)["who_id"].startswith("paper-authors:")

@@ -35,16 +35,23 @@ store, skip-and-count fail-safe). What differs from the footprint adapters:
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
+import threading
+import time
 import unicodedata
+from datetime import date, timedelta
 from urllib.parse import urlparse
+
+import requests
 
 from . import derive, schema
 from .embed import assert_model
+from pipeline.ingestion.utils import log
 from .ingest_common import (BASIS_OBSERVED, BODY_COMPLETE, BODY_PARTIAL, FETCH_ABSENT,
                             FETCH_OK, FETCH_UNDETERMINED, body_fields, promote_atom,
-                            snapshot_and_hash, submit_atom)
+                            snapshot_and_hash, store_atom, submit_atom)
 
 # Where `paper_from_url` records whether the S2 metadata fetch ANSWERED or was BLOCKED. Carried on
 # the Paper dict rather than returned alongside it, because the Paper is what crosses every seam
@@ -81,6 +88,21 @@ _S2_FIELDS = ("title,abstract,year,url,externalIds,citationCount,"
 # and one shared header dict is exactly how that leak happens.
 _PDF_UA = {"User-Agent": "opyt-paper-adapter/1.0"}
 
+# S2 RETRY. Unauthenticated S2 is one shared pool, so a 429 says the POOL is busy, not that this
+# caller is over a quota — and the contention is time-varying, measured 2026-09-09 on the same
+# endpoint minutes apart: a 20-request burst took 16 429s, and a later 12-paper batch took none.
+# One request was therefore a coin flip whose outcome is PERMANENT, because a paper that lands
+# without a title can never be repaired (policy-B dedup, `_thin_metadata_warning`).
+#
+# Retrying is free in the quiet window — no 429, no sleep, not one extra request — and in the busy
+# window it is the difference between a good atom and a permanently anonymous one. The same 30
+# papers that a single shot lost answered 30/30 when asked again at this interval.
+#
+# A FIXED interval because S2 gives nothing else to pace on: its 429 carries no `Retry-After`,
+# only `x-amzn-ErrorType: TooManyRequestsException` (measured, same date).
+_S2_RETRIES = 5
+_S2_RETRY_SLEEP = 1.5
+
 
 def _s2_headers() -> dict:
     """Semantic Scholar request headers, incl. the API key when the user set one.
@@ -106,15 +128,129 @@ def _strip_arxiv_version(arxiv_id: str) -> str:
 # 1. paper_from_url — link → Paper (the shared helper the 3 link-based sources use)
 # ══════════════════════════════════════════════════════════════════════════════════
 
-# arXiv: /abs/{id} or /pdf/{id}[.pdf]; id may contain a slash (old-style hep-th/9901001).
-_ARXIV_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(.+?)(?:\.pdf)?(?:[?#].*)?$", re.I)
-# DOI: doi.org / dx.doi.org / a raw DOI path (10.NNNN/suffix).
-_DOI_RE = re.compile(r"(?:dx\.)?doi\.org/(10\.\d{4,9}/[^\s?#]+)", re.I)
+# arXiv: /abs/{id}, /pdf/{id}[.pdf] or /html/{id}; id may contain a slash (old-style
+# hep-th/9901001). `html` is arXiv's rendered view, which it now serves by DEFAULT for recent
+# papers — so the url a reader copies out of their browser is increasingly this one, and without
+# it here `arxiv.org/html/2402.17764v1` routed to the paper adapter (the host matches) and then
+# parsed to None, which is the advertised-but-refuses shape PubMed was in until 2026-09-09.
+_ARXIV_RE = re.compile(r"arxiv\.org/(?:abs|pdf|html)/(.+?)(?:\.pdf)?(?:[?#].*)?$", re.I)
+# The same arXiv id on a READER front-end. Both mirrors put the bare id in the path and neither
+# hosts anything else paper-shaped there, so this is the id wearing a different hostname — not a
+# second paper. Restricted to the modern `YYMM.NNNNN` form on purpose: these hosts are not arXiv,
+# so the loose `.+?` above (which exists for arXiv's own legacy `hep-th/9901001` ids) would let an
+# unrelated path become a paper id. Old-style ids predate both sites.
+_ARXIV_MIRROR_RE = re.compile(
+    r"(?:huggingface\.co/papers|(?:www\.)?alphaxiv\.org/(?:abs|pdf|overview))/"
+    r"(\d{4}\.\d{4,5}(?:v\d+)?)", re.I)
+# A DOI in the url's PATH, on any host. Named `doi.org` only until 2026-09-09, which read as
+# "a raw DOI path" in this comment and was not: every publisher that prints the DOI in its own url
+# — ACS/JACS `/doi/10.1021/…`, Wiley `/doi/10.1002/…`, ACM `/doi/10.1145/…`, Springer
+# `/article/10.1007/…`, APS `/abstract/10.1103/…` — parsed to None, so `mint_artifact` returned
+# `failed` for a paper whose identity was sitting in the string.
+#
+# The leading `/` is the whole guard against a false positive, and it also keeps the doi.org form
+# matching (`https://doi.org/10.1021/x`), so this one pattern replaced two ideas rather than
+# joining them. `link_router._DOI_IN_PATH_RE` is the same shape doing the ROUTING half; both are
+# needed, because the parser never runs on a url the router sent to `article`.
+_DOI_RE = re.compile(r"/(10\.\d{4,9}/[^\s?#]+)")
+# What the pattern above over-captures. A DOI may legitimately contain slashes
+# (`10.1088/1748-9326/ab4553`), so it cannot stop at the first one — which means it also swallows
+# whatever VIEW segment the publisher appended. Measured over 250 pasted urls (2026-09-11): 5 of
+# 85 parsed DOIs came out wrong, and every wrong one resolved to NOTHING in OpenAlex while its
+# trimmed form resolved to the real paper:
+#
+#   frontiersin.org/articles/10.3389/fpsyg.2013.00863/full  -> …00863/full   -> not found
+#   degruyter.com/document/doi/10.1515/9783110769043-005/html               -> not found
+#   biorxiv.org/content/10.1101/2020.03.22.002386v1         -> …002386v1     -> not found
+#
+# That last one is the serious case: bioRxiv and medRxiv are first-class paper hosts and that IS
+# their canonical url, so the store was minting `paper:DOI:…002386v1` — a wrong id, and immutable,
+# so it would never dedup against the same preprint pasted as a clean DOI.
+_DOI_VIEW_TAIL_RE = re.compile(
+    r"/(?:full|fulltext|full-text|html|pdf|epdf|abstract|meta|references|citations|figures|"
+    r"supplemental|supplementary|summary)$", re.I)
+# bioRxiv/medRxiv put the VERSION in the url and not in the DOI — exactly the arXiv situation
+# `_strip_arxiv_version` already handles, one prefix over. `.full` and `.full.pdf` ride along.
+_BIORXIV_VER_RE = re.compile(r"v\d+(?:\.full(?:-text)?)?(?:\.pdf)?$", re.I)
+
+
+def _clean_doi(raw: str) -> str:
+    """A DOI captured out of a url path → the DOI, with the url's own decoration removed.
+
+    Trimmed repeatedly because publishers stack the suffixes (`…v1.full.pdf`). Conservative by
+    construction: only a KNOWN view word is ever removed, so a DOI that genuinely ends in an
+    unusual segment is left alone.
+    """
+    doi = (raw or "").strip().rstrip(".").rstrip("/")
+    for _ in range(3):                      # `…/v1.full.pdf` needs more than one pass
+        before = doi
+        doi = _DOI_VIEW_TAIL_RE.sub("", doi).rstrip("/")
+        if doi.lower().startswith("10.1101/"):
+            doi = _BIORXIV_VER_RE.sub("", doi)
+        if doi == before:
+            break
+    return doi
 # arXiv mints a DOI for every preprint under the 10.48550 prefix. It is an arXiv id wearing a DOI,
 # not a second paper — see the DOI branch below for why it is collapsed here.
 _ARXIV_DOI_RE = re.compile(r"10\.48550/arxiv\.(.+)$", re.I)
+# SSRN mints every paper's DOI from its own abstract id: `abstract_id=3482150` is
+# `10.2139/ssrn.3482150`. That makes this the one blocked publisher whose identity needs no
+# request — which matters because ssrn.com answers 403 to a server fetch (measured 2026-09-11,
+# identical for a browser User-Agent), so the `citation_doi` probe can never reach it.
+#
+# DERIVED, not declared, which is the line this module otherwise holds — so it was checked rather
+# than assumed (2026-09-11): 10 of 10 SSRN works sampled from OpenAlex carry a `10.2139/ssrn.*`
+# DOI, and 3 of 3 ids round-tripped through Crossref to a real SSRN paper (3482150 → "The Impact
+# of Artificial Intelligence on the Labor Market"). It is a minting SCHEME, not a guess at a
+# match, which is the same footing `_ZENODO_DOI_RE` already stands on in reverse.
+_SSRN_RE = re.compile(r"ssrn\.com/\S*?abstract(?:_id)?=(\d+)", re.I)
 # Semantic Scholar paper page: /paper/[slug/]{40-hex-hash | corpus-id-digits}.
-_S2_RE = re.compile(r"semanticscholar\.org/paper/(?:[^/]+/)?([0-9a-f]{40}|\d+)", re.I)
+_S2_RE = re.compile(
+    r"semanticscholar\.org/paper/(?:[^/]+/)?(CorpusID:\d+|[0-9a-f]{40}|\d+)", re.I)
+# PubMed: /{PMID}. The id is NOT a DOI and carries no route to one inside the string, so unlike
+# every other branch this needs a lookup — see `_pubmed_doi` for where it happens and why not here.
+_PUBMED_RE = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d{4,9})", re.I)
+# PubMed Central, on both the legacy `www.ncbi.nlm.nih.gov/pmc/articles/…` path and the
+# `pmc.ncbi.nlm.nih.gov/articles/…` host NCBI moved it to. Same E-utilities lookup as a PMID with
+# `db=pmc`, and the same reason it cannot be a string rule: the PMCID carries no route to a DOI.
+#
+# Worth its own branch because PMC is the largest open-access full-text archive in biomedicine AND
+# it answers 403 to a server fetch (measured 2026-09-11, browser User-Agent included), so the
+# `citation_doi` probe cannot rescue it the way it rescues nature.com. Before this, every PMC url
+# was refused outright.
+_PMC_RE = re.compile(r"ncbi\.nlm\.nih\.gov/(?:pmc/)?articles/(?:PMC)?(\d+)", re.I)
+# A Zenodo RECORD page. Zenodo's own api is asked for the DOI rather than deriving it from the
+# record number, and the difference is not cosmetic: `zenodo.org/records/20027463` is a CONCEPT id
+# ("all versions"), whose current version DOI is `10.5281/zenodo.20027464` — off by one — and
+# `records/3509134` (pandas) reports `10.5281/zenodo.21500199`, nowhere near it. Deriving
+# `10.5281/zenodo.{n}` would therefore mint a different atom than the same deposit's own DOI url
+# does, and papers are immutable, so that split would be permanent. One request buys the id the
+# record DECLARES.
+# Europe PMC is a second front door onto the same two ids: `/article/MED/{pmid}` and
+# `/pmc/articles/PMC{pmcid}`. No new lookup — it reuses the E-utilities calls above.
+# Europe PMC addresses an article as `/{article|abstract}/{SOURCE}/{id}`, and the SOURCE segment
+# decides who can resolve it. MED is a PMID and PMC is a PMCID — both answerable by NCBI's
+# E-utilities above. PPR is a PREPRINT, which NCBI has never heard of; only Europe PMC's own index
+# knows it, hence the separate resolver.
+#
+# The PMC pattern wanted `articles?/PMC` until 2026-09-16 and so matched only the legacy
+# `/articles/PMC123` form. Europe PMC's actual url is `/article/PMC/PMC7096066` — source segment,
+# THEN the id — which the old shape could not match at any position, so their own PMC view fell
+# through to the blog ingester (measured 2026-09-16, and invisible because the host answers 403 to
+# the `citation_doi` probe, so nothing ever contradicted the mis-route).
+_EUROPEPMC_PMID_RE = re.compile(r"europepmc\.org/(?:article|abstract)/MED/(\d{4,9})", re.I)
+_EUROPEPMC_PMC_RE = re.compile(
+    r"europepmc\.org/(?:article|abstract)/PMC/PMC(\d+)|europepmc\.org/articles?/PMC(\d+)", re.I)
+_EUROPEPMC_PPR_RE = re.compile(r"europepmc\.org/(?:article|abstract)/PPR/(PPR\d+)", re.I)
+_EUROPEPMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+# An OpenAlex work page. The id names the work outright, so one call gives its DOI.
+_OPENALEX_WORK_RE = re.compile(r"openalex\.org/(W\d+)", re.I)
+_ZENODO_RECORD_RE = re.compile(r"zenodo\.org/records?/(\d+)", re.I)
+_ZENODO_API = "https://zenodo.org/api/records"
+
+# NCBI E-utilities. Keyless, and the free tier is documented at 3 requests/second — well past
+# anything one deposit at a time approaches.
+_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 # OpenReview: /forum?id=X or /pdf?id=X.
 _OPENREVIEW_RE = re.compile(r"openreview\.net/(?:forum|pdf)\?id=([^\s&#]+)", re.I)
 
@@ -139,9 +275,18 @@ def _parse_paper_url(url: str, *, content_type: str | None = None) -> dict | Non
         return {"paperId": f"arXiv:{aid}", "externalIds": {"ArXiv": aid}, "url": u,
                 "s2_lookup": f"arXiv:{aid}"}
 
+    m = _ARXIV_MIRROR_RE.search(u)
+    if m:
+        # The reader front-ends. Deliberately identical to the branch above — the whole point is
+        # that a Hugging Face papers link and an arxiv.org link are ONE atom — and the user's own
+        # url is still what gets stored, as every other branch keeps theirs.
+        aid = _strip_arxiv_version(m.group(1))
+        return {"paperId": f"arXiv:{aid}", "externalIds": {"ArXiv": aid}, "url": u,
+                "s2_lookup": f"arXiv:{aid}"}
+
     m = _DOI_RE.search(u)
     if m:
-        raw = m.group(1).rstrip(".")
+        raw = _clean_doi(m.group(1))
         # An arXiv DOI resolves to the same preprint as its /abs/ page, so keying it as a DOI mints
         # a SECOND atom for a paper we already have. Collapsed HERE and not in any one adapter,
         # because this function's contract is that every link form of one paper dedups to one atom
@@ -155,6 +300,12 @@ def _parse_paper_url(url: str, *, content_type: str | None = None) -> dict | Non
             return {"paperId": f"arXiv:{aid}", "externalIds": {"ArXiv": aid}, "url": u,
                     "s2_lookup": f"arXiv:{aid}"}
         doi = raw.lower()                      # DOIs are case-insensitive → canonicalize
+        return {"paperId": f"DOI:{doi}", "externalIds": {"DOI": doi}, "url": u,
+                "s2_lookup": f"DOI:{doi}"}
+
+    m = _SSRN_RE.search(u)
+    if m:
+        doi = f"10.2139/ssrn.{m.group(1)}"
         return {"paperId": f"DOI:{doi}", "externalIds": {"DOI": doi}, "url": u,
                 "s2_lookup": f"DOI:{doi}"}
 
@@ -189,6 +340,232 @@ def _parse_paper_url(url: str, *, content_type: str | None = None) -> dict | Non
     return None
 
 
+def _eutils_doi(db: str, uid: str) -> str | None:
+    """A PubMed or PMC id → the paper's DOI, or None. ONE keyless request to NCBI E-utilities.
+
+    `db` is `"pubmed"` (a PMID) or `"pmc"` (a PMCID). One function rather than two because the
+    request, the response shape and every failure mode are identical — only the database name
+    differs, and NCBI's `articleids` list answers both the same way.
+
+    NOT in `_parse_paper_url`, and the boundary is load-bearing rather than tidy. That function is
+    pure string work, which is the whole contract `link_router.predicted_atom_id` rests on — "the
+    atom_id derivable from the url ALONE — no network, no DB" — and Hopper's free already-present
+    check reads it once per candidate link. A network call inside it would turn scanning ten search
+    results into ten round trips.
+
+    So a PubMed url answers None there, honestly, the same way a Substack post does: the id is
+    knowable, just not from the string. `paper_from_url` — which already goes to the network —
+    resolves it and re-parses as the DOI, so PubMed mints the SAME atom as the DOI, the publisher
+    url, or any other form of that paper. That shared identity is the point; a `pubmed:{pmid}` key
+    would have split one immutable paper across two atoms.
+
+    ⚠️ PubMed was advertised and broken for a MONTH, in two distinct ways, and the second one is
+    why this warning is long. From 2026-08-13 `pubmed.ncbi.nlm.nih.gov` sat in
+    `link_router._PAPER_HOSTS` with no branch here at all, so every PubMed url routed to the paper
+    adapter and returned `failed` — silent, because a failed mint writes nothing. Adding this
+    function on 2026-09-09 did NOT fix it: `mint_artifact` bailed on a paper with no url-derivable
+    id before the adapter ran, so this code was unreachable from Hopper until 2026-09-16. A
+    resolver is only half a fix; the caller has to be able to reach it.
+
+    PMC spent longer in a worse version of that state: refused outright, and unreachable by the
+    `citation_doi` probe too, because ncbi answers 403 to a server fetch (measured 2026-09-11).
+
+    Fail-safe: any failure returns None, which lands exactly on the old behaviour (unparseable →
+    `failed`) rather than on a guess.
+    """
+    from pipeline.ingestion.utils import log
+    try:
+        resp = requests.get(_EUTILS, timeout=_PDF_TIMEOUT, headers=_PDF_UA,
+                            params={"db": db, "id": uid, "retmode": "json"})
+        if resp.status_code != 200:
+            return None
+        doc = ((resp.json().get("result") or {}).get(uid)) or {}
+        for aid in (doc.get("articleids") or []):
+            if (aid.get("idtype") or "").lower() == "doi" and aid.get("value"):
+                return str(aid["value"]).strip()
+    except Exception as e:
+        log(f"[papers] {db} id {uid} DOI lookup failed: {type(e).__name__}: {e}")
+    return None
+
+
+def _zenodo_record_doi(record_id: str) -> str | None:
+    """A Zenodo record number → the DOI that record DECLARES, or None. ONE keyless request.
+
+    Asked rather than derived. `10.5281/zenodo.{record_id}` looks like a free answer and is not
+    one: a record number can be a CONCEPT id standing for every version of a deposit, whose
+    current version carries a different DOI (measured 2026-09-11 — `records/20027463` declares
+    `…20027464`, and `records/3509134` declares `…21500199`). Minting from the number would give
+    that deposit a second, permanent atom id, so the number is only ever used to ASK.
+
+    Fail-safe: any failure returns None and the url stays unparsed, exactly as before.
+    """
+    from pipeline.ingestion.utils import log
+    try:
+        resp = requests.get(f"{_ZENODO_API}/{record_id}", timeout=_PDF_TIMEOUT, headers=_PDF_UA)
+        if resp.status_code != 200:
+            return None
+        rec = resp.json()
+        doi = (rec.get("doi") or (rec.get("metadata") or {}).get("doi") or "").strip()
+        return doi or None
+    except Exception as e:
+        log(f"[papers] zenodo record {record_id} DOI lookup failed: {type(e).__name__}: {e}")
+    return None
+
+
+# One paced door onto OpenAlex for the whole paper path.
+#
+# `min_interval_s` is DECLARED on the adapter and APPLIED BY THE CALLER — `frontier_execute` and
+# `ingest_scholar_footprint` each do it themselves — and the paper path was never one of those
+# callers. It built a fresh adapter per call and fired immediately, which was survivable while the
+# only read here was a rare missing-title fallback.
+#
+# It stopped being survivable on 2026-09-11, when two more reads landed on this path. A 293-url
+# run took `api.openalex.org` to HTTP 429; the PERSISTED breaker opened; and every OpenAlex read
+# then returned None for the next 15 minutes — including `_openalex_metadata`, which had been
+# working. Stored-atom rate fell from 56% to 47% and NOTHING in the logs said why: a breaker-open
+# read is indistinguishable from "OpenAlex has never heard of this paper".
+#
+# So the interval is enforced here, once, for every read on this path. It serializes concurrent
+# callers (the X prefetch pool), which is the intent — being slower than the rate limit is the
+# only way to keep the shared breaker closed for everyone.
+_OPENALEX_GATE = threading.Lock()
+_OPENALEX_NEXT_AT = 0.0
+
+
+def _openalex_read(fn):
+    """Run one OpenAlex read on the paper path: breaker-checked, paced, and fail-safe.
+
+    `fn` takes the adapter and returns whatever it reads. Any failure — breaker open, rate limit,
+    unparseable JSON — is None, because every caller here runs inside `paper_from_url` or
+    `classify_link_deep`, neither of which may raise.
+    """
+    global _OPENALEX_NEXT_AT
+    from .frontier_sources import OpenAlexWorksAdapter
+    adapter = OpenAlexWorksAdapter()
+    # BEFORE the delay, the way `frontier_execute` does it: a host already known to be down must
+    # not also cost a second per caller to rediscover that.
+    if not adapter.available():
+        return None
+    interval = float(getattr(adapter, "min_interval_s", 0.0) or 0.0)
+    with _OPENALEX_GATE:
+        wait = _OPENALEX_NEXT_AT - time.monotonic()
+        if wait > 0:
+            time.sleep(min(wait, interval))
+        _OPENALEX_NEXT_AT = time.monotonic() + interval
+    try:
+        return fn(adapter)
+    except Exception as e:
+        # LOGGED, not swallowed. Every failure here returns None, and None is also what "OpenAlex
+        # has never heard of this paper" looks like — so without a line in the log, a spent daily
+        # budget is indistinguishable from a genuinely unknown DOI, and the store just quietly
+        # gets thinner. That is exactly the shape CLAUDE.md's fail-safe rule exists to prevent, and
+        # it is how the 2026-09-11 budget exhaustion stayed invisible until the breaker row was
+        # read by hand.
+        log(f"[papers] openalex read failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _europepmc_ppr_doi(ppr_id: str) -> str | None:
+    """A Europe PMC PREPRINT id (`PPR217527`) → the DOI it declares, or None. ONE keyless request.
+
+    A third resolver rather than a third branch of `_eutils_doi`, because NCBI is the wrong index
+    to ask: E-utilities covers PubMed and PMC, and a preprint is in neither. Europe PMC indexes
+    them itself and hands back the DOI the preprint server minted (measured 2026-09-16,
+    `PPR217527` → `10.21203/rs.3.rs-76053/v1`, a Research Square deposit), so the atom keys on the
+    same DOI a reader who followed the link would land on.
+
+    `SRC:PPR` is part of the query on purpose. Europe PMC ids are only unique WITHIN a source, and
+    an unqualified `EXT_ID` search is a different question that can answer about another database's
+    record with the same number.
+
+    Free and unmetered, unlike the OpenAlex path — worth knowing when the daily budget is the
+    binding constraint (`docs/plans/2026-09-12-paper-url-coverage-and-the-openalex-budget.md`).
+
+    Fail-safe: any failure returns None and the url stays unparsed.
+    """
+    from pipeline.ingestion.utils import log
+    try:
+        resp = requests.get(_EUROPEPMC_SEARCH, timeout=_PDF_TIMEOUT, headers=_PDF_UA,
+                            params={"query": f"EXT_ID:{ppr_id} AND SRC:PPR",
+                                    "resultType": "core", "format": "json", "pageSize": 1})
+        if resp.status_code != 200:
+            return None
+        hits = ((resp.json().get("resultList") or {}).get("result")) or []
+        return (str(hits[0].get("doi") or "").strip() or None) if hits else None
+    except Exception as e:
+        log(f"[papers] europepmc preprint {ppr_id} DOI lookup failed: {type(e).__name__}: {e}")
+    return None
+
+
+def _openalex_doi_by_url(url: str) -> str | None:
+    """A url no pattern here can read → the DOI of the paper OpenAlex says lives at that url.
+
+    THE LAST RESORT, and the one that covers the largest failure by far. Measured over 250 pasted
+    urls (2026-09-11): 96 were refused outright, and this recovers 63 of them — institutional
+    repositories (`repositorio.unal.edu.co/handle/unal/81443` is ResNet) and aggregators. Those
+    pages are not obscure papers; they are ordinary papers wearing a url we cannot read, and most
+    of them ALSO answer 403 to a fetch, so the `citation_doi` probe cannot reach them either.
+
+    What it does NOT cover is the publisher that names an article some private way. This docstring
+    listed "Elsevier's PII, MDPI's issue path" until 2026-09-16 and neither was ever true of this
+    function — asked directly, `sciencedirect.com/science/article/pii/S0092867420302294`,
+    `mdpi.com/2072-6643/13/6/1815` and `dspace.mit.edu/handle/1721.1/7582` all answered None while
+    a control url resolved in the same session.
+
+    Still a DECLARED identifier, which is the line this module holds. `locations.landing_page_url`
+    is an exact match against a string OpenAlex stores — OpenAlex asserting "this page is a copy of
+    that work" — not a bibliographic guess. The contrast is the measurement that set this rule:
+    Crossref TITLE search resolved 1 of 3 known papers on 2026-09-09 and returned a different paper
+    twice, and a wrong paper atom is immutable.
+
+    REFUSES AMBIGUITY rather than taking the top hit — the same rule `oracles._openalex_root`
+    applies to venue names. More than one work claiming a page means we cannot say which paper the
+    user meant, and guessing writes a permanent wrong answer.
+
+    Fail-safe: any failure, any ambiguity, anything without a DOI → None, and the url stays exactly
+    as unparseable as it was.
+    """
+    if not (url or "").startswith(("http://", "https://")):
+        return None
+    works = _openalex_read(lambda a: a.works_by_landing_page(url)) or []
+    dois = {d for w in works if (d := (w.get("doi") or "").replace("https://doi.org/", "").lower())}
+    if len(dois) != 1:
+        return None                      # nothing, or an ambiguity we refuse to resolve by guess
+    return dois.pop()
+
+
+def _looked_up_doi(url: str) -> str | None:
+    """A url whose identifier needs a REQUEST to become a DOI → that DOI, or None.
+
+    The three ids that name a paper without carrying a route to one inside the string. Collected
+    here so `paper_from_url` keeps ONE network-resolution branch rather than three copies of the
+    same re-parse, and so `_parse_paper_url` stays pure string work — the contract
+    `link_router.predicted_atom_id` rests on.
+    """
+    if m := _PUBMED_RE.search(url):
+        return _eutils_doi("pubmed", m.group(1))
+    if m := _PMC_RE.search(url):
+        return _eutils_doi("pmc", m.group(1))
+    if m := _EUROPEPMC_PMC_RE.search(url):
+        return _eutils_doi("pmc", m.group(1) or m.group(2))
+    if m := _EUROPEPMC_PMID_RE.search(url):
+        return _eutils_doi("pubmed", m.group(1))
+    if m := _EUROPEPMC_PPR_RE.search(url):
+        return _europepmc_ppr_doi(m.group(1))
+    if m := _ZENODO_RECORD_RE.search(url):
+        return _zenodo_record_doi(m.group(1))
+    if m := _OPENALEX_WORK_RE.search(url):
+        return _openalex_work_doi(m.group(1))
+    return None
+
+
+def _openalex_work_doi(work_id: str) -> str | None:
+    """An OpenAlex `W…` id → that work's DOI, or None. Fail-safe, like every lookup here."""
+    w = _openalex_read(lambda a: a.work_by_openalex_id(work_id))
+    doi = ((w or {}).get("doi") or "").replace("https://doi.org/", "").strip().lower()
+    return doi or None
+
+
 def _fetch_s2_paper(lookup_id: str | None) -> tuple[dict | None, str]:
     """Best-effort Semantic Scholar single-paper fetch → `(data | None, verdict)`.
 
@@ -198,24 +575,35 @@ def _fetch_s2_paper(lookup_id: str | None) -> tuple[dict | None, str]:
 
       FETCH_OK           — S2 answered. Whatever it did or did not include is the truth.
       FETCH_ABSENT       — no lookup id, or a 404. A real answer; retrying changes nothing.
-      FETCH_UNDETERMINED — 429 / any other status / transport failure. We were STOPPED.
+      FETCH_UNDETERMINED — 429 / any other status / transport failure, after `_S2_RETRIES`
+                           attempts. We were STOPPED.
+
+    RETRIED, and only the undetermined case is. A 404 is an ANSWER — S2 has no record of this
+    paper, and asking again returns the same 404 while spending a request from the pool everyone
+    shares. Retrying it would make the busy window worse for the calls that can actually be
+    rescued. See `_S2_RETRIES` for the measurement the interval comes from.
 
     Still never raises: the enrichment itself stays a bonus (fail-safe).
     """
     if not lookup_id:
         return None, FETCH_ABSENT
-    try:
-        import requests
-        resp = requests.get(f"{_S2_BASE}/paper/{lookup_id}", params={"fields": _S2_FIELDS},
-                            timeout=_PDF_TIMEOUT, headers=_s2_headers())
-        if resp.status_code == 404:
-            return None, FETCH_ABSENT           # S2 genuinely has no record of this paper
-        if resp.status_code != 200:
-            return None, FETCH_UNDETERMINED     # 429 above all — we were throttled, not answered
-        data = resp.json()
-        return (data, FETCH_OK) if isinstance(data, dict) else (None, FETCH_UNDETERMINED)
-    except Exception:
-        return None, FETCH_UNDETERMINED         # transport failure — indistinguishable from a block
+    for attempt in range(_S2_RETRIES):
+        try:
+            resp = requests.get(f"{_S2_BASE}/paper/{lookup_id}", params={"fields": _S2_FIELDS},
+                                timeout=_PDF_TIMEOUT, headers=_s2_headers())
+            if resp.status_code == 404:
+                return None, FETCH_ABSENT       # S2 genuinely has no record of this paper
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    return data, FETCH_OK
+        except Exception:
+            pass                                # transport failure — indistinguishable from a block
+        # Sleep only BETWEEN attempts, never after the last one: a caller that is going to be told
+        # UNDETERMINED anyway must not also be made to wait for the privilege.
+        if attempt + 1 < _S2_RETRIES:
+            time.sleep(_S2_RETRY_SLEEP)
+    return None, FETCH_UNDETERMINED             # 429 above all — we were throttled, not answered
 
 
 def _merge_paper(minimal: dict, rich: dict) -> dict:
@@ -238,11 +626,101 @@ def _merge_paper(minimal: dict, rich: dict) -> dict:
     return out
 
 
-# Zenodo mints every deposit under this prefix; the digits are the RECORD id, which is all its
-# api needs. Zenodo is reached because it is KEYLESS — no email, no token, no setup asked of the
-# user, which is exactly what disqualified Unpaywall as a general answer.
+def _needs_body(paper: dict) -> bool:
+    """Would `atomize_paper` refuse this paper for having nothing to read?
+
+    The metadata resolvers' gate. Deliberately the SAME question the atomizer asks — "is there a
+    body?" — rather than "is there a title?", because a title with no abstract is dropped just as
+    completely as a blank paper and reads, from the gate's side, like a paper that needs nothing.
+    Full text is not consulted: no PDF has been fetched this early, and an abstract is what makes
+    the difference between an atom and a skip when none resolves.
+    """
+    return not (paper.get("title") or "").strip() or not (paper.get("abstract") or "").strip()
+
+
+def _fill_gaps(paper: dict, extra: dict | None) -> None:
+    """Merge a resolver's fields into the paper, filling ONLY what the paper lacks. Mutates.
+
+    Not `paper.update(extra)`, which the missing-title gate could afford and this one cannot: a
+    paper reaching here now usually HAS a title and authors from S2, and an overwrite would swap
+    S2's authors — carrying `authorId`, which is what mints `who_id = scholar:{id}` — for
+    OpenAlex's, which carry `openalexId` and cannot. The fix would be silent and would only show
+    up as papers quietly losing their author identity.
+    """
+    for k, v in (extra or {}).items():
+        if not paper.get(k):
+            paper[k] = v
+
+
+def _openalex_metadata(paper: dict) -> dict | None:
+    """A DOI → OpenAlex's record of that work, in the S2 field names, or None.
+
+    WHY, MEASURED 2026-09-11. Paste a days-old ACS or RSC article and S2 has not indexed it yet:
+    the DOI parses perfectly, every other field comes back empty, and `atomize_paper`'s no-body
+    skip correctly refuses to freeze a contentless atom — so NOTHING is stored. Of 7 such DOIs S2
+    could not resolve, OpenAlex had title and abstract for 7. The gap is indexing LAG plus whole
+    classes of source S2 does not carry (it resolved 1 of 15 OpenAlex DOIs on 2026-08-26 — Zenodo,
+    institutional repositories).
+
+    Gated on a missing title by its caller, which is the whole cost story: over 12 DOIs S2 DID
+    resolve, OpenAlex added a pdf S2 lacked in 0 of them. A paper S2 answers for gains nothing
+    here, so the common path must never pay for the request.
+
+    METADATA ONLY — never `paperId`, `externalIds` or `url`. OpenAlex will happily report that a
+    JACS paper also exists on arXiv; writing that into `externalIds.ArXiv` would move the canonical
+    id off the DOI the user actually pasted and mint a DIFFERENT atom, which Policy B then freezes.
+    Identity is decided by `_parse_paper_url` and stays there.
+
+    The transport half is `OpenAlexWorksAdapter.work_by_doi`, so this inherits the persisted
+    breaker and the courtesy pacing that already guard `api.openalex.org`. `available()` is checked
+    FIRST: a host already known to be down must not cost a request to rediscover that.
+
+    Fail-safe: any failure returns None and `paper_from_url` returns exactly what it returns today.
+    """
+    doi = (paper.get("externalIds") or {}).get("DOI")
+    if not doi:
+        return None
+    # Imported here, not at module scope: `frontier_sources` is the frontier's own module and
+    # `ingest_papers` is imported by every paper caller, including offline ones.
+    from .frontier_sources import _abstract_from_inverted, _openalex_authors
+    work = _openalex_read(lambda a: a.work_by_doi(str(doi).strip()))
+    if not isinstance(work, dict) or not work:
+        return None
+    loc = work.get("primary_location") or {}
+    # `best_oa_location` first: the primary location can be the paywalled publisher copy, while the
+    # OA one is often the authors' own preprint. That is what recovers part of the paywall case
+    # without going near a paywall — and `_fulltext_pdf_urls` already reads this field, so the body
+    # flows on to the on-open deepen with no edit of its own.
+    pdf_url = (work.get("best_oa_location") or {}).get("pdf_url") or loc.get("pdf_url")
+    out = {
+        "title": " ".join((work.get("title") or "").split()),
+        # `[:2000]` mirrors `ingest_scholar_footprint._paper_from_work`, so an abstract reads the
+        # same however it entered the store.
+        "abstract": _abstract_from_inverted(work.get("abstract_inverted_index"))[:2000],
+        # `openalexId`, never `authorId` — `derive_paper` reads `authorId` to mint
+        # `who_id = scholar:{id}`, and an OpenAlex author id is not a Semantic Scholar one.
+        "authors": [{"name": a["name"],
+                     **({"openalexId": oid} if (oid := a.get("openalex_id")) else {}),
+                     **({"orcid": orc} if (orc := a.get("orcid")) else {}),
+                     **({"position": pos} if (pos := a.get("position")) else {})}
+                    for a in _openalex_authors(work)],
+        "publicationDate": (work.get("publication_date") or "")[:10],
+        "year": work.get("publication_year"),
+        "venue": (loc.get("source") or {}).get("display_name") or "",
+        "citationCount": work.get("cited_by_count") or 0,
+    }
+    if pdf_url:
+        out["openAccessPdf"] = {"url": pdf_url}
+    # Empties stripped, because the caller merges with `paper.update()`: a null abstract in the
+    # record must not erase an abstract a `known=` caller already supplied.
+    return {k: v for k, v in out.items() if v} or None
+
+
+# Zenodo mints every deposit under this prefix; the digits are the id its api takes. Zenodo is
+# reached because it is KEYLESS — no email, no token, no setup asked of the user, which is exactly
+# what disqualified Unpaywall as a general answer. (`_ZENODO_API` itself lives up with the url
+# patterns, since `_zenodo_record_doi` reaches it first.)
 _ZENODO_DOI_RE = re.compile(r"^10\.5281/zenodo\.(\d+)$", re.I)
-_ZENODO_API = "https://zenodo.org/api/records"
 
 
 def _zenodo_metadata(paper: dict) -> dict | None:
@@ -279,7 +757,6 @@ def _zenodo_metadata(paper: dict) -> dict | None:
     if not m:
         return None
     try:
-        import requests
         resp = requests.get(f"{_ZENODO_API}/{m.group(1)}", timeout=_PDF_TIMEOUT, headers=_PDF_UA)
         if resp.status_code != 200:
             return None
@@ -350,6 +827,20 @@ def paper_from_url(url: str, *, enrich: bool = True, content_type: str | None = 
     merge: `_merge_paper` rebuilds the dict from S2's response and would drop a key set before
     it."""
     parsed = _parse_paper_url(url, content_type=content_type)
+    if parsed is None and enrich:
+        # The ids that need a lookup to become a paper id (PubMed, PMC, a Zenodo record page).
+        # Re-parsed as the DOI so this mints the same atom every other form of the paper does; the
+        # ORIGINAL url is kept, because that is what the user actually saved and every other branch
+        # keeps theirs too.
+        #
+        # GATED ON `enrich`, which already means "may I use the network". `predicted_atom_id`
+        # passes `enrich=False` to keep Hopper's already-present pre-check free across ten search
+        # results at once, so without this gate that check would cost ten round trips. These urls
+        # therefore predict None — knowable, just not from the string, exactly like a Substack post.
+        if doi := _looked_up_doi(url or ""):
+            parsed = _parse_paper_url(f"https://doi.org/{doi}")
+            if parsed is not None:
+                parsed["url"] = url
     if parsed is None:
         return None
     paper = {"paperId": parsed["paperId"], "externalIds": dict(parsed.get("externalIds") or {}),
@@ -361,11 +852,24 @@ def paper_from_url(url: str, *, enrich: bool = True, content_type: str | None = 
         rich, verdict = _fetch_s2_paper(parsed.get("s2_lookup"))
         if rich:
             paper = _merge_paper(paper, rich)
-        # Gated on a MISSING TITLE, which is exactly the state that mints an `Untitled` atom — so
-        # the request fires only when it is the difference between a good row and a permanent bad
-        # one. A caller that supplied `known=` (frontier) or an S2 that answered both pay nothing.
-        if not (paper.get("title") or "").strip() and (extra := _zenodo_metadata(paper)):
-            paper.update(extra)
+        # Gated on a MISSING BODY, which is exactly the state `atomize_paper` refuses to write —
+        # so the request fires only when it is the difference between an atom and no atom at all.
+        # A caller that supplied `known=` (frontier) or an S2 that answered fully pays nothing.
+        #
+        # The gate read `not title` until 2026-09-11, and the two are NOT the same question. S2
+        # answers for plenty of older papers with a title and no abstract; `atomize_paper` then
+        # drops them for having no body, and the resolver that could have supplied one was never
+        # asked because a title was present. Measured over 129 pasted urls: 12 landed in exactly
+        # that state and OpenAlex held an abstract for 9 of them — LeCun's gradient-based learning
+        # paper, Tibshirani's lasso paper, the reproducibility-project paper. Cost of asking: 15%
+        # of papers that get a title lack an abstract, so that is how often the extra call fires.
+        if _needs_body(paper):
+            _fill_gaps(paper, _openalex_metadata(paper))
+        # Zenodo SECOND, and kept though OpenAlex resolved a Zenodo DOI in testing and probably
+        # subsumes it: "probably" is not the standard this repo deletes a working path on. Measure
+        # it, then delete.
+        if _needs_body(paper):
+            _fill_gaps(paper, _zenodo_metadata(paper))
     paper[_S2_VERDICT] = verdict
     return paper
 
@@ -427,7 +931,6 @@ def _fulltext_pdf_urls(paper: dict) -> list[str]:
 def _download_pdf(url: str) -> bytes | None:
     """Stream a PDF with a byte ceiling. None on any failure or a runaway size (fail-safe)."""
     try:
-        import requests
         with requests.get(url, timeout=_PDF_TIMEOUT, stream=True, headers=_PDF_UA) as resp:
             resp.raise_for_status()
             buf = bytearray()
@@ -559,7 +1062,8 @@ def resolve_fulltext(paper: dict) -> str | None:
 
     Its url list stays PURE and offline. A source S2 has never heard of reaches this with a body
     anyway, because whoever resolved the paper's METADATA also filled in `openAccessPdf` — see
-    `_zenodo_metadata`. Body discovery belongs beside metadata resolution, not here.
+    `_openalex_metadata` and `_zenodo_metadata`. Body discovery belongs beside metadata resolution,
+    not here.
 
     FILLS IN A MISSING TITLE from the PDF itself, on the Paper. That is a deliberate mutation, and
     it is the same call the module already makes for `_S2_VERDICT` (see its comment at the top):
@@ -574,7 +1078,7 @@ def resolve_fulltext(paper: dict) -> str | None:
             continue
         text = _pdf_bytes_to_text(data)
         if text:
-            # Only when nothing better is known. S2, `known=` and `_zenodo_metadata` all win.
+            # Only when nothing better is known. S2, `known=` and both metadata fallbacks win.
             if not (paper.get("title") or "").strip() and (t := _pdf_title(data)):
                 paper["title"] = t
             return text[:_PAPER_MAX_CHARS]
@@ -649,9 +1153,49 @@ def _atom_exists(conn: sqlite3.Connection, atom_id: str) -> bool:
 
 _UNSET = object()   # "no full text was supplied" — distinct from None, which means "resolved to none"
 
+# How many of one paper's authors the atom records. HEP papers carry 3,000 and a user saving one
+# is not vouching for 3,000 people; the median is 6 and the max 21 across a measured 50 works
+# (2026-09-08). A BOUND, not a defended constant — raise it if real saved papers cluster above it
+# without being hyperauthored. Matched by `frontier_sources.MAX_PAYLOAD_AUTHORS` upstream.
+MAX_ATOM_AUTHORS = 20
+
+
+def atom_authors(paper: dict) -> list[dict]:
+    """A normalized Paper's authors → the list the ATOM carries, in OPYT's own vocabulary.
+
+    The atom needs this because `who_id` records the FIRST author only, and 67 of 82 live paper
+    atoms do not even have that — they carry the `paper-authors:{paper_id}` placeholder because
+    Semantic Scholar never resolved the work. So the first author is not a usable handle on the
+    people behind a saved paper, and the coauthors reach nothing at all.
+
+    Registry ids stay under SEPARATE keys rather than one `id` field. `scholar:2081297` and
+    `openalex:A5043841592` are different namespaces over the same person and collapsing them into
+    one column would make an id unusable without also knowing which registry issued it. The ORCID
+    is the third and is not a namespace at all — it is the one identifier nobody can claim on
+    another person's behalf, so it is what those two namespaces MERGE on.
+    """
+    out = []
+    for a in (paper.get("authors") or [])[:MAX_ATOM_AUTHORS]:
+        if not isinstance(a, dict):
+            continue
+        name = (a.get("name") or "").strip()
+        if not name:
+            continue
+        rec = {"name": name}
+        if sid := a.get("authorId"):
+            rec["scholar_id"] = str(sid)
+        if oid := a.get("openalexId"):
+            rec["openalex_id"] = str(oid)
+        if orcid := a.get("orcid"):
+            rec["orcid"] = str(orcid).rsplit("/", 1)[-1]
+        if pos := a.get("position"):
+            rec["position"] = pos
+        out.append(rec)
+    return out
+
 
 def atomize_paper(conn: sqlite3.Connection, embedder, paper: dict, *,
-                  who_id: str | None = None, entry_mode: str = "author_referenced",
+                  entry_mode: str = "author_referenced",
                   seen: dict | None = None,
                   sink=None, on_written=None, fulltext=_UNSET) -> str | None:
     """Normalized Paper → ONE full-text atom. SOURCE-AGNOSTIC: the caller supplies only the bit
@@ -661,8 +1205,10 @@ def atomize_paper(conn: sqlite3.Connection, embedder, paper: dict, *,
     re-attempts). A caller that vouches must break the None ambiguity with a presence check; only
     the dedup case has an atom to point at.
 
-    `who_id` is the PAPER's own author (defaults to `derive_paper(paper)["who_id"]` —
-    `scholar:{first_author_id}`), NEVER the Oracle. Policy B: an already-present atom is skipped
+    `who_id` is the PAPER's own author, always — `derive_paper(paper)["who_id"]`, i.e.
+    `scholar:{first_author_id}` — and NEVER the Oracle. There is no override parameter: an
+    override is the one mechanism by which that invariant could be broken, and no caller
+    ever passed one. Policy B: an already-present atom is skipped
     BEFORE the paid PDF fetch + embed (papers are immutable). `seen` is a caller-threaded
     `{atom_id: raw_hash}` for batch dedup across a run; when absent, the DB is checked directly.
 
@@ -689,7 +1235,6 @@ def atomize_paper(conn: sqlite3.Connection, embedder, paper: dict, *,
 
     assert_model(conn, embedder)             # guard the store's embedding identity BEFORE any spend
     meta = derive.derive_paper(paper)
-    resolved_who = who_id or meta["who_id"]
     full_text = resolve_fulltext(paper) if fulltext is _UNSET else fulltext   # None → abstract-only
 
     # NO BODY → SKIP. No abstract and no full text means the atom would carry nothing to read,
@@ -710,27 +1255,23 @@ def atomize_paper(conn: sqlite3.Connection, embedder, paper: dict, *,
     # attempt and forces `rejected` at `frontier_admit.ADMIT_MAX_ATTEMPTS`. The hopper deposits
     # once per user action, and the footprint sweep re-fetches referenced papers regardless.
     if not full_text and not (paper.get("abstract") or "").strip():
-        from pipeline.ingestion.utils import log
         log(f"[paper] {atom_id} SKIPPED — no abstract and no full text resolved; nothing "
             f"written (s2_verdict={paper.get(_S2_VERDICT)}), will retry until the attempt cap")
         return None
 
     md = paper_to_markdown_full(paper, full_text)
 
-    decided = snapshot_and_hash("paper", atom_id, md, seen if seen is not None else {})
-    if decided is None:                      # unchanged snapshot (immutable → unreachable) — honor seam
-        return None
-    raw_ref, raw_hash = decided
+    raw_ref, raw_hash = snapshot_and_hash("paper", atom_id, md, seen if seen is not None else {})
 
     # Register the paper's own author as an entity (display name only — no identity_links, since
     # an S2 author id has nothing to merge on; unlike a blog home, it does not unify with an Oracle).
-    schema.upsert_entity(conn, resolved_who, name=meta["who_name"])
+    schema.upsert_entity(conn, meta["who_id"], name=meta["who_name"])
 
     atom = {
         "atom_id": atom_id,
         "source_type": "paper",
         "what_kind": "artifact",              # a research artifact (like a repo), not a hot take
-        "who_id": resolved_who,               # the PAPER's author — NOT the Oracle
+        "who_id": meta["who_id"],               # the PAPER's author — NOT the Oracle
         "when_ts": meta["when_ts"],
         "when_precision": meta["when_precision"],
         "about_entities": meta["about_entities"],
@@ -743,9 +1284,23 @@ def atomize_paper(conn: sqlite3.Connection, embedder, paper: dict, *,
         # abstract-only = PARTIAL (OBSERVED — WE tried the PDF mirrors and came back without one).
         # BODY_ABSENT is unreachable for a paper by construction: an atom with neither is never
         # written, so there is no state left for "we stored it with nothing in it".
+        # `title`/`abstract`/`external_ids`/`pdf_url` are what `upgrade_to_fulltext` rebuilds the
+        # Paper from when a reader opens an abstract-only atom later. They are carried as DATA so
+        # that upgrade never has to parse the snapshot markdown back into fields — the same reason
+        # `authors` is here rather than re-derived from the rendered name list below. `abstract`
+        # duplicates a span of the snapshot, and that is the price of the rule.
         "payload": {"has_fulltext": bool(full_text), "year": paper.get("year"),
                     "citationCount": paper.get("citationCount", 0),
                     "venue": paper.get("venue", ""),
+                    "title": (paper.get("title") or "").replace("\n", " ").strip(),
+                    "abstract": (paper.get("abstract") or "").strip(),
+                    "external_ids": paper.get("externalIds") or {},
+                    "pdf_url": (paper.get("openAccessPdf") or {}).get("url") or "",
+                    # ALL of them, capped — not just `who_id`'s first author. A reader that wants
+                    # the people behind a saved paper has nowhere else to look: the snapshot
+                    # markdown renders names for display, and re-deriving them from that would be
+                    # parsing a presentation string as data.
+                    "authors": atom_authors(paper),
                     **body_fields(BODY_COMPLETE if full_text else BODY_PARTIAL,
                                   BASIS_OBSERVED)},
     }
@@ -753,9 +1308,197 @@ def atomize_paper(conn: sqlite3.Connection, embedder, paper: dict, *,
         submit_atom(conn, embedder, sink, atom=atom, snapshot_text=md,
                     on_written=on_written)
     except Exception as e:                    # embed/write failure → SKIP (no atom, no seen mark)
-        from pipeline.ingestion.utils import log
         log(f"[footprint] paper atom {atom_id} skipped (embed/write failed): {e}")
         return None
     if seen is not None:
         seen[atom_id] = raw_hash
     return atom_id
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# 4. upgrade_to_fulltext — the abstract-only atom a reader actually opened
+# ══════════════════════════════════════════════════════════════════════════════════
+# Papers arrive abstract-only from exactly one adapter — `ingest_scholar_footprint`, which pulls a
+# scholar Oracle's whole back catalogue and deliberately fetches no PDFs (928 works, one paged call).
+# That is the right trade for a corpus nobody has read yet, and the wrong one the moment somebody
+# asks about ONE of those papers in depth: `open()` handed back a 2,000-char abstract and there was
+# no second act, because Policy B skips a present paper BEFORE the fetch, so no re-ingest could ever
+# deepen it. This is that second act, and `kb_open` is its only caller.
+#
+# THE POLICY-B EXCEPTION, STATED NARROWLY. Papers are immutable: a repeat ingest must never re-pay
+# for a body we hold. That is a rule about not spending twice, NOT a claim that a body can never
+# improve — `upsert_atom` has always overwritten in place and bumped `version` ("an audit trail of
+# how many times this atom was re-observed"), and `replace_chunks` exists precisely because a
+# changed snapshot shifts chunk boundaries. So the exception here is ONE-WAY and the narrowest one
+# that does the job: `partial → complete`, body columns only, never the reverse and never a
+# metadata rewrite. Identity fields are copied from the stored row verbatim rather than re-derived,
+# so an upgrade cannot move `who_id`, `when_ts` or the atom id itself no matter what a PDF says.
+_FULLTEXT_RETRY_DAYS = 1      # A failed attempt is stamped so that re-opening the same paper does
+                              # not re-pay the same failed download — within a working session,
+                              # which is where the repetition actually happens.
+                              #
+                              # ONE DAY, NOT A MONTH, because the stamp cannot tell the two
+                              # failures apart: `_download_pdf` returns None for "this paper is
+                              # paywalled and always will be" and for "the wifi dropped" alike.
+                              # Tuned for the second, since the first costs only one bounded
+                              # download a day for a paper somebody keeps opening, while a month
+                              # of lockout on a transient blip defeats the entire gesture — the
+                              # reader asked for THIS paper in depth, and telling them to come
+                              # back in September is not an answer. It doubles as the cheap
+                              # version of "a mirror may appear later": we simply re-ask tomorrow.
+
+
+def _retry_due(stamp: str | None) -> bool:
+    """Is a fresh full-text attempt due? No stamp → yes. Unparseable → yes (fail toward trying)."""
+    if not stamp:
+        return True
+    try:
+        return date.fromisoformat(str(stamp)) <= date.today() - timedelta(days=_FULLTEXT_RETRY_DAYS)
+    except ValueError:
+        return True
+
+
+def _paper_from_atom(row: sqlite3.Row, payload: dict) -> dict:
+    """The stored atom → the Paper shape `resolve_fulltext` and `paper_to_markdown_full` take.
+
+    Rebuilt from COLUMNS AND PAYLOAD ONLY. The snapshot markdown holds the same facts in a nicer
+    order, and reading them back out of it would be parsing a presentation string as data — the
+    thing `atomize_paper` already refuses to do for its author list. `paperId` is pinned to the
+    stored atom id, so `derive_paper` re-derives the identity this atom already has instead of
+    whatever a freshly-fetched PDF might imply."""
+    when_ts = row["when_ts"] or ""
+    return {
+        "paperId": row["atom_id"].split(":", 1)[1] if ":" in row["atom_id"] else row["atom_id"],
+        "title": payload.get("title") or "",
+        "abstract": payload.get("abstract") or "",
+        "authors": _authors_to_s2(payload.get("authors")),
+        "url": row["source_url"] or "",
+        "venue": payload.get("venue") or "",
+        "year": payload.get("year"),
+        "citationCount": payload.get("citationCount") or 0,
+        "externalIds": payload.get("external_ids") or {},
+        **({"publicationDate": when_ts} if row["when_precision"] == "day" and when_ts else {}),
+        **({"openAccessPdf": {"url": u}} if (u := payload.get("pdf_url")) else {}),
+    }
+
+
+def _authors_to_s2(stored: list | None) -> list[dict]:
+    """The atom's author records → back into the S2 field names a Paper speaks.
+
+    `atom_authors` translates ONE way at mint time (`authorId` → `scholar_id`, `openalexId` →
+    `openalex_id`), so rebuilding a Paper from the atom has to translate back or hand every
+    downstream reader a dict whose keys it does not know. `derive_paper` is the one that would
+    quietly misread it — it keys `who_id` off `authorId` — and while an upgrade copies `who_id`
+    from the stored row rather than re-deriving it, a Paper that lies about its own shape is a
+    trap laid for whoever reaches for this next.
+
+    Lossy in one direction only, and harmlessly: the stored list is capped at `MAX_ATOM_AUTHORS`,
+    so a 40-author paper re-renders its "+N more" tail from 20 rather than 40. The names shown are
+    the same names; only the count of the unshown remainder shrinks.
+    """
+    out = []
+    for a in (stored or []):
+        if not isinstance(a, dict) or not (a.get("name") or "").strip():
+            continue
+        rec = {"name": a["name"]}
+        if sid := a.get("scholar_id"):
+            rec["authorId"] = sid
+        if oid := a.get("openalex_id"):
+            rec["openalexId"] = oid
+        if orcid := a.get("orcid"):
+            rec["orcid"] = orcid
+        if pos := a.get("position"):
+            rec["position"] = pos
+        out.append(rec)
+    return out
+
+
+_UPGRADE_COLS = ("atom_id", "source_type", "what_kind", "who_id", "when_ts", "when_precision",
+                 "about_entities", "source_url", "raw_ref", "raw_hash", "description",
+                 "payload", "entry_mode")
+
+
+def upgrade_to_fulltext(conn: sqlite3.Connection, embedder_for, atom_id: str) -> bool:
+    """An abstract-only paper atom → the whole document, rewritten in place. True when it grew.
+
+    `embedder_for` is a ZERO-ARG CALLABLE, not an embedder, the same shape
+    `frontier_admit.admit_one` takes and for the same reason: most calls resolve no PDF, and
+    constructing an embedder needs an API key and a network this read path should not touch until
+    there is something to embed.
+
+    FAIL-SAFE, and load-bearing here more than anywhere (CLAUDE.md): this runs inside `open()`, so
+    every failure path must return the reader their abstract rather than an error. No open url, a
+    download that 404s, a scanned PDF under the per-page floor, a missing pypdf, an embed that
+    fails — all return False having written no body. The one thing a failure DOES write is the
+    attempt stamp, which is bookkeeping and not a claim that the work finished: it stops the next
+    open re-paying the same failed download, and `_FULLTEXT_RETRY_DAYS` lets it be asked again."""
+    row = conn.execute(
+        f"SELECT {', '.join(_UPGRADE_COLS)} FROM atoms WHERE atom_id = ?", (atom_id,)).fetchone()
+    if row is None or row["source_type"] != "paper":
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    # Only the one transition. `complete` is done, `absent` is unreachable for a paper by
+    # construction (`atomize_paper` never writes an atom with neither abstract nor body), and
+    # `has_fulltext` is checked too so a payload that disagrees with itself is left alone.
+    if payload.get("body_state") != BODY_PARTIAL or payload.get("has_fulltext"):
+        return False
+    if not _retry_due(payload.get("fulltext_tried_at")):
+        return False
+
+    paper = _paper_from_atom(row, payload)
+    full_text = resolve_fulltext(paper)
+    if not full_text:
+        _stamp_attempt(conn, atom_id, payload)
+        return False
+
+    md = paper_to_markdown_full(paper, full_text)
+    stamped = snapshot_and_hash("paper", atom_id, md, {row["atom_id"]: row["raw_hash"]})
+    if stamped is None:                       # byte-identical to what we hold → nothing grew
+        _stamp_attempt(conn, atom_id, payload)
+        return False
+    raw_ref, raw_hash = stamped
+
+    atom = {c: row[c] for c in _UPGRADE_COLS if c not in ("about_entities", "payload")}
+    atom["about_entities"] = _json_list(row["about_entities"])
+    atom["raw_ref"], atom["raw_hash"] = raw_ref, raw_hash
+    atom["payload"] = {k: v for k, v in payload.items() if k != "fulltext_tried_at"}
+    atom["payload"].update({"has_fulltext": True,
+                            **body_fields(BODY_COMPLETE, BASIS_OBSERVED)})
+    try:
+        embedder = embedder_for()             # built HERE — only now is there something to embed
+        assert_model(conn, embedder)          # same subspace guard `atomize_paper` takes, and for
+                                              # the same reason: these chunks join the ones the
+                                              # local search arm ranks against.
+        # Overwrites the row (bumping `version`) and REPLACES every chunk, so the abstract-only
+        # chunks cannot linger beside the full-text ones and be retrieved as a separate hit.
+        store_atom(conn, embedder, atom=atom, snapshot_text=md)
+    except Exception as e:
+        # No stamp on this arm: the body WAS reachable and only the write failed, so the next open
+        # should retry immediately rather than wait out the TTL.
+        log(f"[paper] {atom_id} full-text upgrade skipped (embed/write failed): {e}")
+        return False
+    log(f"[paper] {atom_id} upgraded to full text ({len(full_text):,} chars)")
+    return True
+
+
+def _json_list(raw) -> list:
+    try:
+        out = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return out if isinstance(out, list) else []
+
+
+def _stamp_attempt(conn: sqlite3.Connection, atom_id: str, payload: dict) -> None:
+    """Record that we tried and found no open PDF. Payload-only: no `version` bump, no body
+    column touched, because nothing about the atom's content changed."""
+    try:
+        conn.execute("UPDATE atoms SET payload = ? WHERE atom_id = ?",
+                     (json.dumps({**payload, "fulltext_tried_at": date.today().isoformat()}),
+                      atom_id))
+        conn.commit()
+    except Exception:      # bookkeeping must never break the read it rides on
+        pass

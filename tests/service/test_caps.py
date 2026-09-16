@@ -68,7 +68,7 @@ def test_a_snapshot_under_the_cap_keeps_its_own_body_state(svc, emb):
         assert got["body_state"] == expected, atom_id
 
 
-@pytest.mark.parametrize("key,bound", [("top_topics", 15), ("top_entities", 15),
+@pytest.mark.parametrize("key,bound", [("top_entities", 15),
                                        ("recent_descriptions", 12)])
 def test_aggregates_lists_are_already_bounded(svc, key, bound):
     """The cap the service does NOT apply, asserted at the boundary rather than enforced twice.

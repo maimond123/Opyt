@@ -32,16 +32,13 @@ def test_same_day_reads_aggregate_to_one_row(svc):
     assert rows[0]["reader"] == store.token_hash(svc.reader_token)
     assert rows[0]["tool"] == "search"
     assert rows[0]["n"] == 2
-    assert store.usage_total(svc.owner) == 2
 
 
 def test_each_tool_gets_its_own_row(svc):
     svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"}, headers=svc.reader_hdr)
     svc.client.post(f"/v1/kb/{svc.owner}/aggregate", json={}, headers=svc.reader_hdr)
 
-    assert [r["tool"] for r in _rows()] == ["aggregate", "search"]
-    assert store.usage_total(svc.owner) == 2
-    assert store.usage_total(svc.owner, store.token_hash(svc.reader_token)) == 2
+    assert [(r["tool"], r["n"]) for r in _rows()] == [("aggregate", 1), ("search", 1)]
 
 
 def test_zero_results_counted(svc):

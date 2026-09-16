@@ -13,6 +13,12 @@ opyt-worktrees/
 .claude/scheduled_tasks.lock
 .claude/worktrees/
 
+# Playwright MCP scratch — console logs and page snapshots it drops beside the checkout when a
+# session drives a browser. Per-machine debris from one tool run, never source. Ignored for the
+# same reason as the generated website files below: untracked AND unignored is the bad third
+# state, and this worktree is shared by concurrent sessions where one `git add` would commit it.
+.playwright-mcp/
+
 # Python
 venv/
 __pycache__/
@@ -54,3 +60,12 @@ website/robots.txt
 # constraints, and nothing in the repo or CI passes --locked or --frozen. Tracking a 640 KB
 # file that nothing reads is churn. If a build ever pins from it, track it in that change.
 uv.lock
+
+# Built by website/deploy.sh from website/opyt-install.command on every deploy.
+# The .command is the source of truth and is tracked; this is just its shipping wrapper.
+website/opyt-install.command.zip
+
+# Scratch scripts and pre-announce marketing drafts — never part of the tree, and one
+# careless `git add -A` away from a public `--refresh` shipping them.
+scratch_*.py
+marketing/

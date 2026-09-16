@@ -19,11 +19,8 @@ from __future__ import annotations
 # verbatim — the host cannot rescue what it is never told exists.
 DELIVER_CAP = 20
 
-_SURFACE = "frontier"
 
-
-def deliver(limit: int = DELIVER_CAP, dismiss=None, include_dismissed: bool = True,
-            conn=None) -> dict:
+def deliver(limit: int = DELIVER_CAP, dismiss=None, include_dismissed: bool = True) -> dict:
     """Assemble the ranked payload, record what it showed, and record what was dismissed.
 
     Order matters. Dismissals are written FIRST, so anything dismissed in this call comes back in
@@ -34,10 +31,9 @@ def deliver(limit: int = DELIVER_CAP, dismiss=None, include_dismissed: bool = Tr
     from pipeline.kb import frontier_surface as fs
     from pipeline.kb import schema
 
-    own = conn is None
-    conn = conn or schema.connect()
+    conn = schema.connect()
     try:
-        dismissed_n = fs.record_dismissed(conn, list(dismiss or []), surface=_SURFACE)
+        dismissed_n = fs.record_dismissed(conn, list(dismiss or []))
 
         # Rank EVERYTHING once, then narrow in this layer. One pass gives both the delivered set
         # and the count of what the opt-out held back, and there is no way for the two numbers to
@@ -45,7 +41,7 @@ def deliver(limit: int = DELIVER_CAP, dismiss=None, include_dismissed: bool = Tr
         staged = fs.rank_candidates(conn)
         ranked = staged if include_dismissed else [c for c in staged if not c["dismissed"]]
         delivered = ranked[:max(0, int(limit or 0))]
-        fs.record_shown(conn, [c["candidate_id"] for c in delivered], surface=_SURFACE)
+        fs.record_shown(conn, [c["candidate_id"] for c in delivered])
 
         out = {
             "status": "ok",
@@ -67,8 +63,7 @@ def deliver(limit: int = DELIVER_CAP, dismiss=None, include_dismissed: bool = Tr
                            "is nothing for the user to fix.")
         return out
     finally:
-        if own:
-            conn.close()
+        conn.close()
 
 
 def _card(c: dict) -> dict:

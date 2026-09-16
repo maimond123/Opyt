@@ -9,7 +9,7 @@ import re
 
 import pytest
 
-from pipeline.kb import resolve, schema, screen
+from pipeline.kb import curation_state, resolve, schema, screen
 
 
 @pytest.fixture()
@@ -40,6 +40,28 @@ def test_rank_pools_signals_across_the_canonical_cluster(conn):
     assert c.distinct_signals == 2 and c.has_endorsement and c.corroborated
     assert {"x:user:1", "substack:carol"} == set(c.members)
     assert c.name == "Carol"                      # prefers the X row's name (Fork 1)
+
+
+def test_repeated_truncated_following_walks_do_not_retire_candidates(conn):
+    """Only an accepted following count may establish the retirement baseline."""
+    for i in range(4):
+        entity_id = f"x:user:{i}"
+        _person(conn, entity_id, name=f"P{i}")
+        schema.add_signal(conn, entity_id, "follow", "x")
+
+    starts = ["2026-08-12T00:00:00+00:00", "2026-08-12T06:00:00+00:00",
+              "2026-08-12T12:00:00+00:00", "2026-08-12T18:00:00+00:00"]
+    for started_at, found in zip(starts, (4, 4, 1, 1)):
+        curation_state.record_run(conn, "x_following", status="ok", found=found,
+                                  stored_after=4, now=started_at, started_at=started_at)
+    conn.execute("UPDATE curation_signals SET last_confirmed_at=? WHERE entity_id='x:user:0'",
+                 (starts[-1],))
+    conn.execute("UPDATE curation_signals SET last_confirmed_at=? WHERE entity_id!='x:user:0'",
+                 (starts[0],))
+    conn.commit()
+
+    assert {c.canonical_id for c in screen.rank_candidates(conn)} == {
+        "x:user:0", "x:user:1", "x:user:2", "x:user:3"}
 
 
 def test_sort_key_is_endorsement_then_distinct_then_count(conn):
@@ -269,3 +291,257 @@ def test_build_screen_preticks_persons_without_demoting_or_reordering(conn, monk
     assert ids == ["x:user:o", "x:user:p"], "the label must not reorder the list"
     assert by_id["x:user:o"]["shown_by_default"] is True
     assert scr["recommended_count"] == 1 and scr["shown_by_default_count"] == 2
+
+
+# ── the scholar tier ─────────────────────────────────────────────────────────────
+
+def _cand(cid, *, signals, endorsement=False, distinct=1, count=1):
+    return screen.Candidate(canonical_id=cid, name=cid, signals=signals,
+                        has_endorsement=endorsement, distinct_signals=distinct,
+                        total_count=count)
+
+
+_FOLLOW = [{"signal_type": "follow", "platform": "x", "count": 1, "extra": None}]
+_PAPERS = [{"signal_type": "save", "platform": "openalex", "count": 3, "extra": None}]
+
+
+def test_a_researcher_is_interleaved_with_follows_not_buried_under_them():
+    """OpenAlex has no follow primitive, so a scholar can NEVER earn an endorsement signal and
+    sorts below every X follow under `sort_key` alone. That is the ordering being wrong for a
+    structural reason. Interleaving by RANK POSITION fixes it without weakening the endorsement
+    key — no ratio between "a follow" and "three saved papers" has to be defended."""
+    ranked = [_cand("x:1", signals=_FOLLOW, endorsement=True),
+              _cand("x:2", signals=_FOLLOW, endorsement=True),
+              _cand("openalex:A1", signals=_PAPERS),
+              _cand("openalex:A2", signals=_PAPERS)]
+
+    out = [c.canonical_id for c in screen.interleave_tiers(ranked)]
+
+    assert out == ["x:1", "openalex:A1", "x:2", "openalex:A2"]
+
+
+def test_a_single_platform_user_sees_their_list_untouched():
+    ranked = [_cand("x:1", signals=_FOLLOW, endorsement=True), _cand("x:2", signals=_FOLLOW)]
+    assert screen.interleave_tiers(ranked) == ranked
+
+    scholars = [_cand("openalex:A1", signals=_PAPERS), _cand("openalex:A2", signals=_PAPERS)]
+    assert screen.interleave_tiers(scholars) == scholars
+
+
+def test_a_person_the_user_also_follows_stays_in_the_main_tier():
+    """ALL signals scholar, not ANY. Someone the user follows on X who also wrote a paper they
+    saved has a real endorsement, and it should earn them their rank rather than move them into
+    the tier for people known only as authors."""
+    both = _cand("x:9", signals=_FOLLOW + _PAPERS, endorsement=True, distinct=2)
+    assert both.is_scholar is False
+    assert _cand("openalex:A1", signals=_PAPERS).is_scholar is True
+
+
+def test_a_scholar_is_never_pre_ticked_however_corroborated(conn):
+    """A pre-tick is OPYT vouching. The user picked the PAPER; inferring a vouch for its author
+    from that is the inference OPYT should not make on their behalf."""
+    schema.upsert_entity(conn, "openalex:A1", name="F. Arnold")
+    schema.set_signal(conn, "openalex:A1", "save", "openalex", count=9)
+    schema.set_signal(conn, "openalex:A1", "save", "scholar", count=4)   # 2 distinct → corroborated
+
+    out = screen.build_screen(conn)
+    card = next(c for c in out["candidates"] if c["canonical_id"] == "openalex:A1")
+
+    assert card["corroborated"] is True
+    assert card["pre_ticked"] is False
+    assert card["shown_by_default"] is True          # never hidden — only never vouched for
+
+
+def test_the_classifier_is_never_called_for_a_scholar(conn, monkeypatch):
+    """`kind` decides exactly one thing — the pre-tick — and no scholar is ever pre-ticked, so a
+    paid call for them cannot change any outcome."""
+    schema.upsert_entity(conn, "openalex:A1", name="F. Arnold")
+    schema.set_signal(conn, "openalex:A1", "save", "openalex", count=3)
+    called = []
+    monkeypatch.setattr(screen, "_classify_prompt", lambda batch: called.append(batch) or "")
+
+    out = screen.classify_kinds(conn, screen.rank_candidates(conn))
+
+    assert called == []
+    assert out["classified"] == 0
+
+
+def test_the_authors_of_saved_papers_are_reflected_as_papers_not_posts():
+    """The old `x`/not-`x` binary read every non-X save as a Substack post, so an author of three
+    saved PAPERS was reflected back as "saved 3 post(s)" — a claim about content the user never
+    saw."""
+    assert screen.reflect(_cand("openalex:A1", signals=_PAPERS)) == "you saved 3 of their paper(s)"
+    assert screen.reflect(_cand("x:1", signals=[
+        {"signal_type": "save", "platform": "x", "count": 2, "extra": None}])) == "bookmarked 2×"
+
+
+# ── the payload a host can actually read ──────────────────────────────────────
+
+def _followed(conn, eid, *, name, count=1):
+    """Someone with a plain follow — a candidate, never pre-ticked (distinct=1)."""
+    _person(conn, eid, name=name, profile={"bio": "writes"})
+    schema.add_signal(conn, eid, "save", "x", count=count)
+
+
+def test_the_payload_is_bounded_as_a_total_with_no_exemption(conn, monkeypatch):
+    """⚠️ THE TEST THAT REPLACES THE ONE THAT BLESSED THE BUG. Its predecessor asserted "no
+    pre-ticked candidate is ever cut" and passed — and that assertion WAS the defect: on a real
+    store 179 of 1,070 people are pre-ticked, so exempting them left 181 cards riding and the
+    payload came back at 68,476 characters, over the host's limit exactly as before.
+
+    A cap with an unbounded exemption is not a cap. This asserts the total.
+    """
+    for i in range(30):                       # all pre-ticked: follow + likes = 2 distinct signals
+        _person(conn, f"x:user:{i}", name=f"PERSON-{i}", profile={"bio": "writes"})
+        schema.add_signal(conn, f"x:user:{i}", "follow", "x")
+        schema.add_signal(conn, f"x:user:{i}", "like", "x", count=30 - i)
+    _patch_llm(monkeypatch)
+
+    scr = screen.build_screen(conn, floor=15, limit=10)
+
+    assert scr["recommended_count"] == 30         # the vouch is still COUNTED in full …
+    assert len(scr["candidates"]) == 10           # … and the payload is still bounded
+    assert scr["omitted"]["count"] == 20
+    assert sum(1 for c in scr["candidates"] if c["pre_ticked"]) == 10
+
+
+def test_a_real_sized_store_fits_in_the_reader(conn, monkeypatch):
+    """The measurement, not the mechanism. 297 chars/card measured live on 2026-09-14; the two
+    payloads that failed were 68KB and 52KB. Any future change to `_card` that pushes a default
+    screen back over ~25KB reopens the exact bug."""
+    import json
+
+    for i in range(400):
+        _person(conn, f"x:user:{i}", name=f"PERSON-{i}", profile={"bio": "a writer of things"})
+        schema.add_signal(conn, f"x:user:{i}", "follow", "x")
+        schema.add_signal(conn, f"x:user:{i}", "like", "x", count=400 - i)
+    _patch_llm(monkeypatch)
+
+    size = len(json.dumps(screen.build_screen(conn)))
+
+    assert size < 25_000, f"a default screen is {size:,} chars — the host could not read 52,000"
+
+
+def test_an_ordinary_screen_reports_no_omission_at_all(conn, monkeypatch):
+    """`omitted: 0` on every ordinary result trains the reader to skip the one field that says the
+    list is short."""
+    _followed(conn, "x:user:1", name="PERSON-1")
+    _patch_llm(monkeypatch)
+
+    assert "omitted" not in screen.build_screen(conn)
+
+
+def test_the_cap_bounds_what_is_returned_never_what_is_ranked(conn, monkeypatch):
+    """Ranks must not move when the cap does, or two renders of one store disagree about who the
+    user cares most about. The classify still runs over everybody for the same reason."""
+    for i in range(20):
+        _followed(conn, f"x:user:{i}", name=f"PERSON-{i}", count=20 - i)
+    _patch_llm(monkeypatch)
+
+    narrow = screen.build_screen(conn, limit=8)
+    wide = screen.build_screen(conn, limit=100)
+
+    ids = [c["canonical_id"] for c in wide["candidates"]]
+    assert [c["canonical_id"] for c in narrow["candidates"]] == ids[:8]
+    assert "omitted" not in wide
+
+
+def test_a_card_carries_the_sentence_and_not_the_rows_behind_it(conn, monkeypatch):
+    """`signals`, `identity_links` and `members` WERE the payload, and every one of them is the raw
+    form of something the card already states: `reflected` is `signals` as a sentence,
+    `distinct_signals` is its length, `canonical_id` is the handle onto the cluster. No reader
+    outside `screen` ever read them off a card."""
+    _person(conn, "x:user:1", name="Carol", links=["https://carol.substack.com"])
+    schema.add_signal(conn, "x:user:1", "follow", "x")
+    schema.add_signal(conn, "x:user:1", "save", "x", count=12)
+    _patch_llm(monkeypatch)
+
+    card = screen.build_screen(conn)["candidates"][0]
+
+    assert card["reflected"] == "you follow · bookmarked 12×"
+    assert card["distinct_signals"] == 2
+    assert not {"signals", "identity_links", "members"} & set(card)
+
+
+# ── source= : the bounded form of "show me my Substack people" ──────────────────
+#
+# THE DEFECT THESE EXIST FOR, read back from a real session 2026-09-14: the user asked to see
+# their Substack writers, no surface answered that in bounds, and the host called
+# `screen(limit=1100)` — straight past the `omitted` note's "do NOT raise it past ~80". The result
+# was 290,754 characters, over the token limit, recovered only by spilling to a file and `jq`-ing
+# it. The cap was not the thing that was broken; the missing question was.
+def _both_platforms(conn, eid, *, name):
+    """Someone the user follows on X AND subscribes to on Substack."""
+    _person(conn, eid, name=name, profile={"bio": "writes"})
+    schema.add_signal(conn, eid, "follow", "x")
+    schema.add_signal(conn, eid, "subscribe", "substack")
+
+
+def test_source_narrows_who_is_listed(conn, monkeypatch):
+    _followed(conn, "x:user:1", name="X-ONLY")
+    _person(conn, "substack:sub", name="SUBSTACK-ONLY", profile={"bio": "writes"})
+    schema.add_signal(conn, "substack:sub", "subscribe", "substack")
+    _patch_llm(monkeypatch)
+
+    out = screen.build_screen(conn, source="substack")
+
+    assert [c["name"] for c in out["candidates"]] == ["SUBSTACK-ONLY"]
+    assert out["total_candidates"] == 1 and out["source"] == "substack"
+
+
+def test_source_is_membership_not_exclusivity(conn, monkeypatch):
+    """The corroborated cross-platform people are the whole point of asking. Requiring EVERY
+    signal to match would hide exactly the ones a screen exists to surface."""
+    _both_platforms(conn, "x:user:1", name="BOTH")
+    _patch_llm(monkeypatch)
+
+    assert [c["name"] for c in screen.build_screen(conn, source="substack")["candidates"]] == \
+           [c["name"] for c in screen.build_screen(conn, source="x")["candidates"]] == ["BOTH"]
+
+
+def test_source_narrows_the_list_without_moving_a_rank(conn, monkeypatch):
+    """`source=` is a filter, never a re-score. Filtering after ranking is what guarantees it."""
+    for i in range(6):
+        _followed(conn, f"x:user:{i}", name=f"X-{i}", count=100 - i)
+    for i in range(6):
+        _person(conn, f"substack:s{i}", name=f"S-{i}", profile={"bio": "writes"})
+        schema.add_signal(conn, f"substack:s{i}", "subscribe", "substack", count=50 - i)
+    _patch_llm(monkeypatch)
+
+    everyone = [c["canonical_id"] for c in screen.build_screen(conn, limit=80)["candidates"]]
+    subs = [c["canonical_id"] for c in screen.build_screen(conn, source="substack")["candidates"]]
+
+    assert subs == [cid for cid in everyone if cid in set(subs)], "filtering reordered the list"
+
+
+def test_an_unknown_source_says_so_instead_of_returning_nobody(conn, monkeypatch):
+    """An empty list IS a guess here: it reads exactly like a connected platform nobody arrives
+    through. Naming what the store holds is the repair."""
+    _followed(conn, "x:user:1", name="PERSON-1")
+    _patch_llm(monkeypatch)
+
+    out = screen.build_screen(conn, source="twitter")
+
+    assert "twitter" in out["error"] and "x" in out["known_platforms"]
+    assert "candidates" not in out
+
+
+def test_an_oversized_limit_is_clamped_and_reported_not_honored(conn, monkeypatch):
+    """A documented "do not" the tool cheerfully honors is not a guard — the host raised `limit`
+    to 1100 precisely because nothing stopped it."""
+    for i in range(120):
+        _followed(conn, f"x:user:{i}", name=f"PERSON-{i}", count=200 - i)
+    _patch_llm(monkeypatch)
+
+    out = screen.build_screen(conn, limit=1100)
+
+    assert len(out["candidates"]) == screen.SCREEN_LIMIT_MAX
+    assert out["limit_clamped"] == {"asked": 1100, "applied": screen.SCREEN_LIMIT_MAX,
+                                    "note": out["limit_clamped"]["note"]}
+    assert "source=" in out["limit_clamped"]["note"], "say how to ask the bounded question"
+
+
+def test_an_ordinary_limit_reports_no_clamp(conn, monkeypatch):
+    _followed(conn, "x:user:1", name="PERSON-1")
+    _patch_llm(monkeypatch)
+    assert "limit_clamped" not in screen.build_screen(conn, limit=40)

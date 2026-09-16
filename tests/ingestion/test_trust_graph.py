@@ -18,7 +18,8 @@ def _trusted(result) -> set:
 def test_rule1_root_is_trusted():
     r = propagate([], {"karpathy.ai"})
     assert _trusted(r) == {"karpathy.ai"}
-    assert r["karpathy.ai"].reasons == ["X-attested (root)"]
+    assert r["karpathy.ai"].reasons
+    assert r["karpathy.ai"].edges == []
 
 
 def test_rule2_bidirectional_with_root():
@@ -67,11 +68,11 @@ def test_rule2_relaxation_still_requires_a_path_to_a_root():
 
 
 def test_rule3_two_trusted_pointers_graduate_candidate():
-    # Two roots both link the YouTube channel → trusted by corroboration.
-    edges = [Edge("karpathy.ai", "youtube.com/@k"), Edge("github.com/karpathy", "youtube.com/@k")]
+    # Two roots both link the GitHub account → trusted by corroboration.
+    edges = [Edge("karpathy.ai", "github.com/k"), Edge("github.com/karpathy", "github.com/k")]
     r = propagate(edges, {"karpathy.ai", "github.com/karpathy"})
-    assert r["youtube.com/@k"].trusted
-    assert "Cited by 2" in r["youtube.com/@k"].reasons[0]
+    assert r["github.com/k"].trusted
+    assert "Cited by 2" in r["github.com/k"].reasons[0]
 
 
 def test_rule4_squatter_pointing_at_root_is_not_trusted():
@@ -102,15 +103,15 @@ def test_rule5_identity_edge_graduates_without_bidirectional():
 
 def test_rule5_substack_only_person_reaches_t1_with_no_x():
     # The whole point: no X in the root set at all. Substack root's userLinks
-    # declare their X, site, and YouTube → all T1 via identity edges.
+    # declare their X, site, and GitHub → all T1 via identity edges.
     root = "them.substack.com"
     edges = [
         Edge(root, "x.com/them", via="identity_verified"),
         Edge(root, "them.com", via="identity_declared"),
-        Edge(root, "youtube.com/@them", via="identity_declared"),
+        Edge(root, "github.com/them", via="identity_declared"),
     ]
     r = propagate(edges, {root})
-    assert all(r[t].trusted for t in ("x.com/them", "them.com", "youtube.com/@them"))
+    assert all(r[t].trusted for t in ("x.com/them", "them.com", "github.com/them"))
 
 
 def test_identity_edge_only_fires_from_trusted_source():

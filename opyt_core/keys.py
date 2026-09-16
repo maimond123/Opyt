@@ -30,12 +30,20 @@ from .credentials_registry import KNOWN as KNOWN          # re-export: the ONE l
 from .paths import opyt_home
 
 
-def _env_path() -> Path:
+def env_path() -> Path:
+    """Where the keys file actually is, resolved at CALL time.
+
+    Public for `openrouter_oauth.acquire`, which reports the location back to the CALLER after
+    storing a key. That is a developer-facing status line, and it is the only surface that
+    should name this file: the browser page a user lands on after authorising deliberately
+    names no path at all. `$OPYT_HOME` moves it, so a second spelling of it anywhere is the
+    drift `paths.py` exists to prevent.
+    """
     return opyt_home() / ".env"  # the one sandbox knob ($OPYT_HOME), via paths.py
 
 
 def _read() -> dict[str, str]:
-    p = _env_path()
+    p = env_path()
     out: dict[str, str] = {}
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
@@ -48,7 +56,7 @@ def _read() -> dict[str, str]:
 
 def set_key(name: str, value: str) -> Path:
     """Upsert KEY=VALUE in ~/.opyt/.env (chmod 600 so secrets aren't world-readable)."""
-    p = _env_path()
+    p = env_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     cur = _read()
     cur[name] = value
@@ -86,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         if not k.strip():
             ap.error(f"--set expects a key name before '=', got {kv!r}")
         set_key(k.strip(), v.strip())
-        print(f"[set] {k.strip()} -> {_env_path()}")
+        print(f"[set] {k.strip()} -> {env_path()}")
 
     if args.list or not args.set:
         for k, st in status().items():

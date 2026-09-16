@@ -3,7 +3,7 @@
 # Bootstrap a CONTRIBUTOR checkout of OPYT. Run once after cloning the repo.
 # Usage: bash scripts/setup.sh
 #
-# This is NOT the install path for a user. Users run `uvx --from opyt==<version> opyt-mcp`,
+# This is NOT the install path for a user. Users run `uvx --from opyt@latest opyt-mcp`,
 # where uv supplies both the interpreter and the package. This script instead assumes a
 # `python3` that ALREADY satisfies requires-python >= 3.10 and does not check it — and a stock
 # macOS `python3` is 3.9.6, as is the one `xcode-select --install` delivers. It also installs

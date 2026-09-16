@@ -5,12 +5,12 @@ Two layers:
     they encode the LOAD-BEARING order (drop reply-to-others BEFORE grouping by conversationId, or a
     self-thread essay welds to its replies-to-commenters) + the RESOLVED curation filter (drop RTs +
     replies-to-others, keep originals + self-threads, NO length gate). The reply target is
-    `inReplyToUserId` vs the AUTHOR's id — `x_graphql._normalize` does not emit `inReplyToUsername`
+    `inReplyToUserId` vs the AUTHOR's id — `x_graphql_core.normalize` does not emit `inReplyToUsername`
     at all, and twitterapi.io left it EMPTY on profile tweets before that (live-verified
     2026-07-19), so the fixtures mirror the real shape (author.id + inReplyToUserId).
   • Adapter tests stub the X session + timeline walk and the VLM, proving the WIRING: self-thread →
     ONE atom, entry_mode/who_id, thread figure → VLM description in chunk text, content-hash
-    idempotency, and the `limit` bound. Not the live scrape.
+    idempotency, and full-window ingestion. Not the live scrape.
 """
 from __future__ import annotations
 
@@ -232,16 +232,22 @@ def _patch_fetch(monkeypatch, tweets, *, articles=False):
     stitch, render, hash, embed, write) is what these tests are actually about.
 
     `articles=False` also stubs out article DETECTION, since these fixtures carry no X-Articles and
-    the real detector would scan every fixture's entities on every test."""
+    the real detector would scan every fixture's entities on every test.
+
+    The stub returns a COMPLETE `TimelineWalk` — both timelines finished, frontier at the bound —
+    which is what every test below is about. The partial cases have their own file; see
+    `test_partial_x_walks.py`."""
     from pipeline.ingestion import x_graphql_core as core
     from pipeline.ingestion import x_render as xt
-    monkeypatch.setattr(core, "read_x_cookies", lambda *a, **k: {"auth_token": "t", "ct0": "c"})
+    monkeypatch.setattr(core, "read_x_cookies", lambda: {"auth_token": "t", "ct0": "c"})
     monkeypatch.setattr(core, "auth_headers", lambda *a, **k: {})
     monkeypatch.setattr(core, "fetch_user_profile", lambda cookies, headers, h: {
         "user_id": "99", "handle": h, "display_name": h, "bio": "", "website": "",
         "bio_urls": [], "verified": False, "followers": 1})
     monkeypatch.setattr(fp, "_pull_own_timeline",
-                        lambda cookies, headers, uid, since_ts, cap: [dict(t) for t in tweets])
+                        lambda cookies, headers, uid, since_ts, cap: fp.TimelineWalk(
+                            tweets=[dict(t) for t in tweets],
+                            complete=frozenset({"posts", "replies"}), reached=float(since_ts)))
     if not articles:
         monkeypatch.setattr(xt, "_article_tweet_id", lambda t: None)
 
@@ -361,7 +367,7 @@ def test_quoted_article_body_arrives_with_the_timeline(conn, fake_embedder, monk
 
     This used to cost a second paid `/twitter/article` call per quoted article, because the paid
     profile fetch returned only a stub node. The timeline walk asks for
-    `withArticleRichContentState`, and `x_graphql._normalize` recurses into
+    `withArticleRichContentState`, and `x_graphql_core.normalize` recurses into
     `quoted_status_result` carrying the whole `article` node with it — so the body is already here
     and the fetch is gone. Losing it would leave the atom holding a reaction plus a title, and the
     long-form it points at would never enter the corpus."""
@@ -390,28 +396,19 @@ def test_content_hash_idempotent(conn, fake_embedder, monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM atoms WHERE atom_id='xprofile:1'").fetchone()[0] == 1
 
 
-def test_limit_caps_new_atoms(conn, fake_embedder, monkeypatch):
+def test_all_qualifying_groups_are_stored(conn, fake_embedder, monkeypatch):
     _patch_fetch(monkeypatch, [_raw("1", text=_LONG + " one", conv="1"),
                                _raw("2", text=_LONG + " two", conv="2"),
                                _raw("3", text=_LONG + " three", conv="3")])
-    out = fp.sync_x_footprint(conn, fake_embedder, handle="carol", limit=2)
-    assert out["added"] == 2
-    assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 2
+    out = fp.sync_x_footprint(conn, fake_embedder, handle="carol")
+    assert out["added"] == 3
+    assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 3
 
 
-# ── STEP 3: link dispatch — a referenced github/paper → its OWN artifact atom + an Oracle vouch ──
-# The reacting tweet already survives the substance filter (a dispatchable link → provisional-keep);
-# here the LINK itself is resolved into an artifact atom and the Oracle gets a
-# (this-oracle → references → artifact) vouch — the trust edge David asked for.
+# ── Link dispatch: references become artifact atoms attributed to their own authors ──
 
-def _minted(conn, oracle=None):
-    """Artifact atoms the Step-3 link dispatcher captured (`entry_mode='author_referenced'`).
-
-    Replaces `_vouch_edges`, which read the Oracle→artifact `references` edge until the `edges`
-    table was deleted 2026-08-23 for having no reader. WHICH Oracle pointed at an artifact is no
-    longer recorded anywhere; THAT the artifact was captured still is, and capture is what these
-    tests are really guarding. `oracle` is accepted and ignored so the call sites still read as
-    "this Oracle's reference landed"."""
+def _minted(conn):
+    """Artifact atoms captured by link dispatch."""
     # Keyed on "not an X opinion atom" rather than `entry_mode`, because the paper tests stub
     # `atomize_paper` and their fakes do not stamp one. The Oracle's own tweets are the only
     # `source_type='x'` rows here, so everything else is something the dispatcher captured.
@@ -419,9 +416,9 @@ def _minted(conn, oracle=None):
         "SELECT atom_id FROM atoms WHERE source_type != 'x'")}
 
 
-def test_github_reference_dispatched_and_vouched(conn, fake_embedder, monkeypatch):
+def test_github_reference_dispatched(conn, fake_embedder, monkeypatch):
     # An Oracle points at a repo → the repo becomes its OWN artifact atom (attributed to the repo
-    # OWNER, entry_mode 'author_referenced') AND the Oracle gets a references vouch onto it.
+    # OWNER, entry_mode 'author_referenced').
     _patch_fetch(monkeypatch, [_raw("50", text="best C++ inference repo",
                                     link="https://github.com/ggerganov/llama.cpp")])
     from pipeline.ingestion.sources import github as gh_ing
@@ -444,8 +441,8 @@ def test_github_reference_dispatched_and_vouched(conn, fake_embedder, monkeypatc
         "SELECT COUNT(*) FROM atoms WHERE atom_id='xprofile:50'").fetchone()[0] == 1
 
 
-def test_paper_reference_dispatched_and_vouched(conn, fake_embedder, monkeypatch):
-    # An arXiv link → atomize_paper (mocked) mints the paper as REFERENCED, and the Oracle vouches.
+def test_paper_reference_dispatched(conn, fake_embedder, monkeypatch):
+    # An arXiv link → atomize_paper (mocked) mints the paper as author_referenced.
     _patch_fetch(monkeypatch, [_raw("51", text="must read", link="https://arxiv.org/abs/2401.00001")])
     from pipeline.kb import ingest_papers as ip
     paper = {"paperId": "arXiv:2401.00001", "url": "https://arxiv.org/abs/2401.00001",
@@ -470,8 +467,8 @@ def test_paper_reference_dispatched_and_vouched(conn, fake_embedder, monkeypatch
     assert "paper:arXiv:2401.00001" in _minted(conn)
 
 
-def test_substack_reference_dispatched_and_vouched(conn, fake_embedder, monkeypatch):
-    # A referenced Substack POST → its own opinion atom + the Oracle vouch (same treatment as
+def test_substack_reference_dispatched(conn, fake_embedder, monkeypatch):
+    # A referenced Substack POST → its own opinion atom (same treatment as
     # github/paper: the Oracle pointed at it, who_id is the POST's author, not the Oracle).
     _patch_fetch(monkeypatch, [_raw("52", text="great post", link="https://joe.substack.com/p/x")])
     from pipeline.kb import ingest_substack as isub
@@ -491,7 +488,7 @@ def test_substack_reference_dispatched_and_vouched(conn, fake_embedder, monkeypa
 
 def test_quoted_node_link_not_dispatched(conn, fake_embedder, monkeypatch):
     # A github link inside the QUOTED tweet is the quoted author's reference, not this Oracle's act.
-    # The dispatcher scans OWN nodes only → nothing minted or vouched.
+    # The dispatcher scans OWN nodes only → nothing minted.
     quoted = {"id": "9", "text": "check my repo", "author": {"userName": "bob"},
               "entities": {"urls": [{"expanded_url": "https://github.com/bob/thing"}]}}
     _patch_fetch(monkeypatch, [_raw("53", text="nice", quoted=quoted)])     # OUTER tweet carries no link
@@ -501,10 +498,10 @@ def test_quoted_node_link_not_dispatched(conn, fake_embedder, monkeypatch):
         "SELECT COUNT(*) FROM atoms WHERE atom_id='github:bob/thing'").fetchone()[0] == 0
 
 
-def test_referenced_pdf_is_minted_and_vouched(conn, fake_embedder, monkeypatch):
+def test_referenced_pdf_is_minted(conn, fake_embedder, monkeypatch):
     # A raw .pdf has no scholarly id and no attested author — IRRELEVANT for a reference: who_id is
     # the artifact's, never the Oracle's, so it mints like any paper (the adapter fetches the full
-    # body via the pdf url itself). The Oracle vouches for it.
+    # body via the pdf url itself).
     from pipeline.kb import ingest_papers as ip
     monkeypatch.setattr(ip, "paper_from_url", lambda url, enrich=True: {
         "paperId": "url:acme.com/deck.pdf", "url": url, "openAccessPdf": {"url": url}})
@@ -525,10 +522,8 @@ def test_referenced_pdf_is_minted_and_vouched(conn, fake_embedder, monkeypatch):
     assert "paper:url:acme.com/deck.pdf" in _minted(conn)
 
 
-def test_reference_vouch_idempotent_mint_once(conn, fake_embedder, monkeypatch):
-    # THE correctness point: a paper ALREADY in the store (a prior Oracle brought it in) must still
-    # get a NEW Oracle's vouch — even though atomize_paper's immutability dedup returns None and
-    # stores nothing. The vouch goes through upsert_edge directly, not the adapter's edge list.
+def test_present_reference_is_counted_without_reminting(conn, fake_embedder, monkeypatch):
+    # A paper already in the store is counted as captured without fetching or minting it again.
     schema.upsert_atom(conn, {"atom_id": "paper:arXiv:2401.00001", "source_type": "paper"})  # pre-existing
     from pipeline.kb import ingest_papers as ip
     paper = {"paperId": "arXiv:2401.00001", "url": "https://arxiv.org/abs/2401.00001",
@@ -538,11 +533,10 @@ def test_reference_vouch_idempotent_mint_once(conn, fake_embedder, monkeypatch):
     monkeypatch.setattr(ip, "atomize_paper", lambda *a, **k: called.append(1))   # must NOT be called
 
     d = fp.LinkDispatcher(conn, fake_embedder)
-    kinds = d.dispatch([_raw("60", text="ditto", link="https://arxiv.org/abs/2401.00001")],
-                       "x:user:OTHER")
+    kinds = d.dispatch([_raw("60", text="ditto", link="https://arxiv.org/abs/2401.00001")])
     assert kinds == {"paper": 1}
-    assert not called                                                       # present → vouch-only, no re-mint
-    assert "paper:arXiv:2401.00001" in _minted(conn, oracle="x:user:OTHER")
+    assert not called                                                       # present → no re-mint
+    assert "paper:arXiv:2401.00001" in _minted(conn)
 
 
 def test_unlisted_paper_host_dispatched_via_deep_probe(conn, fake_embedder, monkeypatch):
@@ -572,14 +566,13 @@ def test_unlisted_paper_host_dispatched_via_deep_probe(conn, fake_embedder, monk
     monkeypatch.setattr(ip, "atomize_paper", fake_atomize)
 
     d = fp.LinkDispatcher(conn, fake_embedder)
-    kinds = d.dispatch([_raw("80", text="huge if true", link="https://nature.com/articles/x")],
-                       "x:user:ORACLE")
+    kinds = d.dispatch([_raw("80", text="huge if true", link="https://nature.com/articles/x")])
     assert kinds == {"paper": 1}
     # Called twice (the offline `predicted_atom_id` pre-check, then the mint itself) — same as any
-    # other paper reference (see test_paper_reference_dispatched_and_vouched); the point here is
+    # other paper reference (see test_paper_reference_dispatched); the point here is
     # every call used the REWRITTEN doi.org url, never the original nature.com one.
     assert seen_urls and all(u == "https://doi.org/10.1038/s41586-021-03819-2" for u in seen_urls)
-    assert "paper:DOI:10.1038/s41586-021-03819-2" in _minted(conn, oracle="x:user:ORACLE")
+    assert "paper:DOI:10.1038/s41586-021-03819-2" in _minted(conn)
 
 
 def test_unlisted_pdf_without_pdf_shaped_url_dispatched_via_content_type_hint(conn, fake_embedder,
@@ -608,10 +601,10 @@ def test_unlisted_pdf_without_pdf_shaped_url_dispatched_via_content_type_hint(co
     monkeypatch.setattr(ip, "atomize_paper", fake_atomize)
 
     d = fp.LinkDispatcher(conn, fake_embedder)
-    kinds = d.dispatch([_raw("82", text="preprint", link=link)], "x:user:ORACLE")
+    kinds = d.dispatch([_raw("82", text="preprint", link=link)])
     assert kinds == {"paper": 1}
     assert "application/pdf; charset=binary" in seen_content_types
-    assert f"paper:url:{link}" in _minted(conn, oracle="x:user:ORACLE")
+    assert f"paper:url:{link}" in _minted(conn)
 
 
 def test_unlisted_non_paper_link_stays_undispatched(conn, fake_embedder, monkeypatch):
@@ -619,7 +612,7 @@ def test_unlisted_non_paper_link_stays_undispatched(conn, fake_embedder, monkeyp
     # undispatched reference, same as before this fallback existed.
     monkeypatch.setattr(fp.link_router, "classify_link_deep", lambda u: None)
     d = fp.LinkDispatcher(conn, fake_embedder)
-    kinds = d.dispatch([_raw("81", text="wow", link="https://www.nytimes.com/x")], "x:user:ORACLE")
+    kinds = d.dispatch([_raw("81", text="wow", link="https://www.nytimes.com/x")])
     assert kinds == {}
 
 
@@ -647,10 +640,10 @@ def test_resolve_since_passthrough_within_ceiling():
     assert fp._resolve_since(one_yr, now) == one_yr
 
 
-# ── the media prefetch: images are the unit of dispatch, and `limit` still bounds spend ──────────
+# ── the media prefetch: images are the unit of dispatch ───────────────────────────
 
 def test_prefetch_reads_every_image_before_the_render_pass(conn, fake_embedder, monkeypatch):
-    """The unbounded run reads images UP FRONT, one future per image, so `run_concurrent`'s per-group
+    """The run reads images UP FRONT, one future per image, so `run_concurrent`'s per-group
     threads never serialize on a round-trip. `late_reads` is the escape hatch: anything above 0 means
     an image was read inside a producer thread after all — the serialization the prefetch removes,
     partially back — and a leak costs only latency, so it would otherwise look like a healthy run."""
@@ -666,29 +659,6 @@ def test_prefetch_reads_every_image_before_the_render_pass(conn, fake_embedder, 
     assert out["media_prefetch"]["read"] == 3
     assert out["late_reads"] == 0, "the render pass must not have paid for a single read"
     assert "media_prefetch" in out["stage_seconds"]
-
-
-def test_limit_skips_the_prefetch_so_a_cost_cap_stays_a_cost_cap(conn, fake_embedder, monkeypatch):
-    """`limit` bounds SPEND on a bounded run, and `_work` enforces it by early-skipping groups before
-    they reach the VLM. A prefetch reads every image in the WINDOW first, so running it under `limit`
-    would turn the cap into a floor — paying for images of groups that are never ingested. A latency
-    optimization must not silently un-bound a cost the caller asked to bound."""
-    reads: list[str] = []
-    media = [{"type": "photo", "media_url_https": f"https://pbs.twimg.com/media/{i}.jpg"}
-             for i in range(6)]
-    _patch_fetch(monkeypatch, [_raw(str(i), text=_LONG + f" n{i}", conv=str(i), media=media)
-                               for i in range(1, 6)])
-    from pipeline import ocr_cascade
-    monkeypatch.setattr(ocr_cascade, "read_image",
-                        lambda url, context="": (reads.append(url)
-                                                 or ocr_cascade.MediaRead("a chart", "chart", True)))
-
-    out = fp.sync_x_footprint(conn, fake_embedder, handle="carol", limit=1)
-
-    assert out["added"] == 1
-    assert out["media_prefetch"] == {}, "no prefetch may run when `limit` bounds the spend"
-    # 5 groups x 6 images = 30 refs in the window; the cap must keep the paid reads far under that.
-    assert len(set(reads)) <= 6, f"limit leaked: {len(set(reads))} unique images paid for"
 
 
 # ── the profile must account for its own wall clock (2026-08-02) ─────────────────────────────────
@@ -733,7 +703,7 @@ def test_residual_is_reported_and_never_negative(conn, fake_embedder, monkeypatc
         assert left >= -1e-6, f"{parent} residual {left} < 0 — a child is timed outside its parent"
 
 
-# ── batched artifact writes: the vouch must survive deferral (2026-08-02) ────────────────────────
+# ── Batched artifact writes: pending work and durable storage ───────────────────────────────
 
 def _sink(conn, fake_embedder, flush_chunks=10_000):
     """A sink that will NOT auto-flush — so a test can observe the window where an atom is
@@ -742,12 +712,8 @@ def _sink(conn, fake_embedder, flush_chunks=10_000):
     return AtomSink(conn, fake_embedder, flush_chunks=flush_chunks)
 
 
-def test_vouch_is_deferred_until_the_artifact_is_durable(conn, fake_embedder, monkeypatch):
-    """THE regression guard for batching. With a sink the artifact is buffered in RAM, so
-    `_atom_present` answers False for an atom that lands seconds later. The old code asked exactly
-    that question and vouched on the answer — under batching it would answer "no" every time and
-    drop EVERY vouch, leaving papers with no record of who referenced them. Indistinguishable from
-    an Oracle who linked nothing, so nothing would have caught it."""
+def test_buffered_artifact_is_stored_on_flush(conn, fake_embedder, monkeypatch):
+    """A buffered artifact is absent before flush and durable afterward."""
     from pipeline.kb import ingest_papers as ip
     paper = {"paperId": "arXiv:2401.00002", "url": "https://arxiv.org/abs/2401.00002",
              "externalIds": {"ArXiv": "2401.00002"}, "authors": []}
@@ -756,15 +722,13 @@ def test_vouch_is_deferred_until_the_artifact_is_durable(conn, fake_embedder, mo
 
     sink = _sink(conn, fake_embedder)
     d = fp.LinkDispatcher(conn, fake_embedder, sink=sink)
-    kinds = d.dispatch([_raw("70", text="read this", link="https://arxiv.org/abs/2401.00002")],
-                       "x:user:ORACLE")
+    kinds = d.dispatch([_raw("70", text="read this", link="https://arxiv.org/abs/2401.00002")])
 
     assert kinds == {"paper": 1}, "the reference must still be counted while in flight"
-    assert _minted(conn, oracle="x:user:ORACLE") == set(), \
-        "nothing may be vouched before the atom is durable — that would be a dangling edge"
+    assert _minted(conn) == set()
 
     sink.close()                                          # flush → the atom lands → callback fires
-    assert "paper:arXiv:2401.00002" in _minted(conn, oracle="x:user:ORACLE")
+    assert "paper:arXiv:2401.00002" in _minted(conn)
 
 
 def test_second_reference_in_one_window_rides_the_first_submit(conn, fake_embedder, monkeypatch):
@@ -784,40 +748,16 @@ def test_second_reference_in_one_window_rides_the_first_submit(conn, fake_embedd
     sink = _sink(conn, fake_embedder)
     d = fp.LinkDispatcher(conn, fake_embedder, sink=sink)
     link = "https://arxiv.org/abs/2401.00003"
-    assert d.dispatch([_raw("71", text="a", link=link)], "x:user:ORACLE") == {"paper": 1}
-    assert d.dispatch([_raw("72", text="b", link=link)], "x:user:ORACLE") == {"paper": 1}
+    assert d.dispatch([_raw("71", text="a", link=link)]) == {"paper": 1}
+    assert d.dispatch([_raw("72", text="b", link=link)]) == {"paper": 1}
 
     assert len(mints) == 1, f"the artifact was minted {len(mints)}x for two references"
     sink.close()
-    assert "paper:arXiv:2401.00003" in _minted(conn, oracle="x:user:ORACLE")
+    assert "paper:arXiv:2401.00003" in _minted(conn)
 
 
-def test_two_oracles_in_one_window_both_get_their_vouch(conn, fake_embedder, monkeypatch):
-    """`_pending` maps an atom to a LIST of who_ids, not one. Collapsing it to a single value would
-    silently drop the second Oracle's attestation — the exact 'mint once, vouch every time' rule the
-    dispatcher exists to hold, broken by the optimization meant to preserve it."""
-    from pipeline.kb import ingest_papers as ip
-    paper = {"paperId": "arXiv:2401.00004", "url": "https://arxiv.org/abs/2401.00004",
-             "externalIds": {"ArXiv": "2401.00004"}, "authors": []}
-    monkeypatch.setattr(ip, "paper_from_url", lambda url, enrich=True: dict(paper))
-    monkeypatch.setattr(ip, "resolve_fulltext", lambda p: "body")   # no real PDF pull
-
-    sink = _sink(conn, fake_embedder)
-    d = fp.LinkDispatcher(conn, fake_embedder, sink=sink)
-    link = "https://arxiv.org/abs/2401.00004"
-    d.dispatch([_raw("73", text="a", link=link)], "x:user:ONE")
-    d.dispatch([_raw("74", text="b", link=link)], "x:user:TWO")
-    sink.close()
-
-    assert "paper:arXiv:2401.00004" in _minted(conn, oracle="x:user:ONE")
-    assert "paper:arXiv:2401.00004" in _minted(conn, oracle="x:user:TWO")
-
-
-def test_a_failed_artifact_write_leaves_no_dangling_vouch(conn, fake_embedder, monkeypatch):
-    """Fail-safe, restated for the deferred path. An edge points at an atom BY ID; if the atom never
-    lands, the edge points into empty space and 'what has this Oracle referenced?' returns an id
-    that resolves to no row. On the synchronous path `_atom_present` guarded that. On the sink path
-    the guard is that `on_written` simply never fires for an atom the flush dropped."""
+def test_failed_artifact_flush_stores_nothing(conn, fake_embedder, monkeypatch):
+    """A failed embed must leave the buffered artifact absent from the store."""
     from pipeline.kb import ingest_papers as ip
     paper = {"paperId": "arXiv:2401.00005", "url": "https://arxiv.org/abs/2401.00005",
              "externalIds": {"ArXiv": "2401.00005"}, "authors": []}
@@ -826,15 +766,14 @@ def test_a_failed_artifact_write_leaves_no_dangling_vouch(conn, fake_embedder, m
 
     sink = _sink(conn, fake_embedder)
     d = fp.LinkDispatcher(conn, fake_embedder, sink=sink)
-    d.dispatch([_raw("75", text="doomed", link="https://arxiv.org/abs/2401.00005")], "x:user:ORACLE")
+    d.dispatch([_raw("75", text="doomed", link="https://arxiv.org/abs/2401.00005")])
 
     from pipeline.kb.embed import EmbedError
     monkeypatch.setattr(fake_embedder, "embed",
                         lambda *a, **k: (_ for _ in ()).throw(EmbedError("dead")))
     sink.close()                                  # batch fails, then per-atom isolation also fails
 
-    assert _minted(conn, oracle="x:user:ORACLE") == set(), \
-        "an artifact that never landed must never be vouched to"
+    assert _minted(conn) == set()
 
 
 def test_prefetched_payload_skips_the_inline_fetch(conn, fake_embedder, monkeypatch):
@@ -852,7 +791,7 @@ def test_prefetched_payload_skips_the_inline_fetch(conn, fake_embedder, monkeypa
 
     d = fp.LinkDispatcher(conn, fake_embedder,
                           prefetched={link: {"paper": dict(paper), "fulltext": "body text"}})
-    assert d.dispatch([_raw("76", text="x", link=link)], "x:user:ORACLE") == {"paper": 1}
+    assert d.dispatch([_raw("76", text="x", link=link)]) == {"paper": 1}
 
     assert d.prefetch_hits == 1
     assert fetches == [False], "only the free id-parse may run; the S2 enrich was prefetched"
@@ -869,10 +808,9 @@ def test_a_missing_prefetch_entry_falls_back_to_an_inline_fetch(conn, fake_embed
     monkeypatch.setattr(ip, "resolve_fulltext", lambda p: "inline body")
 
     d = fp.LinkDispatcher(conn, fake_embedder, prefetched={})     # prefetch found nothing
-    assert d.dispatch([_raw("77", text="x", link="https://arxiv.org/abs/2401.00007")],
-                      "x:user:ORACLE") == {"paper": 1}
+    assert d.dispatch([_raw("77", text="x", link="https://arxiv.org/abs/2401.00007")]) == {"paper": 1}
     assert d.prefetch_hits == 0
-    assert "paper:arXiv:2401.00007" in _minted(conn, oracle="x:user:ORACLE")
+    assert "paper:arXiv:2401.00007" in _minted(conn)
 
 
 def test_prefetch_dispatches_one_future_per_artifact(conn, monkeypatch):
@@ -894,7 +832,7 @@ def test_prefetch_dispatches_one_future_per_artifact(conn, monkeypatch):
     groups = [[_raw(str(i), text="x", link=f"https://arxiv.org/abs/2401.0000{i}")] for i in range(1, 5)]
     t = threading.Timer(0.3, release.set)
     t.start()
-    out = fp.prefetch_referenced_artifacts(groups, conn, workers=20)
+    out = fp.prefetch_referenced_artifacts(groups, workers=20)
     t.cancel()
 
     assert out["fetched"] == 4 and out["unique"] == 4
@@ -912,20 +850,10 @@ def test_prefetch_dedupes_and_ignores_bare_links(conn, monkeypatch):
     groups = [[_raw("80", text="a", link=link)], [_raw("81", text="b", link=link)],
               [_raw("82", text="c", link="https://x.com/someone/status/1")],
               [_raw("83", text="d", link="https://acme.com/blog/post")]]
-    out = fp.prefetch_referenced_artifacts(groups, conn, workers=4)
+    out = fp.prefetch_referenced_artifacts(groups, workers=4)
 
     assert calls == [link], f"prefetched {calls}, must be the one dispatchable url"
     assert out["links"] == 2 and out["unique"] == 1
-
-
-def test_limit_skips_the_artifact_prefetch_too(conn, fake_embedder, monkeypatch):
-    """Same bound as the media prefetch, same reason: `limit` caps SPEND, and a pass that walks the
-    whole window would pay to fetch artifacts of groups the run will never ingest."""
-    monkeypatch.setattr(fp, "prefetch_referenced_artifacts",
-                        lambda *a, **k: pytest.fail("artifact prefetch ran under `limit`"))
-    _patch_fetch(monkeypatch, [_raw(str(i), text=_LONG + f" n{i}", conv=str(i)) for i in range(1, 4)])
-    out = fp.sync_x_footprint(conn, fake_embedder, handle="carol", limit=1)
-    assert out["artifact_prefetch"] == {}
 
 
 def test_residual_grows_when_a_child_goes_unregistered(conn, fake_embedder):
@@ -954,7 +882,7 @@ def test_an_unreadable_profile_is_blocked_not_error(conn, fake_embedder, monkeyp
     from pipeline.ingestion import x_graphql_core as core
     from pipeline.kb import ingest_common
 
-    monkeypatch.setattr(core, "read_x_cookies", lambda *a, **k: {"auth_token": "t", "ct0": "c"})
+    monkeypatch.setattr(core, "read_x_cookies", lambda: {"auth_token": "t", "ct0": "c"})
     monkeypatch.setattr(core, "auth_headers", lambda *a, **k: {})
     monkeypatch.setattr(core, "fetch_user_profile", lambda *a, **k: None)
 
@@ -962,3 +890,27 @@ def test_an_unreadable_profile_is_blocked_not_error(conn, fake_embedder, monkeyp
     assert ingest_common.classify_run(summ) == ingest_common.RUN_BLOCKED
     assert summ["added"] == 0
     assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0   # nothing written
+
+
+# ── the run summary is a summary, not a cache ───────────────────────────────────
+#
+# THE DEFECT THIS EXISTS FOR, measured 2026-09-14 on a real ingest: `artifact_prefetch` rode the
+# run summary whole, `payloads` included — every prefetched artifact body verbatim, full GitHub
+# repo objects and `node_id`s. `oracles._ingest_oracle` renders that summary into a result row
+# with `str()`, so one x source row came back at 46,473 characters of which 41,339 were the
+# cache. `oracle(action='progress')` hit 110KB and blew the host's token limit, which meant the
+# completion report for a FINISHED pull could not be read at all.
+def test_the_prefetch_reports_its_counters_and_never_its_bodies():
+    from pipeline.kb.ingest_x_footprint import _prefetch_counters
+
+    out = _prefetch_counters({"payloads": {"https://github.com/a/b": {"id": 1, "body": "x" * 9999}},
+                              "links": 3, "unique": 2, "fetched": 2})
+
+    assert out == {"links": 3, "unique": 2, "fetched": 2}
+    assert "payloads" not in out and len(str(out)) < 200
+
+
+def test_no_prefetch_summarises_as_nothing_not_as_a_prefetch_of_nothing():
+    from pipeline.kb.ingest_x_footprint import _prefetch_counters
+
+    assert _prefetch_counters(None) == {} and _prefetch_counters({}) == {}

@@ -14,6 +14,8 @@ What these lock, and every one is a failure that would be invisible in productio
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
@@ -248,7 +250,7 @@ def mapped(monkeypatch):
 
     class _Resp:
         text, model = "mapped", "fake-model"
-        input_tokens, output_tokens, cost_usd = 100, 20, 0.01
+        input_tokens, output_tokens = 100, 20
         raw: dict = {}
 
     calls: list = []
@@ -284,7 +286,7 @@ def test_read_is_reachable_without_a_preview_first(conn, tool, monkeypatch):
         text = json.dumps({"consensus": "it moved",
                            "queries": [{"text": "gated deltanet", "target_sources": ["arxiv"],
                                         "rationale": "why", "atom_ids": ["a:seed"]}]})
-        model, input_tokens, output_tokens, cost_usd = "m", 1, 1, 0.0
+        model, input_tokens, output_tokens = "m", 1, 1
         raw = {}
 
     monkeypatch.setattr("pipeline.ingestion.utils.load_yaml_config",
@@ -294,6 +296,86 @@ def test_read_is_reachable_without_a_preview_first(conn, tool, monkeypatch):
     res = tool(action="read", atom_ids=["a:seed"])
     assert res["status"] == "ok" and res["emitted"] == 1
     assert res["scope"]["atoms"] > 0            # the scope comes back anyway, unasked
+
+
+# ── `_dispose`: the read-queue scheduler is REQUESTED, never launched from the tool call ────
+
+def _health(monkeypatch, *, claims_waiting, breaker_open=False, needs_attention=False):
+    from pipeline.kb import sitting_scheduler
+
+    monkeypatch.setattr(sitting_scheduler, "health",
+                        lambda conn: {"claims_waiting": claims_waiting,
+                                      "breaker_open": breaker_open,
+                                      "needs_attention": needs_attention})
+
+
+def _scheduler_job(home):
+    """The durable job the resident worker would find, or None if the read asked for nothing."""
+    from pipeline.kb.rail_jobs import LOCAL_HOME_ID, RailJobStore
+    return RailJobStore(home / "rail_jobs.db").get(LOCAL_HOME_ID, "sitting_scheduler")
+
+
+def _read_one(conn, tool, monkeypatch):
+    """One successful read, which is the only path `_dispose` runs on."""
+    import json
+    from pipeline import llm_client
+
+    class _R:
+        text = json.dumps({"consensus": "it moved",
+                           "queries": [{"text": "gated deltanet", "target_sources": ["arxiv"],
+                                        "rationale": "why", "atom_ids": ["a:seed"]}]})
+        model, input_tokens, output_tokens = "m", 1, 1
+        raw = {}
+
+    _region(conn, n=12)
+    monkeypatch.setattr("pipeline.ingestion.utils.load_yaml_config",
+                        lambda: {"frontier": {"backend": "api"}})
+    monkeypatch.setattr(llm_client, "preflight", lambda role: None)
+    monkeypatch.setattr(llm_client, "call", lambda role, **kw: _R())
+    return tool(action="read", atom_ids=["a:seed"])
+
+
+def test_a_read_with_claims_waiting_makes_the_scheduler_due_now(conn, tool, monkeypatch,
+                                                                kb_home):
+    """D8's second half: pointing at a region must not leave it unread for the rail's whole hour."""
+    from pipeline.kb.rail_worker import RAILS
+    _health(monkeypatch, claims_waiting=True)
+
+    assert _read_one(conn, tool, monkeypatch)["status"] == "ok"
+
+    job = _scheduler_job(kb_home)
+    assert job is not None and job.due_at <= time.time() and job.started_at is None
+    assert job.rail in RAILS, "a name outside the registry is a row no worker dispatches"
+
+
+def test_a_read_with_nothing_waiting_queues_nothing(conn, tool, monkeypatch, kb_home):
+    """The request is conditional on real work, exactly as it was when it forked a child."""
+    _health(monkeypatch, claims_waiting=False)
+
+    assert _read_one(conn, tool, monkeypatch)["status"] == "ok"
+
+    assert _scheduler_job(kb_home) is None
+
+
+def test_a_tripped_breaker_queues_nothing_and_says_so(conn, tool, monkeypatch, kb_home):
+    """A child would exit without reading, so the row would be a scheduled no-op. The health
+    notice is what surfaces instead, because nothing was asked for."""
+    _health(monkeypatch, claims_waiting=True, breaker_open=True, needs_attention=True)
+
+    res = _read_one(conn, tool, monkeypatch)
+
+    assert _scheduler_job(kb_home) is None
+    assert res["scheduler"]["breaker_open"] is True
+
+
+def test_an_invalid_read_lens_does_not_queue_the_scheduler(conn, tool, monkeypatch, kb_home):
+    rec = _region(conn, n=12)
+    _health(monkeypatch, claims_waiting=True)
+
+    res = tool(action="read", sitting_id=rec["sitting_id"], lens="briefing")
+
+    assert res["status"] == "error"
+    assert _scheduler_job(kb_home) is None
 
 
 def test_an_unresolvable_phrase_is_an_error_not_an_empty_region(conn, tool):

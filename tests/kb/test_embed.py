@@ -1,9 +1,8 @@
 """Hermetic proof of the hosted-embedding seam (pipeline/kb/embed.py).
 
-No network, no spend: the HTTP layer (`_http_post_json`) and the cost recorder are
-monkeypatched. Proves the contracts the atom-KB relies on — normalization, input↔vector
-alignment, the asymmetric query prefix, all-or-nothing failure, cost attribution, and the
-kb_meta model-identity guard.
+No network: the HTTP layer (`_http_post_json`) is monkeypatched. Proves the contracts the
+atom-KB relies on — normalization, input↔vector alignment, the asymmetric query prefix,
+all-or-nothing failure, and the kb_meta model-identity guard.
 """
 import json
 import sqlite3
@@ -24,7 +23,7 @@ from pipeline.kb.embed import (
 QWEN = "qwen/qwen3-embedding-8b"
 
 
-def _cfg(model=QWEN, batch_size=64, dim=None, price=0.01, query_instruction=None):
+def _cfg(model=QWEN, batch_size=64, dim=None, query_instruction=None):
     """A resolved config dict (mirrors what _resolve_config produces), so tests can
     construct a HostedEmbedder without a settings.yaml."""
     qi = query_instruction
@@ -32,7 +31,7 @@ def _cfg(model=QWEN, batch_size=64, dim=None, price=0.01, query_instruction=None
         qi = _QWEN_QUERY_INSTRUCTION if "qwen" in model else ""
     return {
         "provider": "openrouter", "model": model, "endpoint": "http://test/embeddings",
-        "dim": dim, "batch_size": batch_size, "price_per_million": price,
+        "dim": dim, "batch_size": batch_size,
         "query_instruction": qi, "timeout": 5.0,
     }
 
@@ -125,19 +124,15 @@ def test_batching_makes_multiple_requests_all_complete(monkeypatch):
     assert sorted(t for c in cap for t in c) == [f"t{i}" for i in range(5)]  # no drops, no dupes
 
 
-# ── fail-safe: all-or-nothing, no cost on failure ───────────────────────────────
+# ── fail-safe: all-or-nothing ───────────────────────────────────────────────────
 
-def test_http_failure_raises_and_records_no_cost(monkeypatch):
+def test_http_failure_raises(monkeypatch):
     def boom(req, timeout):
         raise EmbedError("HTTP 500: upstream down")
     monkeypatch.setattr("pipeline.kb.embed._http_post_json", boom)
-    spy = []
-    monkeypatch.setattr("pipeline.llm_client.record_external_cost",
-                        lambda *a, **k: spy.append((a, k)))
     emb = HostedEmbedder(_cfg(), use_breaker=False)
     with pytest.raises(EmbedError):
         emb.embed(["a", "b"], role="document")
-    assert spy == []  # a failed call must not bill (Fail-safe: no partial state)
 
 
 def test_partial_response_raises(monkeypatch):
@@ -171,23 +166,6 @@ def test_missing_key_raises(monkeypatch):
     monkeypatch.setattr("pipeline.kb.embed._http_post_json", _fake_http())
     with pytest.raises(EmbedError):
         HostedEmbedder(_cfg(), use_breaker=False).embed(["a"])
-
-
-# ── cost attribution ────────────────────────────────────────────────────────────
-
-def test_cost_recorded_on_success(monkeypatch):
-    monkeypatch.setattr("pipeline.kb.embed._http_post_json",
-                        _fake_http(usage_tokens=1_000_000))
-    spy = []
-    monkeypatch.setattr("pipeline.llm_client.record_external_cost",
-                        lambda provider, cost, **k: spy.append((provider, cost, k)))
-    emb = HostedEmbedder(_cfg(price=0.01), use_breaker=False)
-    emb.embed(["a"], role="document")
-    assert len(spy) == 1
-    provider, cost, kw = spy[0]
-    assert provider == "openrouter-embed"
-    assert abs(cost - 0.01) < 1e-9        # 1M tokens * $0.01/M
-    assert kw.get("requests") == 1
 
 
 # ── kb_meta: the model-identity guard ───────────────────────────────────────────

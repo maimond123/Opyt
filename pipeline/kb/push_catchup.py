@@ -1,16 +1,16 @@
 """
 pipeline/kb/push_catchup.py — keeps the SERVED copy of this knowledge base current, by itself.
 
-R3. Freshness cannot be a user action: an owner who has to remember to run `opyt-push` serves a
-stale copy, and the whole point of hosting is that a reader can read while the owner's laptop is
-shut. So this is the fifth rail on `spawn_rail`'s pattern — detached, coalesced, fail-safe, fired
-on session open, exactly like `bookmark_catchup` and its siblings.
+R3. Freshness cannot be a user action: an owner who has to remember to publish serves a stale
+copy, and the whole point of hosting is that a reader can read while the owner's laptop is shut.
+This rail is now the ONLY caller of `push.publish` — the `opyt-push` command that was the other
+one was deleted on 2026-09-05, as argv and printing over the function this rail already calls.
+Launched by the resident worker like its seven siblings, activated by `share` once the grant is
+durable.
 
-Owns its own spawner in its own `try/except` in `mcp_server/server.py`, never welded to another
-rail's (`atom-rail-not-welded-to-catchup`).
-
-NOT CRON. `cron` does not fire while a Mac sleeps, and `launchd` needs a per-user plist — which
-is install-time friction against the constraint this whole feature answers to.
+NOT CRON. `cron` does not fire while a Mac sleeps. The worker is a resident process the OS
+restarts (`opyt_core/install_worker.py` on macOS, `gateway/deploy/opyt-worker.service` hosted),
+so a machine that wakes catches up rather than skipping the window it slept through.
 
 THE LAZY GATE, and both terms are required: push when somebody has READ since the last push AND
 the local store has CHANGED since it. Demand alone would ship an identical 117 MB every time
@@ -23,10 +23,10 @@ obligation.
 fresh, it makes the FOLLOWING one fresh. The first reader after a change gets the previous
 version.
 
-⚠️RAILS ARE DETACHED AND CONCURRENT (`start_new_session=True`), so this cannot be sequenced after
-an ingest rail — it evaluates the store while ingest is still writing. The consequence is
-structural and self-correcting: a push lands one session behind the ingest that caused it. Do not
-try to order them.
+⚠️THIS CANNOT BE SEQUENCED AFTER AN INGEST RAIL. The worker runs at most one rail per home at a
+time, but it picks by due time, not by dependency — an ingest that finishes after this pass leaves
+its rows unpublished until the next one. The consequence is structural and self-correcting: a push
+lands one pass behind the ingest that caused it. Do not try to order them.
 
 NO SPEND CEILING and no consent marker, unlike the paid rails. This rail calls no model and buys
 nothing; its only cost is bandwidth on a connection the user already pays for, and the consent it
@@ -44,7 +44,7 @@ from pathlib import Path
 
 from opyt_core.paths import opyt_db, opyt_path
 from pipeline.ingestion.utils import log
-from pipeline.kb.rail_runtime import COALESCE_DEFAULT, load_rail_env, spawn_rail
+from pipeline.kb.rail_runtime import load_rail_env
 
 RAIL = "push_catchup"
 
@@ -56,12 +56,13 @@ def _watermark_path() -> Path:
 
 
 def store_position() -> dict | None:
-    """Where this store stands right now — `{atoms_at, chunk_id}` — or None if it cannot be read.
+    """The store's `{atoms_at, chunk_id, atom_count}`, or None if it cannot be read.
 
-    TWO facts because one does not cover the other. `MAX(atoms.ingested_at)` moves when an atom
+    `MAX(atoms.ingested_at)` moves when an atom
     arrives or is re-observed; `MAX(chunks.chunk_id)` is an AUTOINCREMENT and moves when anything
     is re-chunked or re-embedded without a new atom, which a re-embed run does to the whole store
-    while leaving every `ingested_at` alone.
+    while leaving every `ingested_at` alone. The atom count detects removal even when neither
+    maximum changes, so deleting an older atom also removes it from the next served export.
 
     A comparison and not a mirror: the watermark is a copy of a value this store owns, read only
     to answer "has it moved", and it is never authoritative for anything."""
@@ -70,13 +71,14 @@ def store_position() -> dict | None:
     except Exception:
         return None
     try:
-        atoms_at = conn.execute("SELECT MAX(ingested_at) FROM atoms").fetchone()[0]
+        atoms_at, atom_count = conn.execute(
+            "SELECT MAX(ingested_at), COUNT(*) FROM atoms").fetchone()
         chunk_id = conn.execute("SELECT MAX(chunk_id) FROM chunks").fetchone()[0]
     except sqlite3.OperationalError:
         return None            # a store that has never ingested — nothing to publish either
     finally:
         conn.close()
-    return {"atoms_at": atoms_at, "chunk_id": chunk_id}
+    return {"atoms_at": atoms_at, "chunk_id": chunk_id, "atom_count": atom_count}
 
 
 def read_watermark() -> dict | None:
@@ -151,12 +153,6 @@ def run_push_catchup(force: bool = False) -> dict:
     if res["status"] != "ok":
         log(f"[{RAIL}] {res['status']}: {res.get('message')}")
     return res
-
-
-def spawn_push_catchup(force: bool = False, coalesce_window: float = COALESCE_DEFAULT) -> bool:
-    """Fire one pass as a detached, non-blocking child and return immediately."""
-    return spawn_rail("pipeline.kb.push_catchup", slug=RAIL,
-                      force=force, coalesce=coalesce_window)
 
 
 def main(argv: list[str] | None = None) -> int:

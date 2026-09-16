@@ -48,3 +48,52 @@ def test_no_key_value_is_ever_returned(monkeypatch):
     monkeypatch.setattr(readiness, "_credential", lambda s: "sk-or-SECRET")
     monkeypatch.setattr(readiness, "_ping", lambda k: (True, "ok", None))
     assert "SECRET" not in str(readiness.openrouter())
+
+
+# ── A trial key that stopped working is not an unfunded one ───────────────────────────────────
+# The SAME 402 arrives for both, and the two remedies are opposite: one person tops up an
+# account, the other does not have one to top up. Fold them together and the trial user is sent
+# to a credits page for an account they never made — a dead end at the exact moment they were
+# about to become a customer.
+
+@pytest.mark.parametrize("ping,want", [
+    ((False, "... HTTP 402 ...", 402), "trial_over"),   # the cap is spent
+    ((False, "... HTTP 401 ...", 401), "trial_over"),   # `expires_at` passed, or revoked
+    ((False, "... HTTP 403 ...", 403), "trial_over"),
+    ((True,  "ok",               None), "ok"),          # a live trial is just a live key
+    ((False, "connection reset", None), "unknown"),     # indeterminate stays indeterminate
+])
+def test_a_trial_key_has_its_own_end_state(monkeypatch, ping, want):
+    monkeypatch.setattr(readiness, "_credential", lambda s: "sk-or-x")
+    monkeypatch.setattr(readiness, "_is_trial", lambda: True)
+    monkeypatch.setattr(readiness, "_ping", lambda k: ping)
+    assert readiness.openrouter()["state"] == want
+
+
+def test_a_spent_trial_is_never_sent_to_a_credits_page(monkeypatch):
+    """The load-bearing half. `TOPUP_URL` is correct advice for a user with an account and wrong
+    advice for one without, so it must not reach this state's message."""
+    monkeypatch.setattr(readiness, "_credential", lambda s: "sk-or-x")
+    monkeypatch.setattr(readiness, "_is_trial", lambda: True)
+    monkeypatch.setattr(readiness, "_ping", lambda k: (False, "HTTP 402", 402))
+    assert readiness.TOPUP_URL not in readiness.openrouter()["message"]
+
+
+def test_a_user_key_keeps_the_advice_it_always_had(monkeypatch):
+    """The trial branch must be reachable ONLY from a trial. A regression that keys it on
+    anything else silently stops telling real customers how to fund their accounts."""
+    monkeypatch.setattr(readiness, "_credential", lambda s: "sk-or-x")
+    monkeypatch.setattr(readiness, "_is_trial", lambda: False)
+    monkeypatch.setattr(readiness, "_ping", lambda k: (False, "HTTP 402", 402))
+    out = readiness.openrouter()
+    assert out["state"] == "unfunded" and readiness.TOPUP_URL in out["message"]
+
+
+def test_the_cost_is_stated_wherever_a_card_is(monkeypatch):
+    """A user sent to a payment page is told the size of the amount. Asserted against the one
+    constant rather than against a phrase, so correcting the number — see the ⚠️ on COST_NOTE —
+    is a one-line edit that cannot leave a stale copy behind in a prompt."""
+    monkeypatch.setattr(readiness, "_credential", lambda s: "sk-or-x")
+    monkeypatch.setattr(readiness, "_is_trial", lambda: False)
+    monkeypatch.setattr(readiness, "_ping", lambda k: (False, "HTTP 402", 402))
+    assert readiness.COST_NOTE in readiness.openrouter()["message"]

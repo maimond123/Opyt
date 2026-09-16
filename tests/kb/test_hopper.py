@@ -1,11 +1,12 @@
 """Hopper — the one deposit surface: any URL → the right adapter → one `user-saved` atom.
 
-Offline. Every network seam (`_fetch_article`, `_fetch_one_tweet`, the paper/github/substack
-adapters) is monkeypatched, so these prove the ROUTING and the INVARIANTS, not the scrapes:
+Offline. Every network seam (`_fetch_article`, `_fetch_one_tweet`, `classify_link_deep`, the
+paper/github/substack adapters) is monkeypatched, so these prove the ROUTING and the INVARIANTS,
+not the scrapes:
 
   • the wider `classify_reference` vocabulary, and — the load-bearing one — that widening it did
     NOT touch `classify_link`, whose None is a MEASURED decision inside the X footprint filter;
-  • preview costs nothing (no fetch, no write) and answers already-present for free;
+  • preview makes no fetch for non-X sources, writes nothing, and answers already-present;
   • every dumped atom is stamped `entry_mode='user-saved'`;
   • a dump creates an ENTITY but never an ORACLE, and never an ORACLE row for a bare host;
   • a repeat dump is a no-op, and every failure path writes nothing at all.
@@ -17,6 +18,7 @@ import json
 import pytest
 
 from pipeline.kb import hopper, ingest_blog, ingest_x, link_router, schema
+from pipeline.kb.embed import ensure_kb_meta
 
 
 @pytest.fixture()
@@ -24,6 +26,14 @@ def conn(kb_home, tmp_path):
     c = schema.connect(tmp_path / "opyt.db")
     yield c
     c.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_deep_probe(no_deep_probe):
+    """Autouse in THIS file only: nearly every test here hoppers `_ARTICLE_URL`, and the article
+    fallback pays a bounded page read to check its own guess. The stub itself lives in conftest
+    (`no_deep_probe`) because a second file needs it; the tests that are ABOUT the probe re-patch
+    the same symbol to say otherwise."""
 
 
 _ARTICLE_URL = "https://www.theverge.com/2026/8/1/some-cool-article"
@@ -62,6 +72,110 @@ def test_a_known_shape_is_sniffed_not_guessed(url, kind):
     assert link_router.classify_reference(url) == (kind, "sniffed")
     assert link_router.classify_reference(url, hint="article") == (kind, "sniffed"), \
         "a recognized host must beat the hint — the hint is a read, the host is a fact"
+
+
+# ── the DOI in the path: what makes the paper test generalize past a host list ────────
+#
+# Measured 2026-09-09: ACS, JACS, Wiley, ACM, Taylor & Francis, SAGE, Springer and APS all print
+# the DOI in their own url, and NONE of their hosts was in `_PAPER_HOSTS` — so a JACS paper routed
+# to `article` and landed as `blog:pubs.acs.org/doi/10.1021/…`. The publisher list that would fix
+# that is unbounded; the DOI's shape is not.
+
+
+@pytest.mark.parametrize("url,doi", [
+    ("https://pubs.acs.org/doi/10.1021/jacs.4c01234", "10.1021/jacs.4c01234"),
+    ("https://onlinelibrary.wiley.com/doi/10.1002/anie.202401234", "10.1002/anie.202401234"),
+    ("https://dl.acm.org/doi/10.1145/3442188.3445922", "10.1145/3442188.3445922"),
+    # Springer and APS do NOT use a `/doi/` segment, which is why the test is the DOI and not
+    # that segment — anchoring on `/doi/` would have missed both.
+    ("https://link.springer.com/article/10.1007/s00214-024-03100-5", "10.1007/s00214-024-03100-5"),
+    # Lowercased on the way in: DOIs are case-insensitive, so `PhysRevLett` and `physrevlett`
+    # are one paper and must not become two immutable atoms.
+    ("https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.130.123456",
+     "10.1103/physrevlett.130.123456"),
+])
+def test_a_doi_in_the_path_is_a_paper_on_any_host(url, doi):
+    """Routed AND parsed. Both halves are required and they live in different modules: the router
+    decides the url is a paper, and only then does `_parse_paper_url` ever see it."""
+    from pipeline.kb import ingest_papers
+
+    assert link_router.classify_reference(url) == ("paper", "sniffed")
+    assert ingest_papers.paper_from_url(url, enrich=False)["paperId"] == f"DOI:{doi}"
+
+
+def test_every_url_form_of_one_paper_still_deduplicates():
+    """The contract the generalization could most easily have broken. `_parse_paper_url` promises
+    every link form of one paper mints ONE atom, and papers are immutable — a split identity can
+    never be merged back."""
+    from pipeline.kb import ingest_papers
+    ids = {ingest_papers.paper_from_url(u, enrich=False)["paperId"] for u in (
+        "https://pubs.acs.org/doi/10.1021/jacs.4c01234",
+        "https://pubs.acs.org/doi/abs/10.1021/jacs.4c01234",
+        "https://doi.org/10.1021/jacs.4c01234",
+        "https://dx.doi.org/10.1021/jacs.4c01234",
+        "https://pubs.acs.org/doi/10.1021/jacs.4c01234?ref=article",
+    )}
+    assert ids == {"DOI:10.1021/jacs.4c01234"}
+
+
+def test_an_arxiv_doi_still_collapses_onto_the_preprint():
+    """The generalized pattern now matches the arXiv DOI on any host too, so the collapse that
+    stops one preprint minting two atoms has to survive it."""
+    from pipeline.kb import ingest_papers
+    for u in ("https://doi.org/10.48550/arXiv.2302.13971",
+              "https://arxiv.org/abs/2302.13971"):
+        assert ingest_papers.paper_from_url(u, enrich=False)["paperId"] == "arXiv:2302.13971"
+
+
+def test_an_ordinary_url_is_not_mistaken_for_a_doi():
+    """The false-positive direction. `10.` plus four-to-nine digits plus a slash is the guard; a
+    version number, a date path or a plain slug must not trip it."""
+    for u in (_ARTICLE_URL, "https://example.com/v10.2/release-notes",
+              "https://example.com/2024/10.15/some-post", "https://example.com/pricing"):
+        assert link_router.classify_link(u) is None, u
+
+
+# ── tier 3: a DOI the page PRINTS but does not declare ────────────────────────────────
+#
+# The probe already reads 64KB of the head looking for `citation_doi`; scanning the same bytes for
+# a printed DOI costs nothing extra and covers every publisher that renders a page without
+# citation tags. It stays on the right side of this module's one line: read an identifier the
+# source DECLARES, never infer one. Both inference routes measured badly on 2026-09-09 — Crossref
+# title search resolved 1 of 3, returning a Faculty Opinions review of AlphaFold and a different
+# paper called "Is Attention All You Need?", and a wrong paper atom is immutable.
+
+
+@pytest.mark.parametrize("markup,doi", [
+    (b'<p>DOI: 10.1039/d3sc01260c</p>', "10.1039/d3sc01260c"),
+    (b'<a href="https://doi.org/10.1145/3442188.3445922">link</a>', "10.1145/3442188.3445922"),
+    (b'cite as doi.org/10.1021/jacs.4c01234.', "10.1021/jacs.4c01234"),
+])
+def test_a_printed_doi_is_read_from_the_page(markup, doi):
+    from pipeline.kb.link_router import _PRINTED_DOI_RE
+    m = _PRINTED_DOI_RE.search(markup)
+    assert m and m.group(1).decode().rstrip(".,;)") == doi
+
+
+@pytest.mark.parametrize("markup", [
+    b'var buildId = 10.1234/abcdef;',          # a bare number pair in a script payload
+    b'{"analytics":"10.5555/session"}',        # json that happens to look DOI-shaped
+    b'<p>no identifier here at all</p>',
+])
+def test_a_bare_number_is_not_read_as_a_doi(markup):
+    """This runs on pages that reached the ARTICLE fallback — mostly NOT papers — so the required
+    `doi.org/` or `doi:` prefix is what stops 64KB of markup producing a false paper."""
+    from pipeline.kb.link_router import _PRINTED_DOI_RE
+    assert _PRINTED_DOI_RE.search(markup) is None
+
+
+def test_the_declared_tag_outranks_the_printed_one():
+    """A `citation_doi` is the publisher naming THIS page's paper; a printed DOI may be a citation
+    of somebody else's. Order is the whole guard, so it is asserted rather than assumed."""
+    from pipeline.kb import link_router as lr
+    body = (b'<meta name="citation_doi" content="10.1038/mine"/>'
+            b'<p>as shown in DOI: 10.1234/somebody-elses</p>')
+    assert lr._CITATION_DOI_RE.search(body).group(1) == b"10.1038/mine"
+    assert lr._PRINTED_DOI_RE.search(body).group(1) == b"10.1234/somebody-elses"
 
 
 def test_a_bare_link_falls_back_to_article():
@@ -145,21 +259,24 @@ def test_predicted_atom_id_is_offline_and_admits_what_it_cannot_know():
 # ── preview: free by contract ─────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("url,hint,kind", [
-    (_ARTICLE_URL, None, "article"),
     ("https://arxiv.org/abs/2504.13171", None, "paper"),
     ("https://github.com/letta-ai/letta", None, "github"),
     ("https://newsletter.example.com/p/a-post", "substack", "substack"),
 ])
-def test_preview_spends_nothing_on_a_source_the_caller_can_read(conn, monkeypatch, url, hint, kind):
-    """Four of the five kinds cost ZERO to preview, and it is not an optimization — the caller can
-    fetch those pages itself, so a preview fetch would buy something already free. Every network
-    seam is booby-trapped, including the X one, to prove the X spend does not leak into them."""
+def test_preview_makes_no_fetch_on_a_source_the_caller_can_read(conn, monkeypatch, url, hint, kind):
+    """A reference that ROUTES on a fact — a known host, a DOI in the path, a hint — is free. The
+    caller has already read the page, so preview must not read it again. Every network seam is
+    booby-trapped, including the X one, to prove the X path does not leak into them.
+
+    `article` left this set on 2026-09-09: it is the one route that is a GUESS, and it now pays
+    one bounded probe to check the guess. See the test below."""
     from pipeline.ingestion.sources import blog as src
     def _boom(*a, **k):
         raise AssertionError("preview must not fetch a source the caller can read")
     monkeypatch.setattr(src, "_fetch_article", _boom)
     monkeypatch.setattr(ingest_x, "peek_tweet", _boom)
     monkeypatch.setattr(ingest_x, "_fetch_one_tweet", _boom)
+    monkeypatch.setattr(link_router, "classify_link_deep", _boom)
 
     out = hopper.save(conn, None, url, kind_hint=hint)   # embedder is None — nothing may embed
     assert out["status"] == "preview" and out["kind"] == kind
@@ -169,6 +286,52 @@ def test_preview_spends_nothing_on_a_source_the_caller_can_read(conn, monkeypatc
     assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
 
 
+# ── the article fallback is a guess, and it gets checked ──────────────────────────────
+#
+# Measured 2026-09-09: `https://www.nature.com/articles/s41586-021-03819-2` — AlphaFold — landed as
+# `blog:nature.com/articles/…` with `who_id = blog:nature.com`, `what_kind = opinion`, and the
+# author list scraped into the title. It never deduped against the same paper saved by DOI, and
+# none of its 34 authors reached `sync_paper_author_signals`. `classify_link_deep` had been able to
+# read that page's `citation_doi` the whole time; only `ingest_x_footprint` ever called it, so the
+# SAME url routed correctly when an Oracle tweeted it and wrongly when a user pasted it.
+
+
+def test_a_page_that_declares_a_doi_is_a_paper_not_an_article(conn, monkeypatch):
+    """The probe REWRITES the reference to the doi.org form it found, which is what makes `save`
+    mint the paper instead of the landing page it was handed."""
+    monkeypatch.setattr(link_router, "classify_link_deep",
+                        lambda u: ("paper", "https://doi.org/10.1038/s41586-021-03819-2", None))
+
+    out = hopper.save(conn, None, "https://www.nature.com/articles/s41586-021-03819-2")
+
+    assert out["kind"] == "paper"
+    assert out["reference"] == "https://doi.org/10.1038/s41586-021-03819-2"
+    assert out["atom_id"] == "paper:DOI:10.1038/s41586-021-03819-2"
+
+
+def test_a_page_that_declares_nothing_stays_an_article(conn):
+    """The probe must not widen the paper route. A blog post is still a blog post, and the whole
+    reason `classify_reference` has an article catch-all is that most links are one. Rides the
+    autouse None, which is the same answer a real fetch of a blog post gives."""
+    out = hopper.save(conn, None, _ARTICLE_URL)
+
+    assert out["kind"] == "article" and out["atom_id"] == _ARTICLE_ATOM
+
+
+def test_the_probe_never_runs_when_the_url_already_answered(conn, monkeypatch):
+    """LAST RESORT, and the word is load-bearing: a fetch on every preview would make the free
+    already-present check cost a round trip per link, which is exactly what the tool description
+    tells the host to rely on when it is deciding among ten search results."""
+    calls = []
+    monkeypatch.setattr(link_router, "classify_link_deep", lambda u: calls.append(u) or None)
+
+    hopper.save(conn, None, "https://pubs.acs.org/doi/10.1021/jacs.4c01234")
+    hopper.save(conn, None, "https://arxiv.org/abs/2504.13171")
+    hopper.save(conn, None, "https://github.com/letta-ai/letta")
+
+    assert calls == []
+
+
 def test_previewing_an_x_post_reads_it_because_the_caller_cannot(conn, monkeypatch):
     """David 2026-08-13: the "the host model has already read the page" premise holds for four
     kinds and FAILS for X — x.com serves a JS shell to unauthenticated fetchers, so a model holding
@@ -176,8 +339,8 @@ def test_previewing_an_x_post_reads_it_because_the_caller_cannot(conn, monkeypat
 
     That breaks the preview's ONE job. Four atom ids are self-describing, so a wrong link is
     visible on sight; `x:2086520133909168332` is unverifiable by a human. OPYT can read what the
-    caller cannot, and one tweet costs ~$0.00015 — ~5% of a single thread call — so the preview
-    pays it and shows the post. `description` is `derive_x`'s string, i.e. LITERALLY what the atom
+    caller cannot, so the preview reads the post and shows it. `description` is `derive_x`'s string,
+    i.e. LITERALLY what the atom
     will carry, so what you approve is what gets stored."""
     monkeypatch.setattr(ingest_x, "peek_tweet", lambda tid: dict(_TWEET))
     out = hopper.save(conn, None, _TWEET_URL)
@@ -201,8 +364,7 @@ def test_an_unreadable_x_post_is_flagged_before_the_user_says_yes(conn, monkeypa
 
 def test_a_present_x_post_is_not_re_read_to_preview_it(conn, monkeypatch):
     """Already have it → nothing to verify, so nothing to read verifying it. The presence check
-    must short-circuit ahead of the card, which costs a request against a rate bucket even though
-    it no longer costs money."""
+    must short-circuit ahead of the card, which consumes a request against a rate bucket."""
     schema.upsert_atom(conn, {"atom_id": "x:1750000000000000000", "source_type": "x"})
     monkeypatch.setattr(ingest_x, "peek_tweet",
                         lambda tid: pytest.fail("must not re-read a present post"))
@@ -214,8 +376,7 @@ def test_a_confirmed_x_save_does_not_read_the_post_twice(conn, fake_embedder, mo
     """`save(confirm=True)` runs the preview internally to route and dedup. Without
     `enrich=not confirm` it would read the tweet for the card and then again for the ingest.
 
-    That used to cost money twice (~$0.00015 each through twitterapi.io); the read is free since
-    2026-08-30. It still must not happen: the second read draws on a 500/15-min rate bucket and
+    It must not happen: the second read draws on a 500/15-min rate bucket and
     can return a DIFFERENT tweet from the one previewed if it changed in between."""
     peeks: list = []
     monkeypatch.setattr(ingest_x, "peek_tweet",
@@ -226,11 +387,29 @@ def test_a_confirmed_x_save_does_not_read_the_post_twice(conn, fake_embedder, mo
     assert peeks == [], "a confirm must not also pay for a preview card"
 
 
+def test_a_model_mismatch_stops_a_direct_x_save_before_any_work(conn, fake_embedder, monkeypatch):
+    """The direct path shares the bulk writer's pre-spend identity boundary.
+
+    A late guard used to archive a raw snapshot and pay for an embedding before `_write_atom`
+    rejected the vector subspace. Neither the X fetch nor the embed call belongs after a known
+    mismatch.
+    """
+    ensure_kb_meta(conn, "model-a", fake_embedder.dim, fake_embedder.provider)
+    fake_embedder.model = "model-b"
+    monkeypatch.setattr(ingest_x, "_fetch_one_tweet",
+                        lambda *_: pytest.fail("model drift must stop before fetching"))
+    monkeypatch.setattr(fake_embedder, "embed",
+                        lambda *_a, **_kw: pytest.fail("model drift must stop before embedding"))
+
+    assert ingest_x.x_atom_from_url(conn, fake_embedder, _TWEET_URL) == ("failed", None)
+    assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
+
+
 def test_preview_answers_already_present_for_free(conn):
     schema.upsert_atom(conn, {"atom_id": _ARTICLE_ATOM, "source_type": "blog"})
     out = hopper.save(conn, None, _ARTICLE_URL)
     assert out["already_present"] is True
-    assert "no fetch, no spend" in out["note"]
+    assert "no-op" in out["note"]
 
 
 def test_an_unroutable_reference_reports_and_writes_nothing(conn):
@@ -316,6 +495,20 @@ def test_a_blocked_page_stores_nothing(conn, fake_embedder, monkeypatch):
     out = hopper.save(conn, fake_embedder, _ARTICLE_URL, confirm=True)
 
     assert out["status"] == "blocked" and out["atom_id"] is None
+    assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
+
+
+def test_a_model_mismatch_stops_a_direct_article_save_before_any_work(conn, fake_embedder,
+                                                                        monkeypatch):
+    """The Blog hand-dump must reject model drift before fetching or embedding, like its crawl."""
+    ensure_kb_meta(conn, "model-a", fake_embedder.dim, fake_embedder.provider)
+    fake_embedder.model = "model-b"
+    monkeypatch.setattr("pipeline.ingestion.sources.blog._fetch_article",
+                        lambda *_: pytest.fail("model drift must stop before fetching"))
+    monkeypatch.setattr(fake_embedder, "embed",
+                        lambda *_a, **_kw: pytest.fail("model drift must stop before embedding"))
+
+    assert ingest_blog.article_atom_from_url(conn, fake_embedder, _ARTICLE_URL) == ("failed", None)
     assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
 
 

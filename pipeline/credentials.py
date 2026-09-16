@@ -65,50 +65,6 @@ def s2_headers() -> dict[str, str]:
     return headers
 
 
-def _write_env_atomic(path: Path, lines: list[str]) -> None:
-    """Write .env via temp-file + os.replace so a crash can't leave a half-written
-    (truncated) file. os.replace is atomic within a filesystem, and chmod-ing the
-    temp before the rename means the secret is never world-readable, even briefly.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(lines) + "\n")
-    tmp.chmod(0o600)
-    os.replace(tmp, path)
-
-
-def store_credentials(updates: dict[str, str], env_path: Path | None = None) -> Path:
-    """Write SEVERAL credentials to the .env in ONE atomic replace.
-
-    Use for credential SETS that must land together, e.g. X's access+refresh pair — X invalidates
-    the old refresh token on every refresh, so persisting only half the pair bricks the next run.
-    `updates` maps service name (see SERVICES) -> value; also updates os.environ.
-    """
-    unknown = [s for s in updates if s not in SERVICES]
-    if unknown:
-        raise ValueError(f"Unknown service(s): {unknown}. Valid: {list(SERVICES.keys())}")
-
-    path = _env_file_path(env_path)
-    lines = path.read_text().splitlines() if path.exists() else []
-
-    for service, value in updates.items():
-        env_var = SERVICES[service]
-        for i, line in enumerate(lines):
-            if line.startswith(f"{env_var}="):
-                lines[i] = f"{env_var}={value}"
-                break
-        else:
-            lines.append(f"{env_var}={value}")
-
-    _write_env_atomic(path, lines)
-
-    # Reflect into the live process only after the on-disk write succeeds.
-    for service, value in updates.items():
-        os.environ[SERVICES[service]] = value
-
-    return path
-
-
 def validate_credential(service: str, key: str) -> tuple[bool, str]:
     """Per-service validation. Returns (success, message).
 
@@ -120,7 +76,7 @@ def validate_credential(service: str, key: str) -> tuple[bool, str]:
       error — S2 ignores it and silently drops you back to the shared anonymous pool. A format
       check would "pass" a dead key and the user would never learn why they still get 429s.
     """
-    from pipeline.llm_client import known_providers, validate_provider
+    from pipeline.llm_providers import known_providers, validate_provider
     if service in known_providers():
         return validate_provider(service, key)
     if service == "github":

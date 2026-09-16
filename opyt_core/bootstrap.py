@@ -14,8 +14,6 @@ dev-checkout guard were removed 2026-08-13 as dead/broken. See
 """
 from __future__ import annotations
 
-import json
-
 import yaml
 
 from . import config
@@ -55,6 +53,3 @@ def ensure_initialized() -> dict:
     Runs on EVERY session, not once per machine — see the module docstring."""
     return {"config_written": ensure_config()}
 
-
-if __name__ == "__main__":
-    print(json.dumps(ensure_initialized(), indent=2))

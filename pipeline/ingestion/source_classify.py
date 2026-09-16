@@ -1,15 +1,11 @@
 """
 pipeline/ingestion/source_classify.py
 
-A richer sibling to `discover_profile._classify_url`, which returns a bare type string
-and is pinned by 3 live callers that expect exactly that. This returns a typed
-`ProfileLink` carrying three extra facts hub expansion and atom-KB onboarding need:
-``is_profile`` (account/home page vs an artifact like a repo or a post), ``shape``
-("org" vs "personal" — org-shaped links become an affiliation edge, not the Oracle's
-own atoms), and ``handle`` (for matching a surfaced profile into ``same_entity``).
+Classify links for profile discovery: account vs artifact, organization vs person,
+and the account handle. `canonical_identity` owns URL exclusions for both discovery
+classifiers and the trust graph. Empty or excluded links return ``None``.
 
-Pure: stdlib only, no network. Unparseable/empty input returns ``None`` (fail-safe).
-Kept separate from ``_classify_url`` so the live probe path stays byte-for-byte unchanged.
+Pure: no network.
 """
 
 from __future__ import annotations
@@ -17,12 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
+from pipeline.ingestion.url_canon import canonical_identity
+
 
 @dataclass(frozen=True)
 class ProfileLink:
     """A classified link. ``url`` is the original string (callers canonicalize)."""
 
-    type: str          # github|scholar|orcid|substack|blog|x|youtube|linkedin|paper|podcast|medium|gitlab
+    type: str          # github|scholar|orcid|substack|blog|x|paper|medium|gitlab
     is_profile: bool   # True = account/home; False = an artifact (repo/abs/watch/post)
     handle: str | None # account handle, else None
     shape: str         # "personal" | "org" | "unknown"
@@ -31,20 +29,22 @@ class ProfileLink:
 
 # ── Host tables ───────────────────────────────────────────────────────────────
 
-_YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
-_PODCAST_HOSTS = {"open.spotify.com", "spotify.com", "podcasts.apple.com", "apple.co",
-                  "pod.link", "overcast.fm", "pca.st"}
 _PAPER_HOSTS = {"arxiv.org", "doi.org", "biorxiv.org", "www.biorxiv.org",
                 "medrxiv.org", "papers.ssrn.com", "openreview.net",
                 "aclanthology.org", "dl.acm.org", "pubmed.ncbi.nlm.nih.gov"}
 
 # First path segments on github.com / x.com that are NOT a user account.
-_GITHUB_RESERVED = {"orgs", "about", "pricing", "features", "marketplace", "sponsors",
-                    "settings", "login", "join", "explore", "topics", "trending",
-                    "collections", "events", "apps", "team", "enterprise", "security",
-                    "notifications", "new", "organizations", "site", "contact",
-                    "customer-stories", "readme", "mobile", "nonprofit", "education",
-                    "search", "pulls", "issues", "codespaces"}
+# github.com's own product/route first-segments — NOT user/org owners. PUBLIC because a second
+# module asks the same question: `pipeline.kb.ingest_github` reads it to decide whether a bio
+# link's first segment names a person. It kept a private copy of 28 until 2026-09-06 and the two
+# had already drifted six entries apart — this list is their union, and one list is the point.
+# Anything reserved that slips through 404s the fetch.
+GITHUB_RESERVED = {"about", "account", "apps", "codespaces", "collections", "contact",
+                   "customer-stories", "dashboard", "education", "enterprise", "events",
+                   "explore", "features", "issues", "join", "login", "marketplace",
+                   "mobile", "new", "nonprofit", "notifications", "organizations", "orgs",
+                   "pricing", "pulls", "readme", "search", "security", "settings", "site",
+                   "sponsors", "team", "topics", "trending"}
 _X_RESERVED = {"home", "explore", "notifications", "messages", "search", "settings",
                "i", "intent", "hashtag", "compose", "login", "logout", "signup",
                "tos", "privacy", "about", "share"}
@@ -79,15 +79,13 @@ def _domain_label(host: str) -> str | None:
 
 def classify_source(url: str) -> ProfileLink | None:
     """Classify a URL into a typed ``ProfileLink``, or ``None`` if unusable."""
-    if not url or not url.strip():
+    if not canonical_identity(url):
         return None
     raw = url.strip()
-    # Non-web hrefs (mailto:/tel:/javascript:/…) are not profiles — real blog HTML is
-    # full of them, and without this they'd urlparse into a bogus host+label.
-    if raw.lower().startswith(("mailto:", "tel:", "javascript:", "data:", "file:",
-                               "sms:", "ftp:", "#")):
+    # HTML hrefs need an explicit web scheme: a relative page is not a new host.
+    if not raw.lower().startswith(("http://", "https://")):
         return None
-    parsed = urlparse(raw if "://" in raw else "https://" + raw)
+    parsed = urlparse(raw)
     host = _host_of(parsed)
     if not host:
         return None
@@ -100,7 +98,7 @@ def classify_source(url: str) -> ProfileLink | None:
     # ── arXiv AUTHOR listing (arxiv.org/a/name) is a research PROFILE, not a paper —
     #    check before the paper-host bucket, which would otherwise swallow it. ──
     if host == "arxiv.org" and segs and segs[0].lower() == "a":
-        return mk("scholar", True, segs[1] if len(segs) >= 2 else None, "personal")
+        return mk("scholar", len(segs) in (2, 3), segs[-1], "personal")
 
     # ── Papers / PDFs / DOIs — always artifacts, never a person's profile ──
     if host in _PAPER_HOSTS or host.endswith(".arxiv.org") or path_l.endswith(".pdf"):
@@ -113,7 +111,7 @@ def classify_source(url: str) -> ProfileLink | None:
         first = segs[0].lower()
         if first == "orgs" and len(segs) >= 2:
             return mk("github", True, segs[1].lower(), "org")       # github.com/orgs/<org>
-        if first in _GITHUB_RESERVED:
+        if first in GITHUB_RESERVED:
             return mk("github", False, None, "unknown")             # a feature page, not a user
         if len(segs) == 1:
             return mk("github", True, first, "personal")            # github.com/<user>
@@ -136,20 +134,9 @@ def classify_source(url: str) -> ProfileLink | None:
             return mk("x", False, first, "personal")               # a tweet = artifact
         return mk("x", True, first, "personal")                    # x.com/<handle>
 
-    # ── YouTube ──
-    if host in _YOUTUBE_HOSTS:
-        if host == "youtu.be":
-            return mk("youtube", False, None, "unknown")           # short video link
-        if not segs:
-            return mk("youtube", False, None, "unknown")
-        first = segs[0]
-        if first.startswith("@"):
-            return mk("youtube", True, first[1:].lower(), "personal")
-        if first.lower() in ("channel", "c", "user") and len(segs) >= 2:
-            return mk("youtube", True, segs[1].lower(), "personal")
-        return mk("youtube", False, None, "unknown")               # watch/playlist/results
-
     # ── Substack (subdomain owns identity) ──
+    if host == "substack.com":
+        return mk("substack", False, None, "unknown")
     if host.endswith(".substack.com"):
         sub = host[: -len(".substack.com")]
         if not sub or sub == "www":
@@ -168,46 +155,34 @@ def classify_source(url: str) -> ProfileLink | None:
         return mk("blog", not segs, sub or None, "personal")
 
     # ── Scholar / academic identity ──
-    if host.startswith("scholar.google."):
-        if "citations" in path_l:
+    if host == "scholar.google.com":
+        if parsed.path.rstrip("/") == "/citations":
             user = (parse_qs(parsed.query).get("user") or [None])[0]
             return mk("scholar", bool(user), user, "personal")
         return mk("scholar", False, None, "unknown")               # a search, not a profile
-    if host.endswith("semanticscholar.org"):
+    if (host == "semanticscholar.org" or host.endswith(".semanticscholar.org")):
         if segs and segs[0].lower() == "author":
-            return mk("scholar", True, segs[1] if len(segs) >= 2 else None, "personal")
+            return mk("scholar", len(segs) in (2, 3), segs[-1], "personal")
         return mk("scholar", False, None, "unknown")
     if host == "orcid.org":
-        return mk("orcid", bool(segs), segs[0] if segs else None, "personal")
+        return mk("orcid", len(segs) == 1, segs[0] if segs else None, "personal")
     # dblp — the canonical CS bibliography; author pages live at /pid/… or /pers/….
     if host == "dblp.org" or host.endswith(".dblp.org"):
         if segs and segs[0].lower() in ("pid", "pers"):
             return mk("scholar", True, segs[-1].replace(".html", "").lower(), "personal")
-        return mk("scholar", bool(segs), None, "unknown")
+        return mk("scholar", False, None, "unknown")
     # ResearchGate / Academia.edu — profile pages (lower-signal, mostly reposts).
-    if host.endswith("researchgate.net"):
+    if (host == "researchgate.net" or host.endswith(".researchgate.net")):
         if len(segs) >= 2 and segs[0].lower() == "profile":
             return mk("scholar", True, segs[1].lower(), "personal")
         return mk("scholar", False, None, "unknown")
     if host == "academia.edu" or host.endswith(".academia.edu"):
         sub = host[: -len(".academia.edu")] if host != "academia.edu" else ""
-        if sub and sub != "www":
+        if sub and not segs:
             return mk("scholar", True, sub, "personal")           # {name}.academia.edu
-        if segs:
-            return mk("scholar", True, segs[0].lower(), "personal")  # academia.edu/{id}
+        if len(segs) == 1 and not segs[0].isdigit():
+            return mk("scholar", True, segs[0].lower(), "personal")
         return mk("scholar", False, None, "unknown")
-
-    # ── LinkedIn ──
-    if host.endswith("linkedin.com"):
-        if segs and segs[0].lower() == "in" and len(segs) >= 2:
-            return mk("linkedin", True, segs[1].lower(), "personal")
-        if segs and segs[0].lower() in ("company", "school") and len(segs) >= 2:
-            return mk("linkedin", True, segs[1].lower(), "org")
-        return mk("linkedin", False, None, "unknown")
-
-    # ── Podcasts (discovered but not part of PROFILE_SCOPE / atom ingest) ──
-    if host in _PODCAST_HOSTS:
-        return mk("podcast", False, None, "unknown")
 
     # ── Default: a personal site / blog. Bare host = the profile; a path = a page. ──
     return mk("blog", len(segs) == 0, _domain_label(host), "unknown")

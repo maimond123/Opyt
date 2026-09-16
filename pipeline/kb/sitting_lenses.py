@@ -9,7 +9,7 @@ is a lens, not a rail (docs/plans/2026-08-16-sitting-rail-handoff.md).
 ⚠️ THIS FILE SPENDS NOW (amended 2026-08-24). It used to call no model at all: a lens handed the
 host one region's document and the host read it in-session. That could not survive chained parts —
 David judged the claims notebook TOO LOSSY as the sole carrier of old parts for lens questions
-(trajectory gutted, disconfirmation and sprouts likewise; the notebook is the paid-read chain's
+(trajectory gutted, disconfirmation and sprouts likewise; the notebook is the read chain's
 memory, and a lens is a different consumer).
 
 So a sitting-scoped lens is now MAP-REDUCE:
@@ -17,8 +17,8 @@ So a sitting-scoped lens is now MAP-REDUCE:
   MAP (here, code-driven) — a for loop over the region's part chain, one model call per part with
   the lens's map instruction. Never model discretion: a host walking a cursor protocol answers
   early from partial material, and that was rejected on exactly that ground. Outputs are cached per
-  (sitting, lens) in `sitting_lens_outputs`; closed parts are FROZEN, so a part is mapped once per
-  lens EVER and steady state is one call for the open part.
+  (sitting, lens) in `sitting_lens_outputs`. Closed parts reuse their output until atom removal
+  invalidates it; steady state is one call for the open part.
 
   REDUCE (host, in-session) — the host receives ONE compact document, the per-part outputs labeled
   with their date ranges, plus the lens's JOIN rule. It holds the search tools, so the reconcile is
@@ -55,7 +55,7 @@ class LensError(ValueError):
 
 # ── Instructions — no tuning history to carry, unlike `sitting_reader._SYSTEM` ──────────────────
 # That prompt is calibrated for a WEAKER model reached over the API (D18: redundancy first, then
-# price) and every rule in it was bought by a measured failure against a real window, run three
+# tradeoff) and every rule in it was established by a measured failure against a real window, run three
 # times. These run on the host model in the session — "frontier-grade" is D17's own word for it —
 # so the instructions below trust general reading competence and are precise only about FRAMING:
 # what question this lens is answering, and the one failure mode particular to it.
@@ -166,7 +166,7 @@ def _instruction(lens: str, *, claim: str | None) -> str:
 
 
 def _map_part(conn, sitting_id: str, lens: str, *, ref: datetime) -> dict | None:
-    """One part's map output — a cache hit, or one paid call. None when the call could not be made.
+    """One part's map output — a cache hit, or one model call. None when the call could not be made.
 
     Follows the canonical call sequence the two API lenses use (resolve backend → preflight
     degrade-open → call → the 402 branch → usage), and re-applies `MAX_INPUT_CHARS` because
@@ -194,14 +194,13 @@ def _map_part(conn, sitting_id: str, lens: str, *, ref: datetime) -> dict | None
         resp = core.call(backend, _map_instruction(lens), document)
     except Exception as e:
         if getattr(e, "status", None) == 402:
-            log(f"[sitting-lenses] OUT OF CREDITS (HTTP 402) — {lens} map on {sitting_id} rejected "
-                f"before inference, nothing spent. Upstream: {e}")
+            log(f"[sitting-lenses] provider rejected {lens} map on {sitting_id} (HTTP 402): {e}")
         else:
             log(f"[sitting-lenses] {lens} map failed on {sitting_id}: {type(e).__name__}: {e}")
         return None
 
     usage = {"model": resp.model, "in_tokens": resp.input_tokens,
-             "out_tokens": resp.output_tokens, "cost_usd": resp.cost_usd}
+             "out_tokens": resp.output_tokens}
     text = (resp.text or "").strip()
     if not text:
         log(f"[sitting-lenses] {lens} map returned nothing for {sitting_id} — not cached")
@@ -213,15 +212,15 @@ def _map_part(conn, sitting_id: str, lens: str, *, ref: datetime) -> dict | None
 
 def read_lens(conn, lens: str, *, sitting_id: str | None = None, claim: str | None = None,
              ref: datetime | None = None) -> dict:
-    """`{status, lens, instruction, document, parts, spent_usd, ...}` — the MAP, plus the JOIN rule
+    """`{status, lens, instruction, document, parts, ...}` — the MAP, plus the JOIN rule
     the host reduces with.
 
     ⚠️ SPENDS on a cache miss, which is a change from this function's original contract (it called
-    no model at all). One call per uncached (part, lens): a closed part is frozen so it is mapped
-    once per lens EVER, and steady state on any region is one call for the open tail.
+    no model at all). One call per uncached (part, lens): closed parts reuse their output unless
+    atom removal invalidates it. Steady state is one call for the open tail.
 
     `document` is the per-part outputs labeled with the stretch each covers — NOT the region's raw
-    text. That compaction is the point: the claims notebook is the paid-read chain's memory and was
+    text. That compaction is the point: the claims notebook is the read chain's memory and was
     judged too lossy to be a lens's memory too.
 
     The loop is CODE, never model discretion. A host handed a cursor protocol and told to walk the
@@ -251,7 +250,7 @@ def read_lens(conn, lens: str, *, sitting_id: str | None = None, claim: str | No
         raise KeyError(f"no sitting {sitting_id!r}")
 
     chain = sst.ancestors(conn, sitting_id) + [sitting_id]
-    parts, blocks, spent, missing = [], [], 0.0, []
+    parts, blocks, missing = [], [], []
     for i, sid in enumerate(chain, start=1):
         got = _map_part(conn, sid, lens, ref=ref)
         if got is None:
@@ -262,12 +261,18 @@ def read_lens(conn, lens: str, *, sitting_id: str | None = None, claim: str | No
                       "cached": got["cached"]})
         blocks.append(f"## Part {i} of {len(chain)} — covering {lo}–{hi}  (`{sid}`)\n\n"
                       f"{got['output']}")
-        if not got["cached"]:
-            spent += float(got.get("cost_usd") or 0.0)
+
+    if not blocks:
+        # EVERY part failed. `missing_parts` below is right for a HOLE, but no parts at all is not
+        # a degraded answer — and `ok` would tell the host to write one from an empty string.
+        reason = f"no part of this region could be read ({len(missing)} attempted)"
+        log(f"[sitting-lenses] {lens} skipped: {reason}")
+        return {"status": "skipped", "lens": lens, "sitting_id": sitting_id, "reason": reason,
+                "missing_parts": missing, "parts": []}
 
     out = {"status": "ok", "lens": lens, "sitting_id": sitting_id,
            "instruction": _instruction(lens, claim=claim),
-           "document": "\n\n".join(blocks), "parts": parts, "spent_usd": round(spent, 6)}
+           "document": "\n\n".join(blocks), "parts": parts}
     if missing:
         # Never silent: a reconcile over a region with a hole in it must say which stretch is
         # absent, or the join reads as complete.

@@ -18,15 +18,13 @@ an event loop, so a coroutine had nothing to attach to.
 Cloudflare on Groq/OpenRouter blocks Python's default UA, so we always send a
 browser-shaped UA to avoid 1010 errors.
 
-Pricing/cost-accounting (`pipeline/llm_spend.py`), latency telemetry
-(`pipeline/llm_telemetry.py`), and provider discovery (`pipeline/llm_providers.py`) live in
-separate modules; this file re-exports them for backward compatibility (see the compat
-section at the bottom).
+Latency telemetry (`pipeline/llm_telemetry.py`) and provider discovery
+(`pipeline/llm_providers.py`) live in separate modules. Local provider-charge estimates were
+deliberately removed: Opyt retains response and token metadata.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import time
@@ -38,7 +36,7 @@ from typing import Any
 from opyt_core import credentials_registry
 from opyt_core.config import merge_provider_routing
 
-from pipeline import llm_spend, llm_telemetry
+from pipeline import llm_telemetry
 from pipeline.ingestion.utils import load_yaml_config
 
 # Cloudflare 1010 fix — both Groq + some OpenRouter routes need this.
@@ -61,11 +59,8 @@ class LLMResponse:
     text: str
     model: str
     provider: str
-    role: str
     input_tokens: int
     output_tokens: int
-    cost_usd: float
-    elapsed_s: float
     raw: dict | None = field(default=None, repr=False)
 
 
@@ -106,7 +101,7 @@ class ModelUnroutableError(_BackendError):
     retrying it will never succeed. Excluded from the circuit breaker (`ignore=`) so one
     unroutable role can't trip the shared breaker for every other role. Callers should treat it
     as terminal for the whole run, not retry per item. See `pipeline/model_routing.py` for the
-    preflight that catches this before any spend.
+    preflight that catches this before any request.
     """
 
 
@@ -117,28 +112,10 @@ _UNROUTABLE_MARKERS = ("all providers have been ignored", "no allowed providers"
                        "no providers available")
 
 
-# Last-seen provider rate-limit headers across llm_client calls. Best-effort last-write-wins;
-# a header read never breaks a call.
-_LAST_RATE_LIMIT: dict = {}
-
-
-def _note_rate_limit(headers) -> None:
-    try:
-        found = {k: v for k, v in headers.items()
-                 if any(t in k.lower() for t in
-                        ("ratelimit", "rate-limit", "retry-after", "credit", "quota", "remaining"))}
-        if found:
-            _LAST_RATE_LIMIT.clear()
-            _LAST_RATE_LIMIT.update(found)
-    except Exception:
-        pass
-
-
 def _http_json(req: urllib.request.Request, timeout: float = 180.0) -> tuple[dict, float]:
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            _note_rate_limit(resp.headers)
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:500]
@@ -154,7 +131,7 @@ def _http_json(req: urllib.request.Request, timeout: float = 180.0) -> tuple[dic
 _or_breaker = None
 def _openrouter_breaker():
     """Lazy module-level breaker: an OpenRouter outage trips once and every caller
-    (across sessions — state persists) fails fast instead of re-billing retries."""
+    (across sessions — state persists) fails fast instead of repeating futile retries."""
     global _or_breaker
     if _or_breaker is None:
         from pipeline.circuit_breaker import CircuitBreaker
@@ -187,8 +164,6 @@ def _call_openrouter_sync(model: str, system: str, user: str, max_tokens: int,
         ],
         "temperature": 0.2,
         "max_tokens": max_tokens,
-        # Explicit request for usage accounting — `call()` bases real spend on `usage.cost`.
-        "usage": {"include": True},
     }
     if frequency_penalty is not None:
         body["frequency_penalty"] = frequency_penalty
@@ -197,7 +172,7 @@ def _call_openrouter_sync(model: str, system: str, user: str, max_tokens: int,
         # require_parameters: only route to a provider that honors JSON mode.
         body["response_format"] = {"type": "json_object"}
         prefs["require_parameters"] = True
-    # Upstream routing (deny broken upstreams, rank rest by throughput — see opyt_core.config)
+    # Upstream routing (deny broken upstreams, rank rest by latency — see opyt_core.config)
     # applies to every chat role, not just JSON ones, since it's a shared transport concern.
     # Lives here, not in `call()`, because provider routing is an OpenRouter-specific concept.
     prefs = merge_provider_routing(prefs)
@@ -239,6 +214,13 @@ def _get_backend(provider: str):
     return _BACKENDS[provider]
 
 
+def _serving_upstream(provider: str, raw: dict | None) -> str:
+    """The upstream that served a call, for latency telemetry only."""
+    if provider == "openrouter":
+        return str((raw or {}).get("provider") or "unknown")
+    return provider or "unknown"
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -272,24 +254,14 @@ def call(role: str, *, system: str, user: str, model: str | None = None,
     text, in_tok, out_tok, elapsed, raw = backend(
         role_cfg["model"], system, user, role_cfg["max_tokens"], **extra
     )
-    # Real charge first, table second: which upstream actually served the request changes the
-    # true price, so prefer the reported cost and fall back to the static table only when absent.
-    cost = llm_spend._reported_cost(raw)
-    if cost is None:
-        cost = llm_spend.cost_for(role_cfg["model"], in_tok, out_tok)
-    # Recorded on both surfaces since neither is derivable after the fact (`raw` isn't persisted).
-    upstream = llm_spend._serving_upstream(provider, raw)
-    llm_spend._bump_stats(role, role_cfg["model"], in_tok, out_tok, cost, upstream=upstream)
+    upstream = _serving_upstream(provider, raw)
     llm_telemetry._record_latency(role, elapsed, upstream=upstream)
     return LLMResponse(
         text=text.strip(),
         model=role_cfg["model"],
         provider=provider,
-        role=role,
         input_tokens=in_tok,
         output_tokens=out_tok,
-        cost_usd=cost,
-        elapsed_s=elapsed,
         raw=raw,
     )
 
@@ -316,19 +288,15 @@ def _set_backend_for_tests(provider: str, fn) -> None:
     _BACKENDS[provider] = fn
 
 
-# ── Backward-compatible re-exports (step 7 split; keep for one release) ──────
-# `llm_spend`/`llm_telemetry`/`llm_providers` own this code now; `__getattr__` (PEP 562) forwards
-# lookups like `llm_client.spend_today()` LIVE to wherever the name actually lives, so module-level
-# data reassigned elsewhere (e.g. `llm_spend._STATS`) never goes stale here. Only reads are
-# forwarded — no production code writes through `llm_client` directly.
-_REEXPORTS = (llm_spend, llm_telemetry)
+# ── Backward-compatible telemetry re-export ──────────────────────────────────
+# `llm_telemetry` owns this code; `__getattr__` keeps existing telemetry readers live without
+# giving `llm_client` a second writable state store. Provider discovery is imported directly by
+# its callers so the two modules do not form an import cycle.
+_REEXPORTS = (llm_telemetry,)
 
 
 def __getattr__(name: str):
-    # llm_providers imports llm_client back, so it's imported lazily here to avoid a cross-import
-    # ordering dependency at module load time.
-    from pipeline import llm_providers
-    for module in (*_REEXPORTS, llm_providers):
+    for module in _REEXPORTS:
         if hasattr(module, name):
             return getattr(module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

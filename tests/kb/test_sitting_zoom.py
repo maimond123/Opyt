@@ -7,9 +7,6 @@ The claims here are the ones that would be invisible in production if they broke
   • OVER-SPLITTING SELF-CORRECTS. Derived-k is only safe because a homogeneous region collapses back
     to ~1 sub-region under the merge. That is asserted here, not assumed, because it is the entire
     argument for not running silhouette.
-  • THE SWEEP WRITES NOTHING. It is a measurement, and a measurement that writes is a trap.
-  • THE PLATEAU IS REAL. `distinct` naming the region's part count is the claim D2b rests on, so it
-    is tested on a region whose true part count is planted and therefore known.
   • ZOOM IS FREE. No LLM call, no `frontier_queries` row. Positive control: the LLM entry point is
     stubbed to raise, and zoom must still complete.
 """
@@ -289,7 +286,7 @@ def test_a_covered_parent_reports_no_drops(conn):
 # ── D5: sub-sittings are ordinary sittings ──────────────────────────────────────
 def test_sub_sittings_are_ordinary_sittings_with_a_parent_link(conn):
     """They persist as `seed_kind='vector'` rows labelled `<parent>/<i>`, so the ledger, the read
-    queue, the daily cap and `--preview` all apply with no new code."""
+    queue and the daily cap all apply with no new code."""
     _planted(conn, axes=(1, 2))
     p = _parent(conn)
     rep = sz.zoom(conn, p["sitting_id"], k=2, floor=0.70)
@@ -301,8 +298,10 @@ def test_sub_sittings_are_ordinary_sittings_with_a_parent_link(conn):
         assert s["seed_ref"].startswith(f"{p['seed_ref']}/")
         assert s["parent_sitting_id"] == p["sitting_id"]
 
-    from pipeline.kb import sitting_reader as sr
-    queued = {r["sitting_id"] for r in sr.unread_sittings(conn)}
+    # In the read queue, asserted on the predicate that DEFINES it rather than on a listing
+    # helper — `sitting_reader.unread_sittings` was the deleted CLI's and went with it.
+    queued = {r[0] for r in conn.execute(
+        "SELECT sitting_id FROM sittings WHERE read_at IS NULL AND atoms > 0")}
     assert {row["sitting_id"] for row in kids} <= queued
 
 
@@ -413,108 +412,6 @@ def test_building_a_sub_sitting_is_not_reading_it(conn):
 
 
 # ── the sweep ───────────────────────────────────────────────────────────────────
-def test_the_sweep_persists_nothing(conn):
-    """It is a MEASUREMENT. A measurement that writes is a trap: the sweep would queue up to
-    2+3+4+6+8+12 sub-sittings for a question that was only ever "how many parts are there"."""
-    _planted(conn, axes=(1, 2, 3))
-    p = _parent(conn)
-    before = _tables(conn)
-    rep = sz.sweep_k(conn, p["sitting_id"], ks=[2, 3, 4, 6, 8], floor=0.70)
-    assert rep["rows"]
-    assert _tables(conn) == before
-
-
-def test_the_sweep_scores_every_k_in_one_relevance_pass(conn, monkeypatch):
-    """`_relevance` already takes several seed vectors, so 5 k values stack into one matrix. Without
-    this the sweep is 23 sequential corpus scans and stops feeling free — and a measurement nobody
-    runs decides nothing."""
-    _planted(conn, axes=(1, 2, 3))
-    p = _parent(conn)
-    calls = []
-    real = sv._relevance
-
-    def counted(c, seeds, **kw):
-        calls.append(seeds)
-        return real(c, seeds, **kw)
-
-    monkeypatch.setattr(sv, "_relevance", counted)
-    sz.sweep_k(conn, p["sitting_id"], ks=[2, 3, 4, 6, 8], floor=0.70)
-    assert len(calls) == 1, f"{len(calls)} corpus scans for 5 k values"
-    assert len(calls[0]) == 2 + 3 + 4 + 6 + 8
-
-
-def test_distinct_after_merge_plateaus_at_the_planted_part_count(conn):
-    """THE CLAIM D2b RESTS ON, asserted on data whose true answer is known. Three planted clusters:
-    raising k past 3 must keep producing 3 distinct sub-regions, because the extra centroids land
-    inside clusters that are already covered and merge away."""
-    _planted(conn, axes=(1, 2, 3), per=8)
-    p = _parent(conn)
-    rep = sz.sweep_k(conn, p["sitting_id"], ks=[2, 3, 4, 6, 8], floor=0.70)
-    got = {r["k"]: r["distinct"] for r in rep["rows"]}
-    assert got[2] < 3, "asking for too FEW pieces must under-count, or the plateau means nothing"
-    assert got[3] == 3
-    assert got[4] == got[6] == got[8] == 3, f"distinct did not plateau at 3: {got}"
-    assert "plateaus at 3 from k=3" in sz.render_sweep(rep)
-
-
-def test_a_sweep_that_never_plateaus_says_so_instead_of_naming_a_number(conn):
-    """THE REPORTING TRAP, caught on the real corpus 2026-08-10: reading the largest `distinct` as
-    the answer finds a plateau wherever the sweep happened to stop. On the real mlx region distinct
-    grew 6 -> 37 across k = 6 -> 60 and never flattened, and an unconditional line would have
-    announced "~37 sub-conversations" purely because 60 was the last column."""
-    rising = {"rows": [{"k": 2, "distinct": 2, "merged": 0}, {"k": 4, "distinct": 4, "merged": 0},
-                       {"k": 8, "distinct": 7, "merged": 1}]}
-    assert "NO PLATEAU" in sz._plateau_note(rising["rows"])
-    flat = [{"k": 2, "distinct": 2, "merged": 0}, {"k": 4, "distinct": 3, "merged": 1},
-            {"k": 8, "distinct": 3, "merged": 5}]
-    assert "plateaus at 3 from k=4" in sz._plateau_note(flat)
-
-
-def test_the_sweep_reports_the_drop_count_rising_with_k(conn):
-    """`parent dropped` is D1's cost becoming visible: a finer split leaves more fringe atoms outside
-    every sub-centroid. It must be monotone in the sense that it can never DECREASE below what the
-    coarsest split already dropped by chance — here, simply that the column is real and bounded."""
-    _planted(conn, axes=(1, 2, 3))
-    p = _parent(conn)
-    rep = sz.sweep_k(conn, p["sitting_id"], ks=[2, 4], floor=0.75)
-    for r in rep["rows"]:
-        assert 0 <= r["parent_dropped"] <= rep["parent_atoms"]
-        assert r["tokens"] >= 0 and r["max_size"] >= r["med_size"]
-
-
-def test_the_sweep_reprojects_only_the_long_atoms(conn, monkeypatch):
-    """THE HOIST THE SWEEP'S COST RESTS ON. Rendered size is seed-dependent only above
-    `LONG_ATOM_TOKENS`; below it an atom renders in full whatever centroid scored it. So the sweep
-    fetches chunk spans once, bills every short atom once from `whole_tokens`, and re-projects only
-    the long atoms — turning (k values x regions x atoms) into (k values x regions x LONG atoms),
-    and decoding chunk vectors for the long atoms alone.
-
-    Asserted on WHICH ids reach `projection`, because the arithmetic is identical either way: a
-    regression here costs nothing but time, so nothing else would ever catch it."""
-    _planted(conn, axes=(1, 2))
-    long_id = _long_atom(conn, axis=1)
-    p = _parent(conn)
-    seen, real = [], sre.projection
-
-    def counted(c, ids, **kw):
-        seen.append(list(ids))
-        return real(c, ids, **kw)
-
-    monkeypatch.setattr(sre, "projection", counted)
-    rep = sz.sweep_k(conn, p["sitting_id"], ks=[2, 3], floor=0.70)
-    assert rep["rows"] and seen, "the sweep must still project the long material"
-    assert {a for call in seen for a in call} == {long_id}
-    assert all(r["tokens"] > 0 for r in rep["rows"])
-
-
-def test_the_sweep_deduplicates_repeated_k_values(conn):
-    _planted(conn, axes=(1, 2))
-    p = _parent(conn)
-    rep = sz.sweep_k(conn, p["sitting_id"], ks=[3, 3, 3], floor=0.70)
-    assert len(rep["rows"]) == 1
-
-
-# ── degradation ─────────────────────────────────────────────────────────────────
 def test_zooming_an_unembedded_parent_returns_a_reason_not_a_crash(conn):
     """FAIL-SAFE, same rule as the builder: a store whose embed pass has not run degrades to an
     empty fracture that says which failure this is."""
@@ -524,7 +421,6 @@ def test_zooming_an_unembedded_parent_returns_a_reason_not_a_crash(conn):
     conn.commit()
     rep = sz.zoom(conn, p["sitting_id"], floor=0.70)
     assert rep["reason"] and rep["sub"] == [] and rep["k"] == 0
-    assert sz.sweep_k(conn, p["sitting_id"], ks=[2, 3])["reason"]
 
 
 def test_zooming_a_missing_sitting_raises(conn):
@@ -556,39 +452,23 @@ def test_an_older_store_gains_the_parent_column_on_open(kb_home):
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
-def test_cli_zoom_prints_the_report_and_persists(conn, capsys):
+def test_a_trial_zoom_records_nothing(conn):
+    """`sitting_scheduler._fracture` runs `zoom(persist=False)` to DECIDE and only then
+    `persist=True`, so a trial that wrote would double every fracture."""
     _planted(conn, axes=(1, 2))
     p = _parent(conn)
     conn.commit()
-    assert sb.main(["zoom", "--sitting", p["sitting_id"], "--k", "2", "--floor", "0.70"]) == 0
-    out = capsys.readouterr().out
-    assert "parent:" in out and "k = 2" in out
-    assert "parent atoms fell below every sub-centroid" in out
+    before = _tables(conn)
+    sz.zoom(conn, p["sitting_id"], k=2, floor=0.70, persist=False)
+    assert _tables(conn) == before
+
+
+def test_a_persisted_zoom_records_its_sub_regions(conn):
+    """The other half of the same seam: `persist=True` is what the scheduler commits, and the
+    sub-regions have to be findable under the parent afterwards."""
+    _planted(conn, axes=(1, 2))
+    p = _parent(conn)
+    conn.commit()
+    rep = sz.zoom(conn, p["sitting_id"], k=2, floor=0.70, persist=True)
+    assert rep["k"] == 2
     assert _zoomed_from(conn, p["sitting_id"])
-
-
-def test_cli_sweep_prints_the_table_and_writes_nothing(conn, capsys):
-    _planted(conn, axes=(1, 2, 3))
-    p = _parent(conn)
-    conn.commit()
-    before = _tables(conn)
-    assert sb.main(["zoom", "--sitting", p["sitting_id"], "--sweep", "2,3,4",
-                    "--floor", "0.70"]) == 0
-    out = capsys.readouterr().out
-    assert "distinct" in out and "persists NOTHING" in out
-    assert _tables(conn) == before
-
-
-def test_cli_zoom_dry_run_records_nothing(conn, capsys):
-    _planted(conn, axes=(1, 2))
-    p = _parent(conn)
-    conn.commit()
-    before = _tables(conn)
-    assert sb.main(["zoom", "--sitting", p["sitting_id"], "--k", "2", "--floor", "0.70",
-                    "--dry-run"]) == 0
-    assert _tables(conn) == before
-
-
-def test_cli_zoom_on_a_missing_sitting_exits_one(conn, capsys):
-    assert sb.main(["zoom", "--sitting", "deadbeefdeadbeef"]) == 1
-    assert "not found" in capsys.readouterr().err

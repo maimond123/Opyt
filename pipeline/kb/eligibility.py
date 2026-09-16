@@ -31,12 +31,8 @@ from dataclasses import dataclass
 
 from . import schema
 
-# Reuse Stage-4 SCREEN's LLM role by default: it ships on every install (Stage-4), is bound to
-# OpenRouter Llama + `response_format: json_object`, and needs no config migration. A distinct
-# `authorship_classify` role would RAISE on any ~/.opyt/settings.yaml that predates it → every
-# source silently to needs-review. Parameterized so a future caller can override without a code
-# change.
-_DEFAULT_ROLE = "entity_classify"
+# Share the configured SCREEN classifier role.
+_ROLE = "entity_classify"
 
 # Home/about text budget handed to the classifier — enough to judge single-vs-multi authorship
 # without paying for a whole archive page.
@@ -86,11 +82,10 @@ class GateDecision:
 # ── site key ───────────────────────────────────────────────────────────────────
 
 def _site_key(url: str) -> str:
-    """The person-independent cache key: the canonical bare host (`carol.substack.com`,
-    `simonwillison.net`) via url_canon — so every URL form on one site shares a verdict.
-    Falls back to a normalized raw url if canonicalization yields nothing (never empty-key)."""
+    """The canonical site home URL, shared by the fetch and the authorship cache."""
     from pipeline.ingestion.url_canon import canonical_identity
-    return canonical_identity(url) or (url or "").strip().lower().rstrip("/")
+    identity = canonical_identity(url)
+    return f"https://{identity}" if identity else ""
 
 
 # ── name match (person-specific bonus) ───────────────────────────────────────────
@@ -150,8 +145,7 @@ def _fetch_home_text(url: str) -> str | None:
     return content or None
 
 
-def classify_authorship(conn: sqlite3.Connection, source_url: str, *,
-                        role: str = _DEFAULT_ROLE) -> AuthorshipVerdict:
+def classify_authorship(conn: sqlite3.Connection, source_url: str) -> AuthorshipVerdict:
     """Classify whether `source_url`'s SITE is single- or multi-authored, caching the verdict.
 
     Cache-first: a stored `single`/`multi` for this site key returns WITHOUT any fetch or LLM
@@ -163,12 +157,14 @@ def classify_authorship(conn: sqlite3.Connection, source_url: str, *,
     from pipeline.ingestion.utils import log
 
     key = _site_key(source_url)
+    if not key:
+        return AuthorshipVerdict("unknown", reason="unusable site URL")
     row = schema.get_authorship(conn, key)
     if row is not None:
         return AuthorshipVerdict(authorship=row["authorship"], author_name=row["author_name"],
                                  reason="cache hit", cached=True)
 
-    text = _fetch_home_text(source_url)
+    text = _fetch_home_text(key)
     if not text:
         log(f"[eligibility] classify unknown (no fetchable home text): {source_url}")
         return AuthorshipVerdict("unknown", reason="fetch failed / no content")
@@ -179,16 +175,16 @@ def classify_authorship(conn: sqlite3.Connection, source_url: str, *,
         return AuthorshipVerdict("unknown", reason=f"llm_client import failed: {e}")
     # Preflight: a missing role/key degrades CLOSED (→ unknown → needs-review), never raises.
     try:
-        reason = llm_client.preflight(role)
+        reason = llm_client.preflight(_ROLE)
     except Exception as e:
-        reason = f"role {role!r} unavailable: {e}"
+        reason = f"role {_ROLE!r} unavailable: {e}"
     if reason:
         log(f"[eligibility] classify unknown (degrade-closed): {reason}")
         return AuthorshipVerdict("unknown", reason=reason)
 
-    user = f"Site: {source_url}\n\nHome/about text:\n{text[:_TEXT_BUDGET]}"
+    user = f"Site: {key}\n\nHome/about text:\n{text[:_TEXT_BUDGET]}"
     try:
-        resp = llm_client.call(role, system=_CLASSIFY_SYSTEM, user=user)
+        resp = llm_client.call(_ROLE, system=_CLASSIFY_SYSTEM, user=user)
         parsed = _parse_verdict(resp.text)
     except Exception as e:
         log(f"[eligibility] classify call failed (degrade-closed): {type(e).__name__}: {e}")
@@ -211,11 +207,11 @@ def classify_authorship(conn: sqlite3.Connection, source_url: str, *,
 # ── gate (per-run decision) ──────────────────────────────────────────────────────
 
 def gate(conn: sqlite3.Connection, source_url: str, *, expected_author: str | None = None,
-         force: bool = False, role: str = _DEFAULT_ROLE) -> GateDecision:
+         force: bool = False) -> GateDecision:
     """The footprint-eligibility decision for one source, dispatched BEFORE its adapter runs.
 
-    - `force`         → INGEST without classifying (operator override for a solo publication the
-                        classifier mislabels; no fetch, no LLM spend — we'd ignore the verdict).
+    - `force`         → INGEST without classifying (an explicit override for a solo publication
+                        the classifier mislabels; no fetch, no LLM spend — we'd ignore the verdict).
     - `multi`         → SKIP (do not attribute an org/team site to one person).
     - `unknown`       → needs-review (degrade-closed: never auto-ingest an unclassifiable source).
     - `single`        → ingest, unless a known `expected_author` disagrees with the site's sole
@@ -223,9 +219,9 @@ def gate(conn: sqlite3.Connection, source_url: str, *, expected_author: str | No
                         / mistaken-link case). A missing name on either side is NOT a mismatch.
     """
     if force:
-        return GateDecision("ingest", "forced (eligibility gate overridden by operator)")
+        return GateDecision("ingest", "forced (eligibility gate explicitly overridden)")
 
-    verdict = classify_authorship(conn, source_url, role=role)
+    verdict = classify_authorship(conn, source_url)
     hit = " [cache]" if verdict.cached else ""
 
     if verdict.authorship == "multi":
@@ -243,24 +239,15 @@ def gate(conn: sqlite3.Connection, source_url: str, *, expected_author: str | No
 
 # ── affiliation (keep the SKIPPED org, don't discard it) ──────────────────────────
 
-def record_affiliation(conn: sqlite3.Connection, person_entity_id: str, org_url: str, *,
+def record_affiliation(conn: sqlite3.Connection, org_url: str, *,
                        org_name: str | None = None) -> str | None:
-    """Keep a footprint source the gate SKIPPED as `multi` instead of discarding it: upserts an
-    `org:{host}` entity for it. Writes no atoms/chunks — the org's words aren't the person's
-    opinions. Idempotent. Returns the org id, or None when inputs are too thin to record (no
-    person id, or an uncanonicalizable org_url).
-
-    It also wrote an attested `affiliated_with` edge from the person until the `edges` table was
-    deleted 2026-08-23 for having no reader, and stamped the org row with a type label until that
-    column went the same day for the same reason. So the ORG ENTITY survives — its `org:` id prefix
-    is now the whole marker, and it is what keeps a gate-skipped source from being silently
-    discarded — while the person→org RELATION and the unread label do not. The `person_entity_id` argument is kept because the caller's
-    contract is unchanged and a future relation store would need it again."""
+    """Keep a gate-skipped source as an `org:{host}` entity, without attributing its
+    content to a person. Idempotent; returns the org id, or None for an unusable URL.
+    """
     from . import derive
 
-    pid = (person_entity_id or "").strip()
     org_id = derive.org_entity_id(org_url)
-    if not pid or org_id == "org:unknown":
+    if org_id == "org:unknown":
         return None
     schema.upsert_entity(conn, org_id, name=org_name, identity_links=[org_url])
     return org_id

@@ -62,7 +62,7 @@ def _serve(monkeypatch, by_user: dict):
         return v
 
     monkeypatch.setattr(core, "fetch_user_tweets", _fake)
-    monkeypatch.setattr(core, "read_x_cookies", lambda profile=None: {"auth_token": "t"})
+    monkeypatch.setattr(core, "read_x_cookies", lambda: {"auth_token": "t"})
     monkeypatch.setattr(core, "auth_headers", lambda cookies, referer: {})
     return asked
 
@@ -71,6 +71,13 @@ def _run(conn, embedder, monkeypatch, by_user, **kw):
     _serve(monkeypatch, by_user)
     kw.setdefault("pace_seconds", 0)          # no real sleeping in tests
     return cp.probe_candidates(conn, embedder, **kw)
+
+
+def test_probe_cli_rejects_x_profile(kb_home):
+    with pytest.raises(SystemExit) as exited:
+        cp._cli(["--x-profile", "Default", "--dry-run"])
+
+    assert exited.value.code == 2
 
 
 # ── the queue ─────────────────────────────────────────────────────────────────
@@ -125,6 +132,15 @@ def test_a_failure_is_always_due_again(conn):
     _candidate(conn, "1")
     probe_store.record_pull(conn, "x:user:1", probe_store.STATUS_FAILED, detail="boom")
     assert [c["who_id"] for c in cp.candidate_queue(conn, ttl_days=30)] == ["x:user:1"]
+
+
+def test_repeated_failed_samples_consume_repeated_daily_allowance(conn, fake_embedder, monkeypatch):
+    _candidate(conn, "11")
+    for _ in range(2):
+        _run(conn, fake_embedder, monkeypatch, {"11": RuntimeError("transient")})
+
+    assert probe_store.probed_today(conn) == 2
+    assert probe_store.pull_states(conn)["x:user:11"]["status"] == probe_store.STATUS_FAILED
 
 
 # ── the four outcomes ─────────────────────────────────────────────────────────
@@ -194,14 +210,14 @@ def test_no_x_session_degrades_rather_than_crashing(conn, fake_embedder, monkeyp
     from pipeline.ingestion.utils import SyncAuthError
     _candidate(conn, "1")
     monkeypatch.setattr(core, "read_x_cookies",
-                        lambda profile=None: (_ for _ in ()).throw(SyncAuthError("no browser")))
+                        lambda: (_ for _ in ()).throw(SyncAuthError("no browser")))
     out = cp.probe_candidates(conn, fake_embedder, pace_seconds=0)
     assert out["stopped"] == "auth" and out["queued"] == 1
 
 
 # ── the budget ────────────────────────────────────────────────────────────────
 
-def test_max_candidates_is_the_request_budget(conn, fake_embedder, monkeypatch):
+def test_max_candidates_bounds_candidate_samples(conn, fake_embedder, monkeypatch):
     for i in (1, 2, 3):
         _candidate(conn, str(i))
     asked = _serve(monkeypatch, {str(i): [] for i in (1, 2, 3)})
@@ -211,6 +227,27 @@ def test_max_candidates_is_the_request_budget(conn, fake_embedder, monkeypatch):
 
 
 # ── filtering: the curation filter runs, the substance filter does not ────────
+
+def test_an_inline_article_body_is_complete_while_a_teaser_is_partial():
+    full = _tweet("1")
+    full["article"] = {"article_results": {"result": {
+        "title": "A full essay", "content_state": {"blocks": [
+            {"type": "unstyled", "text": "The inline article body is searchable evidence."},
+        ]},
+    }}}
+    teaser = _tweet("2")
+    teaser["article"] = {"article_results": {"result": {"title": "Only a teaser"}}}
+
+    full_atom, teaser_atom = cp._render_groups([[full], [teaser]], handle="p11")
+    assert "The inline article body is searchable evidence." in full_atom["_markdown"]
+    assert full_atom["payload"]["body_state"] == "complete"
+    assert teaser_atom["payload"]["body_state"] == "partial"
+    assert "source: x-probe" in full_atom["_markdown"]
+
+
+def test_an_empty_due_queue_skips_embedding_preflight(conn):
+    out = cp.probe_candidates(conn, object(), pace_seconds=0)
+    assert out == {"source": "candidate-probe", "queued": 0, "note": "no candidate is due"}
 
 def test_self_thread_becomes_one_atom_and_replies_to_others_are_dropped(
         conn, fake_embedder, monkeypatch):

@@ -6,19 +6,21 @@ Fills the reserved `oracle(action='ingest')` gap (.guards.py): `discover_profile
 brain, and this router turns its TRUSTED profile sources into atoms attributed to
 the Oracle (who_id via `resolve`), instead of the retiring vault.
 
-One source → one route, mirroring `run_ingest.main`'s per-source seam:
+One source → one route:
 
-  personal blog / substack → eligibility.gate → sync_*_footprint → resolve
+  personal blog / substack → source_adapters.gate_and_sync_website → resolve
                              (gate SKIP → record_affiliation; no atoms)
-  github profile           → sync_github → resolve
+  github (repo or profile) → sync_github_source → resolve
   shape == "org"           → record_affiliation (an org fact-node, no atoms)
-  scholar / orcid          → DEFERRED (needs a url→author-id resolver; papers are
-                             already covered by the name-based Semantic-Scholar probe)
+  scholar / orcid          → NOT BUILT (needs a profile→publication resolver;
+                             the shared paper ingester already downloads PDFs)
 
 INVARIANT (guard-enforced, .guards.py): the footprint adapters are DUMB — they
 attribute a whole site to `who_id = the Oracle`, so they MUST only ever run on a
-source that passed `eligibility.gate`. Every blog/substack here routes through the
-gate first; a `skip` (multi-author/org) becomes an affiliation, never atoms.
+source that passed `eligibility.gate`. This router does not hold its own copy of that
+order — it calls `source_adapters.gate_and_sync_website`, which is where the gate sits
+next to the adapter it guards; a `skip` (multi-author/org) becomes an affiliation here,
+never atoms.
 
 Fail-safe: an adapter that raises is caught per-source (reported as "error"),
 never aborting the other sources; an org url that won't canonicalize records
@@ -33,19 +35,10 @@ from datetime import datetime
 _FOOTPRINT = ("blog", "substack")
 
 
-def _login_from(src: dict) -> str | None:
-    """The github account login: the classifier's handle, else the last url segment."""
-    meta = src.get("metadata") or {}
-    if meta.get("handle"):
-        return str(meta["handle"]).lstrip("@") or None
-    seg = (src.get("url") or "").rstrip("/").split("/")[-1]
-    return seg or None
-
-
 def onboard_footprint(conn: sqlite3.Connection, embedder, oracle_id: str,
                       sources: list[dict], *, author_name: str | None = None,
                       force: bool = False, since: datetime | None = None,
-                      limit: int = 0) -> dict:
+                      limit: int = 0, on_source=None) -> dict:
     """Route a confirmed Oracle's discovered profile `sources` into the atom-KB.
 
     `sources` are `discover_profile` source dicts ({source_type, url, metadata, trust, …}).
@@ -63,11 +56,17 @@ def onboard_footprint(conn: sqlite3.Connection, embedder, oracle_id: str,
     a highlight reel passes it explicitly
 
     Outcome vocabulary: a source ends as exactly one of `ingested` / `blocked` / `error` /
-    `affiliation` / `needs-review` / `deferred` / `skipped` / `unsupported`. `blocked` means
+    `affiliation` / `needs-review` / `not-built` / `skipped` / `unsupported`. `blocked` means
     transient (nothing written, nothing marked seen, the next run redoes the walk); `error` means
     somebody should look. Adapters signal a host-side stop by RETURNING a summary with `error`
     set rather than raising, so the try/except below can't distinguish them on its own — see
     `_record_run`.
+
+    `on_source` is called with each outcome record the instant that source finishes, before the
+    next one starts. It exists so a caller can make the run's bookkeeping durable at the same grain
+    the atoms already are: `AtomSink` flushes incrementally, so a run killed part-way leaves atoms
+    behind, and an end-of-run stamp leaves them with no record of what was attempted. A callback
+    that raises is the caller's problem to contain — see `oracles._stamp_source`, which does.
     """
     from pipeline.ingestion.utils import log
 
@@ -81,7 +80,9 @@ def onboard_footprint(conn: sqlite3.Connection, embedder, oracle_id: str,
     results: list[dict] = []
     # ROUTER-level wall clock, one stage per routed source (`sync_github` carries no timer of its
     # own). Labelled `{source_type}`, not by url, so multiple sources of one type fold into one
-    # stage.
+    # stage. A website stage covers the eligibility gate AND the adapter, because they are one
+    # call now; the gate's own share is the stage total minus the adapter's `stage_seconds`, which
+    # rides along on that source's record.
     timer = ingest_common.StageTimer()
 
     def _record(url, stype, action, detail="", stats=None):
@@ -89,6 +90,8 @@ def onboard_footprint(conn: sqlite3.Connection, embedder, oracle_id: str,
         if stats:
             rec["stats"] = stats
         results.append(rec)
+        if on_source:
+            on_source(rec)
 
     def _record_run(url, stype, summary):
         """Record ONE adapter run under the outcome it actually had — without this, a blocked
@@ -108,33 +111,38 @@ def onboard_footprint(conn: sqlite3.Connection, embedder, oracle_id: str,
 
         # 1. Org-shaped (surfaced from a trusted hub) → an affiliation fact, never atoms.
         if shape == "org":
-            org = eligibility.record_affiliation(conn, oracle_id, url, org_name=author_name)
+            org = eligibility.record_affiliation(conn, url, org_name=author_name)
             _record(url, stype, "affiliation" if org else "skipped",
-                    f"affiliated_with {org}" if org else "org url did not canonicalize")
+                    f"organization retained: {org}" if org else "org url did not canonicalize")
             continue
 
         # 2. The trust boundary AT the ingest seam — only trusted personal profiles proceed.
         if not trusted:
-            _record(url, stype, "needs-review", "not trusted — confirm in the review step")
+            # "The review step" names a step the USER has no referent for — they never saw one,
+            # and on 2026-09-15 the host passed the phrase straight through. Say what is actually
+            # true of the link instead: Opyt found it, it is not confirmed as this person's, and
+            # the user is the one who decides.
+            _record(url, stype, "needs-review",
+                    "found, but not confirmed as this person's — the user decides whether it is")
             continue
 
-        # 3. Personal blog / Substack → single-author gate, THEN the (dumb) footprint adapter.
+        # 3. Personal blog / Substack → the shared gate-then-sync seam. The gate order is
+        #    `source_adapters`' to own (INVARIANT above); onboarding owns only what a refusal
+        #    MEANS here — an org becomes an affiliation, an unknown verdict waits for review.
         if stype in _FOOTPRINT:
-            with timer.stage("eligibility_gate"):
-                decision = eligibility.gate(conn, url, expected_author=author_name, force=force)
-            if decision.decision == "skip":                 # multi-author/org → affiliation
-                org = eligibility.record_affiliation(conn, oracle_id, url, org_name=author_name)
-                _record(url, stype, "affiliation" if org else "skipped",
-                        f"gate skip ({decision.reason})")
-                continue
-            if decision.decision != "ingest":               # needs-review (unknown / mismatch)
-                _record(url, stype, "needs-review", decision.reason)
-                continue
             try:
                 with timer.stage(stype):
-                    summary = source_adapters.WEBSITE_ADAPTERS[stype].sync(
-                        conn, embedder, url, handle=meta.get("handle"),
-                        author_name=author_name, since=since, limit=limit)
+                    decision, summary = source_adapters.gate_and_sync_website(
+                        conn, embedder, stype, url, handle=meta.get("handle"),
+                        author_name=author_name, since=since, limit=limit, force=force)
+                if summary is None:
+                    if decision.decision == "skip":         # multi-author/org → affiliation
+                        org = eligibility.record_affiliation(conn, url, org_name=author_name)
+                        _record(url, stype, "affiliation" if org else "skipped",
+                                f"gate skip ({decision.reason})")
+                    else:                                   # needs-review (unknown / mismatch)
+                        _record(url, stype, "needs-review", decision.reason)
+                    continue
                 # Resolve even on a blocked run: the adapter upserts the substack:/blog: entity
                 # with its identity link BEFORE the archive walk, so the merge into the Oracle's
                 # canonical is still owed regardless of whether any post came back.
@@ -145,29 +153,34 @@ def onboard_footprint(conn: sqlite3.Connection, embedder, oracle_id: str,
                 _record(url, stype, "error", f"{type(e).__name__}: {e}")
             continue
 
-        # 4. GitHub profile → repos as artifact atoms; `resolve` merges the owner into the Oracle
-        #    via the identity_links `_seed_owner_identity` stores.
+        # 4. GitHub → artifact atoms. `sync_github_source` owns the repository-vs-account
+        #    split (a bio link to `acme/memory` is one repo, not an account named `memory`);
+        #    `resolve` merges a crawled account into the Oracle via the identity link
+        #    `_seed_owner_identity` stores.
         if stype == "github":
-            login = _login_from(src)
-            if not login:
-                _record(url, stype, "skipped", "no github login in url")
-                continue
             try:
                 with timer.stage("github"):
-                    summary = ingest_github.sync_github(conn, embedder, handles=[login])
+                    summary = ingest_github.sync_github_source(conn, embedder, url)
+                if summary is None:
+                    _record(url, stype, "skipped", "no github repo or account in url")
+                    continue
                 resolve.resolve_entities(conn)
                 _record_run(url, stype, summary)
             except Exception as e:
-                log(f"[onboard] github ingest failed for {login}: {type(e).__name__}: {e}")
+                log(f"[onboard] github ingest failed for {url}: {type(e).__name__}: {e}")
                 _record(url, stype, "error", f"{type(e).__name__}: {e}")
             continue
 
-        # 5. Scholar / ORCID → DEFERRED (needs a url→author-id resolver; papers already covered).
+        # 5. Scholar / ORCID → NOT BUILT: profile-to-publication discovery has no adapter.
+        # `not-built`, not `deferred`: `deferred` means bounded work something WILL resume — that is
+        # what it means on `oracle(action='ingest')`'s rate-limited X pull and in `frontier_execute`
+        # — and nothing resumes this one. Sharing the word would let the user-facing copy promise
+        # a continuation that no rail performs.
         if stype in ("scholar", "orcid"):
-            _record(url, stype, "deferred", "scholar/orcid url→author-id resolver not built yet")
+            _record(url, stype, "not-built", "scholar/orcid url→author-id resolver not built yet")
             continue
 
-        # 6. x / youtube / linkedin — no atom-KB footprint adapter here.
+        # Other source types have no atom-KB footprint adapter here.
         _record(url, stype, "unsupported", f"no atom-KB footprint adapter for {stype!r}")
 
     def _stat(key):
@@ -184,7 +197,7 @@ def onboard_footprint(conn: sqlite3.Connection, embedder, oracle_id: str,
         "errors": sum(1 for r in results if r["action"] == "error"),
         "affiliations": sum(1 for r in results if r["action"] == "affiliation"),
         "needs_review": sum(1 for r in results if r["action"] == "needs-review"),
-        "deferred": sum(1 for r in results if r["action"] == "deferred"),
+        "not_built": sum(1 for r in results if r["action"] == "not-built"),
         "atoms_added": _stat("added"),
         "dispatched": _stat("dispatched"),
         "producer_failed": _stat("producer_failed"),

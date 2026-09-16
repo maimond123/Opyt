@@ -2,8 +2,8 @@
 #
 # Before this, registering the MCP meant writing `<some-venv>/python <abs>/server.py` into
 # each client's config — a path that only works on the author's machine. The console scripts
-# below (opyt-mcp / opyt-install-client / opyt-keys) give every install a stable command on
-# PATH, which is the foundation for distributing to a stranger.
+# below give every install stable commands on PATH (opyt-mcp / opyt-worker /
+# opyt-install-client / opyt-keys), which is the foundation for distributing to a stranger.
 #
 # Two install modes both work:
 #   - editable-from-clone: `pip install -e . --config-settings editable_mode=compat`
@@ -26,7 +26,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opyt"
-version = "0.1.0a4"
+version = "0.1.0a5"
 description = "A knowledge base that grows from your attention across the platforms you already use, served to your AI client over MCP."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -62,7 +62,6 @@ dependencies = [
     "html2text>=2024.2.0",
     "feedparser>=6.0.0",
     "beautifulsoup4>=4.12.0",
-    "yt-dlp>=2025.1.1",
     # PDF full-text extraction (pipeline/kb/ingest_papers.py). Load-bearing, and missing here
     # until 2026-08-07 — reachable from nothing else declared above. It is imported lazily behind
     # a fail-safe that degrades to abstract-only, which is correct design and is exactly why its
@@ -86,14 +85,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The SERVER half — `service/`, the process that hosts one person's export for another to query
-# over HTTPS (docs/plans/2026-08-26-foreign-kb-service-phase3.md). Optional, and it must stay
-# optional: installing OPYT to READ a knowledge base must never pull in a web framework to serve
-# one. `service*` is also absent from the packages-find list below, so it does not enter the
-# client wheel at all — a server is deployed from a checkout with `pip install -e ".[server]"`.
+# The SERVER half — anything that answers HTTPS rather than stdio. TWO consumers now:
+#   • `service/` — hosts one person's export for another to query
+#     (docs/plans/2026-08-26-foreign-kb-service-phase3.md). Uses fastapi + uvicorn.
+#   • `gateway/` — the hosted MCP endpoint claude.ai connects to
+#     (docs/plans/2026-09-02-hosted-opyt-remote-connector.md). Uses uvicorn and makes its own
+#     upstream HTTP requests through httpx. It installs this extra rather than splitting a
+#     second one for the gateway alone.
+# Optional, and it must stay optional: installing OPYT to READ a knowledge base must never pull
+# in a web framework to serve one. `service*` and `gateway*` are both absent from the
+# packages-find list below, so neither enters the client wheel — a server is deployed from a
+# checkout with `pip install -e ".[server]"`.
 server = [
     "fastapi>=0.110.0",
+    "httpx>=0.27.0",
     "uvicorn>=0.27.0",
+    "websockets>=15.0.1",
 ]
 
 # The test runner. Declared because it was reachable from nothing: `scripts/setup.sh` installs
@@ -116,10 +123,18 @@ Repository = "https://github.com/maimond123/Opyt"
 
 [project.scripts]
 opyt-mcp = "mcp_server.server:main"
+opyt-worker = "pipeline.kb.rail_worker:main"
 opyt-install-client = "opyt_core.install_client:main"
+opyt-install-worker = "opyt_core.install_worker:main"
 opyt-keys = "opyt_core.keys:main"
-opyt-redeem = "opyt_core.redeem:main"
-opyt-push = "opyt_core.push:main"
+# `opyt-redeem` and `opyt-push` were REMOVED 2026-09-05, with the two `main()` functions behind
+# them. Both modules STAY — `redeem.get_install_id` is imported by `mcp_server/share_tools.accept`
+# and `push.publish`/`fetch_state` by `pipeline/kb/push_catchup.py` — but neither has a console
+# entry point any more. `accept` supersedes `opyt-redeem` (it finds the code in a link, a fragment
+# or a bare string and infers the service, where the command took a positional URL), and the
+# push rail supersedes `opyt-push` (it calls `publish()` detached and coalesced, and
+# `share_tools` writes the token, so nobody has to type anything). The operator procedure in
+# service/DEPLOY.md was rewritten onto those two functions in the same commit.
 # `opyt-footer` and `opyt-cursor-hook` were REMOVED 2026-08-12. Both pointed into
 # statusline/, and both existed only to open the browser dashboard — the footer as a Claude Code
 # PostToolUse hook, the Cursor one as an afterMCPExecution hook. The dashboard is deleted, so

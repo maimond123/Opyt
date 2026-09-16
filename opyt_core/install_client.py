@@ -9,7 +9,7 @@ file. install() parses the existing file (or starts fresh), inserts/replaces our
 inside `mcpServers`, backs up the prior file, and writes valid JSON. Idempotent (re-running
 is a no-op) and reversible (--uninstall).
 
-The server command is `uvx --from opyt==<version> opyt-mcp`, with `uvx` resolved to an absolute
+The server command is `uvx --from opyt@latest opyt-mcp`, with `uvx` resolved to an absolute
 path at install time. That means a registered client needs no venv, no checkout, and no Python
 of its own — `uv` supplies the interpreter and the package. Requires `uv` on PATH when you run
 the installer:
@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-from importlib.metadata import version
 from pathlib import Path
 
 # Key we register under inside each client's "mcpServers" object; capitalized so Claude Code's
@@ -49,26 +48,50 @@ CLIENTS: dict[str, Path] = {
 }
 
 
-def _server_spec() -> dict:
-    """{command, args} block to register: an ABSOLUTE path to `uvx`, told to fetch this exact
-    published version of opyt and run its `opyt-mcp` entry point.
+def uvx_command(entry_point: str) -> list[str]:
+    """The argv that launches one of opyt's published entry points, with no checkout involved.
 
-    Absolute, not bare `uvx`: Claude Desktop spawns a server from a GUI app, which inherits a
-    minimal PATH and never sources a shell profile — so the `~/.local/bin` that `uv`'s installer
-    adds to your rc file does not exist as far as the spawned process is concerned.
+    An ABSOLUTE path to `uvx`, not a bare name: both things that launch opyt unattended — a
+    desktop MCP client and a macOS LaunchAgent — are started by launchd, which supplies a
+    minimal PATH and never sources a shell profile. The `~/.local/bin` that `uv`'s installer
+    adds to your rc file does not exist as far as those processes are concerned.
 
-    Version-pinned to the running distribution, so a config records what it was installed
-    against and `uvx` resolves the same build every launch. Re-running this installer after an
-    upgrade rewrites the pin (the spec differs, so `_is_current` returns False).
+    `opyt@latest`, so a fix reaches an installed user without them running anything. This is the
+    ONLY form that does. Measured 2026-09-14 on uv 0.12.13, warm cache, per launch:
 
-    Before 2026-08-29 this registered `sys.executable` plus an absolute path to this checkout's
-    `mcp_server/server.py`, which welded every config to one folder that could never move.
+        --from opyt==<version>   36 ms   never queries the index  (frozen)
+        --from opyt             36 ms   never queries the index  (frozen)
+        --from opyt@latest     226 ms   queries the index        (updates)
+
+    Note the middle row: dropping the `==` does NOT unfreeze anything. `uvx` reuses the cached
+    tool environment for a bare requirement, so an unpinned launcher pins just as hard as an
+    explicit one, only invisibly. `@latest` is uv's documented "ignore the cache" form and the
+    reason this function does not simply omit a version.
+
+    The 190 ms is an index query on every start, and it is not load-bearing: `uvx --offline
+    --from opyt@latest` exits 0 and runs the cached build. A user with no network gets the
+    version they already had, not a server that refuses to start.
+
+    Until 2026-09-14 this pinned `opyt=={version('opyt')}`, which meant a published fix reached
+    nobody: the pin is written into a client's mcp.json as literal text, and the only opyt that
+    then runs on that machine is the one with no way to learn a newer one exists. Nothing was
+    released publicly under that shape. Do not reintroduce a pin here without a way out of it.
+
+    Before 2026-08-29 the client installer registered `sys.executable` plus an absolute path to
+    this checkout's `mcp_server/server.py`, which welded every config to one folder that could
+    never move. That is the shape this function exists to prevent, for every launcher.
     """
     uvx = shutil.which("uvx") or str(Path.home() / ".local" / "bin" / "uvx")
     if not Path(uvx).exists():
         raise FileNotFoundError(
             "uvx not found. Install uv first: curl -LsSf https://astral.sh/uv/install.sh | sh")
-    return {"command": uvx, "args": ["--from", f"opyt=={version('opyt')}", "opyt-mcp"]}
+    return [uvx, "--from", "opyt@latest", entry_point]
+
+
+def _server_spec() -> dict:
+    """The `{command, args}` block a client's mcp.json wants, around that launcher."""
+    command, *args = uvx_command("opyt-mcp")
+    return {"command": command, "args": args}
 
 
 def _load(path: Path) -> tuple[dict, bool]:

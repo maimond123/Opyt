@@ -154,7 +154,7 @@ def _render_quoted_tweet(qt: dict) -> str:
     username = author.get("userName", "unknown")
     name     = author.get("name", "Unknown")
     qt_url   = (
-        qt.get("url") or qt.get("twitterUrl") or
+        qt.get("url") or
         f"https://x.com/{username}/status/{qt.get('id', '')}"
     )
     qt_text  = _expand_urls(qt.get("text", ""), qt.get("entities"))
@@ -249,20 +249,16 @@ def _render_media(tweet: dict) -> str:
     """
     Render media attachments.
 
-    Input is the twitterapi.io shape: extendedEntities.media, each item carrying
-    type (photo/video/animated_gif), media_url_https, video_info.variants. Free-engine
-    (GraphQL) tweets must be mapped to this shape by x_graphql._normalize first.
+    `x_graphql_core.normalize` supplies extendedEntities.media, each item carrying
+    type (photo/video/animated_gif), media_url_https, and video_info.variants.
 
     Never silently drops: if media is present but unrenderable — hiding under a key we
     don't read (snake_case drift), an unknown type, or a missing url/variant — it emits a
     [media-drop] log line instead of an empty string that's indistinguishable from "no
     media". That distinction is the whole point; a bare "" is how the last drop hid.
     """
-    # Primary: extendedEntities.media (twitterapi.io shape). Fallback: top-level media.
     ext = tweet.get("extendedEntities") or {}
     media_list = ext.get("media") or []
-    if not media_list:
-        media_list = tweet.get("media") or []
 
     if not media_list:
         # Empty under the keys we render from. Before declaring "no media", check whether
@@ -337,7 +333,7 @@ def tweet_to_markdown(
     Render a tweet (or thread) to the pipeline markdown format.
 
     root_tweet:    The canonical tweet for this note (earliest in thread, or solo).
-    article:       Pre-fetched article dict from /twitter/article, if applicable.
+    article:       Normalized tweet's article field, if applicable.
     thread_tweets: Full ordered list of tweets in the thread (root → last reply).
                    Only supplied when len > 1 (i.e., this is actually a thread).
     source:        Provenance stamped into frontmatter `source:` — "x-profile" (the default,
@@ -352,7 +348,7 @@ def tweet_to_markdown(
     name     = author.get("name", "Unknown")
     tweet_id = str(root_tweet.get("id", ""))
     url      = (
-        root_tweet.get("url") or root_tweet.get("twitterUrl") or
+        root_tweet.get("url") or
         f"https://x.com/{username}/status/{tweet_id}"
     )
     created_at = _parse_twitter_date(root_tweet.get("createdAt", ""))

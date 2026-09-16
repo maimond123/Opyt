@@ -36,8 +36,14 @@ from .ingest_common import (AtomSink, BASIS_STATED, BODY_COMPLETE,
                             body_fields, llm_run_marker, llm_run_stats,
                             make_consumer, promote_atom, run_concurrent, snapshot_and_hash,
                             store_atom)
-# A single Substack POST url: `{scheme}://{host}/p/{slug}`. Covers `*.substack.com` posts only —
-# a custom-domain Substack (e.g. noahpinion.blog) needs a fetch to distinguish from a generic blog.
+# A single Substack POST url: `{scheme}://{host}/p/{slug}`. ANY host, deliberately — a
+# custom-domain Substack (noahpinion.blog) is indistinguishable from a generic blog without a
+# fetch, so `link_router.classify_link` cannot sniff one and it reaches here only through Hopper's
+# explicit `kind_hint`. The host BOUNDARY is the router's job, not this regex's: `classify_link`
+# matches `substack.com` on a DNS-suffix boundary, so a lookalike (`not-substack.com`) is no longer
+# routed here at all, and a hint that forces one fails fail-safe — `_fetch_full_post` raises,
+# `substack_atom_from_url` catches, nothing is written. Narrowing this regex to `*.substack.com`
+# would delete the custom-domain path without closing anything the router has not already closed.
 _SUBSTACK_POST_RE = re.compile(r"^(https?://[^/]+)/p/([^/?#]+)", re.I)
 
 # The Substack platform-app share form (`substack.com/.../post/p-{id}`) carries only the global
@@ -83,7 +89,7 @@ def sync_substack_footprint(conn: sqlite3.Connection, embedder, *, publication_u
     The archive LIST carries only metadata; the full body comes from the per-post endpoint
     (`_fetch_full_post`, cookie-less for public posts). So, like `ingest_curation`: skip
     seen/paywalled BEFORE the per-post fetch, then process posts CONCURRENTLY (fetch stays
-    serial; see the run_concurrent call). Full `limit` rationale:
+    serial; see the run_concurrent call).
 """
     from pipeline.ingestion.sources.substack import (SubstackFetchError, SubstackListingError,
                                                      _fetch_all_posts, _fetch_full_post,
@@ -118,7 +124,7 @@ def sync_substack_footprint(conn: sqlite3.Connection, embedder, *, publication_u
             posts = _fetch_all_posts(base, since=since)
     except SubstackListingError as e:
         # Fail-safe on an incomplete listing: ingest nothing, mark nothing `seen` — the next
-        # run redoes the whole walk. Reported as `undetermined`. Return-shape rationale:
+        # run redoes the whole walk. Reported as `undetermined`.
         log(f"[footprint] substack BLOCKED during archive listing: {e}")
         return {"source": "substack-footprint", "added": 0, "skipped": 0, "paywalled": 0,
                 "no_body": 0, "undetermined": 1, "failed": 0, "gate_rejected": 0,
@@ -143,7 +149,7 @@ def sync_substack_footprint(conn: sqlite3.Connection, embedder, *, publication_u
     dispatched = paywalled = no_body = undetermined = 0
     # consumed/submitted/skipped/gate_rejected: a shared dict, not four more `nonlocal` ints — see
     # `make_consumer`'s docstring for why (its `_consume` closure is defined outside this scope).
-    counters = {"consumed": 0, "submitted": 0, "skipped": 0, "gate_rejected": 0}
+    counters = {"submitted": 0, "skipped": 0, "gate_rejected": 0}
     author = f"@{handle}" if handle else (author_name or "substack")
 
     def _mark() -> None:                     # post-commit durable-write count (never on a poison-skip)
@@ -222,7 +228,7 @@ def sync_substack_footprint(conn: sqlite3.Connection, embedder, *, publication_u
         raw_ref, raw_hash = decided
 
         # Replay the pre-enrichment mask onto the enriched body so descriptions reach the CHUNKS
-        # while the SNAPSHOT stays the full page (rechunk-from-raw depends on that). Fail-safe: a
+        # while the SNAPSHOT stays the full page (`open()` serves it verbatim). Fail-safe: a
         # unit-count change returns None and we re-grade rather than emit mis-sliced text.
         md_kept = content_gate.reapply_keep(md, verdict.keep)
         if md_kept is None:
@@ -259,24 +265,32 @@ def sync_substack_footprint(conn: sqlite3.Connection, embedder, *, publication_u
     # Byte-identical to `ingest_blog`'s consumer — see `ingest_common.make_consumer`.
     _consume = make_consumer(sink, seen, counters, _mark)
 
-    run_concurrent(_jobs(), _work, _consume, workers=POST_WORKERS, inflight=POST_INFLIGHT)
+    report = run_concurrent(_jobs(), _work, _consume, workers=POST_WORKERS,
+                            inflight=POST_INFLIGHT)
     sink.close()
     save_image_cache(opyt_home(), img_cache)   # persist new VLM descriptions for the next run
     # A poison-chunk atom the sink isolates fires no _mark → not counted, not marked durable, retried
     # next run (fail-safe). `failed` = submitted-but-never-durable, same meaning as the old counter.
-    return {"source": "substack-footprint", "added": counts["added"], "skipped": counters["skipped"],
-            "paywalled": paywalled, "no_body": no_body, "undetermined": undetermined,
-            "failed": counters["submitted"] - counts["added"],
-            # `dispatched` = handed to the pool (what `limit` caps). A gap between it and what the
-            # consumer saw is a producer that RAISED — run_concurrent logs and skips those, so
-            # without this the post would vanish from every counter.
-            "dispatched": dispatched, "producer_failed": dispatched - counters["consumed"],
-            "gate_rejected": counters["gate_rejected"],
-            "stage_seconds": timer.totals, "stage_latency": timer.distribution(),
-            # per-CALL (not per-atom) — separates "one unlucky call" from "the provider
-            # is slow right now", which decide oppositely on hedging.
-            **llm_run_stats(llm0),
-            "total": schema.count_atoms(conn, "substack")}
+    out = {"source": "substack-footprint", "added": counts["added"], "skipped": counters["skipped"],
+           "paywalled": paywalled, "no_body": no_body, "undetermined": undetermined,
+           "failed": counters["submitted"] - counts["added"],
+           # `dispatched` = handed to the pool (what `limit` caps). `producer_failed` comes from
+           # the runner now: it counts producers that RAISED, where the local
+           # `dispatched - consumed` this used to compute could not tell a raise from a `_work`
+           # that returned nothing, and could not see a source failure at all.
+           "dispatched": dispatched, "producer_failed": report["producer_failed"],
+           "gate_rejected": counters["gate_rejected"],
+           "stage_seconds": timer.totals, "stage_latency": timer.distribution(),
+           # per-CALL (not per-atom) — separates "one unlucky call" from "the provider
+           # is slow right now", which decide oppositely on hedging.
+           **llm_run_stats(llm0),
+           "total": schema.count_atoms(conn, "substack")}
+    if report["source_error"] is not None:
+        # See `ingest_blog` for the same three lines and the same reason: `error` plus the
+        # `undetermined` already in the dict is `classify_run`'s BLOCKED.
+        e = report["source_error"]
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 def _resolve_reader_url(url: str) -> str | None:

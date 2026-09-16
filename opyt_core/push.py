@@ -1,14 +1,16 @@
 """
-opyt_core/push.py — `opyt-push`: build the export and replace what the service serves.
+opyt_core/push.py — build the export and replace what the service serves.
 
-The owner's whole publish loop is `publish()`, and this module is the sequencing and the two
-settings, nothing else. Everything it does is already built — `build_export` projects the store,
+The owner's whole publish loop is `publish()`, and this module is the sequencing, nothing else.
+Everything it does is already built — `build_export` projects the store,
 `POST /v1/upload/{owner}` swaps the served file atomically.
 
-TWO CALLERS, ONE IMPLEMENTATION. `main()` is the CLI: it owns argv, the printing, and the exit
-code. `publish()` is the function, and `pipeline/kb/push_catchup.py`'s rail imports it. That
-split is the whole point of the refactor — a rail with its own upload sequence would be a second
-implementation of the thing the fidelity of every reader's copy depends on.
+ONE CALLER: `pipeline/kb/push_catchup.py`'s rail, which fires detached and coalesced so nobody
+has to remember to publish. There was a second — the `opyt-push` console script — and it was
+deleted on 2026-09-05 as 24 lines of argv, printing and an exit code over a function the rail
+already calls unprompted. It owned no behaviour of its own. Do NOT re-add a CLI here: the
+credential lookup and the URL it did are `push_catchup`'s, and a second entry point would be a
+second place for the sequence every reader's copy depends on.
 
 FULL REPLACE, NEVER A DIFF. An export is a projection of a store, not a log of changes to one, so
 "the newest upload wins" is the entire update model (`service/uploads.py`).
@@ -26,18 +28,14 @@ the expensive build, so a wrong setting costs a round trip instead of a 115 MB p
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
-import sys
 from pathlib import Path
 
 import requests
 from requests import RequestException
 
-from opyt_core import config
 from opyt_core.kb_remote import error_detail
 from opyt_core.paths import opyt_path
-from pipeline.credentials import get_credential
 from pipeline.kb.export import build_export
 
 _UPLOAD_TIMEOUT = 600   # seconds — a 115 MB body over a home connection, not a query
@@ -56,7 +54,7 @@ def fetch_state(token: str, url: str) -> dict:
 
     `{status: "ok", owner, last_upload_at, reads_since_last_upload, tokens}`, or a status naming
     why not. Separate from `publish` because the RAIL needs this answer to decide whether to
-    publish at all, and paying for it twice would be a second round trip on every session open."""
+    publish at all, and paying for it twice would be a second round trip on every rail pass."""
     try:
         r = requests.get(f"{url}/v1/tokens", headers={"Authorization": f"Bearer {token}"},
                          timeout=30)
@@ -114,32 +112,3 @@ def publish(token: str, url: str, *, owner: str | None = None) -> dict:
     return {"status": "ok", "owner": owner, "atoms": manifest["tables"]["atoms"],
             "bytes": served["bytes"], "sha256": local_sha}
 
-
-def main(argv: list[str] | None = None) -> int:
-    argparse.ArgumentParser(
-        prog="opyt-push",
-        description="Build this store's export and replace what the service serves for you."
-    ).parse_args(argv)
-
-    token = get_credential("opyt_service")
-    if not token:
-        print("OPYT_SERVICE_TOKEN is not set, so there is nothing to publish with. "
-              "Set it with `opyt-keys --set OPYT_SERVICE_TOKEN=<token>`, or ask your assistant "
-              "to share your knowledge base, which registers one for you.", file=sys.stderr)
-        return 1
-
-    url = config.service_url().rstrip("/")
-    res = publish(token, url)
-    if res["status"] != "ok":
-        print(res["message"], file=sys.stderr)
-        return 1
-
-    print(f"Published {res['atoms']} atoms as '{res['owner']}' — "
-          f"{res['bytes']:,} bytes, sha256 {res['sha256'][:12]}.")
-    print(f"Readers query it under whatever name they registered, once they redeem a grant "
-          f"code for {url}.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

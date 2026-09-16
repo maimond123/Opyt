@@ -14,19 +14,20 @@
 # (`profile_fetch_limit`, `classify_batch_size`, …): parsed-but-unread since the vault era, the
 # parse deleted 2026-08-29. The fetch cap is `_FETCH_CAP` in pipeline/kb/ingest_x_footprint.py.
 
-# Local-session cookie reads (X bookmarks, Claude chats, Substack). These read your
-# OWN logged-in browser session on THIS machine — nothing leaves your computer.
+# Generic local-session cookie reads, currently Substack. They read your OWN logged-in browser
+# session on THIS machine — nothing leaves your computer. X always uses OPYT's managed profile.
 cookies:
   # Which browser to read from. "auto" tries every installed browser in priority order
   # (Chrome → Brave → Edge → Vivaldi → Opera → Arc → Firefox → Safari) and uses whichever
   # holds a logged-in session. Set a specific key to pin one: chrome | brave | edge |
   # vivaldi | opera | arc | firefox | safari. $OPYT_BROWSER overrides this.
-  # NOTE (macOS): Chromium browsers prompt for Keychain access on first read (click
-  # "Always Allow"); Safari needs Full Disk Access granted to your terminal/app.
+  # NOTE (macOS): generic Arc reads can prompt for Keychain access and Safari needs Full Disk
+  # Access granted to your terminal/app. Generic Chromium reads and X's managed session do not
+  # need a Keychain prompt.
   browser: auto
   # Which PROFILE of that browser to read. Each Chromium profile is its own cookie sandbox,
   # so a session in "Profile 1" is invisible from "Default". Unset means auto-pick when
-  # exactly one profile is logged in. $X_CHROME_PROFILE overrides. `onboard` writes this.
+  # exactly one profile is logged in. This affects generic readers, never X.
   profile:
 
 # `sources:` (x/github/substack enable-flags, github username/topics, substack feeds) predates
@@ -37,41 +38,39 @@ cookies:
 # toggle here. `claude_chats:` was the first casualty of this same block, removed 2026-08-13 with
 # `pipeline/ingestion/claude_chats.py`; see the retired-claude-chat-ingestion guard.
 
-# Where `opyt-push` uploads your export so other people can query it — the address of the service
+# Where the push rail uploads your export so other people can query it — the address of the service
 # that hosts it, e.g. https://api.useopyt.com. Unset means you are not publishing: your knowledge
 # base stays on this disk and only readers you hand the file to can read it. The TOKEN that proves
 # you may publish there is a credential and lives in ~/.opyt/.env as OPYT_SERVICE_TOKEN
 # (`opyt-keys --set OPYT_SERVICE_TOKEN=...`), never here.
 #
-# A READER sets nothing: they run `opyt-redeem <url> <code>` once and the peer row it writes
-# carries the full address.
+# A READER sets nothing: they paste the invite link to their assistant, which calls `accept`, and
+# the peer row it writes carries the full address.
 service_url:
 
 credible_people:
   # Archival roster of hand-curated X handles — NOT a live input. `add_oracle` (or `oracle`
-  # action=confirm) is the current "add a person" path; it writes to the `oracles` table, and no
-  # code reads `profiles` any more. The key is kept because an existing user's hand-curated list
-  # is real data worth not silently dropping — not because anything acts on it. List handles as
-  # `- username: somehandle` if you want them recorded here.
+  # action=confirm) is the current "add a person" path; it writes to the `oracles` table, and
+  # nothing reads `profiles` as a roster. (One thing does read the key: first-run setup blanks it
+  # so a new install does not inherit somebody else's list.) It is kept because an existing user's
+  # hand-curated list is real data worth not silently dropping — not because anything acts on it.
+  # List handles as `- username: somehandle` if you want them recorded here.
   profiles: []
   # `followed_sources` (directly-followed accounts, added via a `follow` MCP tool) was removed
   # 2026-08-16 — that tool, and its config.py reader `followed_sources()`, no longer exist.
 
 # Routes every LLM call site through pipeline/llm_client.py. Each call site names
 # a role; the role's provider+model is decided here. Generic defaults — no
-# personal data. See llm_client.py for pricing tables and supported providers.
+# personal data. See llm_client.py for supported providers.
 #
 # EVERY role below has a live `role="..."` call site. Keep it that way: a role whose
 # caller was deleted is worse than clutter, because this template is what a new user
 # reads to learn what OPYT does. Five orphans were removed 2026-08-07 — see git log.
 #
-# The same rule covers plain KEYS, not just roles. `pricing_table_version` was removed
-# 2026-08-28: nothing read it, and it mirrored `llm_spend.PRICING_TABLE_VERSION` under a
-# comment telling you to update both — so both sat two months stale. The version lives
-# beside the table it describes.
+# The same rule covers plain KEYS, not just roles: configuration exists only for a live caller.
 #
 # `identity_anchor` was removed 2026-08-28: its only caller, the cold-start identity anchor in
-# discover_profile, was deleted with the feature. It was the last paid step on the add_oracle
+# discover_profile, was deleted with the feature. It was the last model step on the add_oracle
 # path. See docs/plans/2026-08-28-delete-the-cold-start-identity-anchor.md — re-adding the role
 # means re-arguing what a rootless person loses, not just restoring a config block.
 llm_backends:
@@ -84,17 +83,30 @@ llm_backends:
     # template is not covered by any automated check. `chat_classify` had zero references left
     # anywhere in the repo; `chat_extract` had none in production and survived only as a fixture
     # role in tests/test_llm_client.py, which now names live roles instead.
+    # gpt-oss-120b REPLACED llama-3.3-70b in the three classify roles on 2026-09-15, after the
+    # llama bill drained a $30 balance. Against the live catalog with the deny-list applied:
+    # 19 surviving orgs (llama had 7), $0.02–0.36/M in vs llama's fast hosts at $0.59–0.72/M, and
+    # benchmark quality at or above the 70B.
+    #
+    # ⚠️ max_tokens: 16000 ON ALL THREE, NOT THE OLD TIGHT CAPS — the caps were tuned for llama,
+    # where every allowed token was answer. gpt-oss is a reasoning model that draws its thinking
+    # from the SAME budget, and the first real screen after the swap proved what that does:
+    # 8 of 9 batches of 100 candidates came back `finish_reason: length` with reasoning=1020 of
+    # 1024 tokens and EMPTY content — zero verdicts, while the lone 29-candidate batch fit
+    # (measured 2026-09-15, reproduced 3/3 on the same candidates; at 16000 the same batch
+    # answers 100/100 using ~2.4K tokens, ~$0.0036). Headroom is free — max_tokens is a ceiling,
+    # not a reservation — and a too-tight cap fails EMPTY, not truncated, so nothing parses.
     entity_classify:
       provider: openrouter
-      model: meta-llama/llama-3.3-70b-instruct
-      max_tokens: 1024
+      model: openai/gpt-oss-120b
+      max_tokens: 16000
       response_format: json_object   # Stage-4 Oracle SCREEN: 5-way person/org/media/project/
                                      # aggregator kind. Degrade-open if absent (screen still ranks).
     # ⚠️ `paper_enrich`, `note_annotate` and `signal_consolidate` WERE DELETED FROM HERE 2026-08-16,
     # and the reason is not tidiness. `model_routing.registered_models()` enumerates every role in
     # this block and PREFLIGHTS it — checking each model still has >= MIN_ORGS providers under the
     # deny-list. A role nobody calls is therefore not inert: it makes preflight assert health about
-    # models this install never touches, and it misrepresents what OPYT spends money on. Their rails
+    # models this install never touches, and it misrepresents what OPYT does. Their rails
     # are gone (the vault note pipeline and the deleted radar layer); verified caller-less across the
     # whole repo, tests included, before removal. The live file dropped them, and thirteen others,
     # on 2026-08-15 — this template was the last place they survived.
@@ -104,11 +116,11 @@ llm_backends:
       max_tokens: 1024
     # Stage-6 content-quality gate: EXTRACTIVE keep/drop over a fetched page's units, run
     # pre-embed. Load-bearing (a false-drop is invisible), so a capable model over the 8B;
-    # cost is trivial (a few calls/page). Gold-set eval may swap to gpt-4o-mini.
+    # it runs only a few times per page. Gold-set eval may swap to gpt-4o-mini.
     content_quality:
       provider: openrouter
-      model: meta-llama/llama-3.3-70b-instruct
-      max_tokens: 2048
+      model: openai/gpt-oss-120b
+      max_tokens: 16000   # reasoning shares the budget — see the ⚠️ on entity_classify
       response_format: json_object   # returns a {unit_index: keep|drop} mask — valid JSON load-bearing
     # Blog/website URL discovery: triage the GRAY zone (marker-less hub links) — article vs not,
     # from url + anchor only (no page fetch). Recall-biased; fail-safe degrades to approve-all-gray,
@@ -116,36 +128,35 @@ llm_backends:
     # article. Cheap URL-string classification — a lighter model (gpt-4o-mini) is fine here.
     url_triage:
       provider: openrouter
-      model: meta-llama/llama-3.3-70b-instruct
-      max_tokens: 512
+      model: openai/gpt-oss-120b
+      max_tokens: 16000   # ONE call carries every gray link — the most exposed of the three
       response_format: json_object   # returns a {index: keep|drop} mask — valid JSON load-bearing
     # The reading rails: read one whole assembled context, emit 10-25 standing queries plus a
     # keep/drop verdict on the ones already running. Shared by both readers — the bookmark window
     # and the sitting rail's topical regions.
-    # THE ONE ROLE THAT IS NOT LLAMA, deliberately. Everything above classifies one small thing at
-    # a time and re-runs cheaply if it is wrong; this makes 10-25 standing decisions from a single
-    # ~120K-token read, and each one runs on a schedule until it is retired — the one place on this
-    # rail where quality compounds instead of being re-rolled. Llama is rejected twice over: the
-    # comprehension is not there, and its unquoted-JSON habit is worst exactly where the payload is
-    # a long free-text consensus.
+    # THE ONE ROLE THAT DOES NOT SHARE THE CLASSIFY MODEL, deliberately. Everything above
+    # classifies one small thing at a time and re-runs cheaply if it is wrong; this makes 10-25
+    # standing decisions from a single ~120K-token read, and each one runs on a schedule until it
+    # is retired — the one place on this rail where quality compounds instead of being re-rolled.
+    # (When the classify roles ran llama-3.3-70b, llama was rejected here twice over: the
+    # comprehension was not there, and its unquoted-JSON habit was worst exactly where the payload
+    # is a long free-text consensus. gpt-oss-120b has not been evaluated for this role — the
+    # 128K context alone makes it a non-starter for the ~120K-token read.)
     frontier_reader:
       provider: openrouter
-      # SELECTED ON PROVIDER REDUNDANCY FIRST, PRICE SECOND — `model_routing`'s own rule, written
+      # SELECTED ON PROVIDER REDUNDANCY — `model_routing`'s own rule, written
       # after the cheapest vision model on the board became a single point of failure. Verified
       # against the live catalog with the deny-list applied 2026-08-16: 16 surviving orgs, 1.05M
-      # context, $0.064/M in and $0.129/M out = ~$0.0087 per read. Two Google models and one Alibaba
-      # model were cheaper-or-near and are DISQUALIFIED at ONE org each. If this one ever needs
+      # context. Two Google models and one Alibaba model are DISQUALIFIED at ONE org each. If this one ever needs
       # replacing, step to minimax/minimax-m3 (11 orgs) or z-ai/glm-5.2 (26 orgs — the most
       # outage-proof on the board) rather than back to a single-org bargain.
       #
-      # ⚠️ The pricing table in `llm_client` is a LOWER BOUND: 12 real content_quality calls billed
-      # $0.0143 against a computed $0.0042, 3.4x. Carry that multiplier on any estimate above.
       model: deepseek/deepseek-v4-flash
       # Generous on purpose, and the reasoning is model-independent: a reasoning model draws its
-      # thinking from the SAME max_tokens budget as the answer — at 64 tokens an early probe spent
+      # thinking from the SAME max_tokens budget as the answer — at 64 tokens an early probe used
       # every one of them thinking and returned empty content (measured 2026-08-09). The visible
       # payload is only ~3K tokens (consensus + 25 cited queries); reasoning over a ~120K-token read
-      # is not, and a ceiling hit truncates the JSON mid-object, turning a paid run into an
+      # is not, and a ceiling hit truncates the JSON mid-object, turning a model run into an
       # unparseable body. Headroom is free — max_tokens is a ceiling, not a reservation.
       max_tokens: 32000
       # ⚠️ SAFE HERE, AND UNSAFE ON THE MODEL THIS REPLACED — the history is worth keeping because
@@ -156,7 +167,7 @@ llm_backends:
       # never reach OpenRouter, that failed ONLY in production, on every run, with a green suite.
       # Every model on the 2026-08-16 shortlist supports structured_outputs AND response_format, so
       # this now removes a failure class the old config had to live with: a malformed body turns a
-      # paid read into nothing.
+      # read into nothing.
       response_format: json_object
 
 # ── Frontier stage 1: which engine reads the bookmarks ──────────────────────────
@@ -164,9 +175,8 @@ frontier:
   # 'api'        — OpenRouter via llm_client (the `frontier_reader` role above). THE DEFAULT, and
   #                that is an invariant rather than a preference: CLAUDE.md requires the core to
   #                run on ANY MCP client, so the shipped path may not need the `claude` binary.
-  # 'claude-cli' — a headless `claude -p` on a Claude subscription instead of metered credits.
-  #                Opt-in per machine. Needs no `frontier_reader` role (it bypasses llm_client)
-  #                and spends no OpenRouter balance. Runs each read in a FRESH process from an
+  # 'claude-cli' — a headless `claude -p` installed on this machine. Opt-in per machine. Needs no
+  #                `frontier_reader` role (it bypasses llm_client). Runs each read in a FRESH process from an
   #                EMPTY temp dir with no tools and no MCP, so the context is as clean as an API
   #                call — running it from a repo instead injected ~28K tokens of CLAUDE.md and
   #                project scaffolding (measured 2026-08-09).
@@ -176,5 +186,5 @@ frontier:
   # comparable by default. `opus` is the considered upgrade for THIS role specifically: every other
   # call site on this rail classifies one small thing at a time and re-runs cheaply when wrong,
   # whereas this makes 10-25 standing decisions from a single ~250K-token read and each one runs on
-  # a schedule until retired. On a subscription that upgrade costs quota, not dollars.
+  # a schedule until retired. A different model changes the available subscription quota.
   cli_model: sonnet

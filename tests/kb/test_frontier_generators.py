@@ -25,8 +25,13 @@ Fenced off here:
     voted. Once the MIN counts votable claims only, a NEW sitting emitting a query the bookmark
     reader had already dropped 15 times would reset the shared row to daily and silently undo the
     entire fix.
-  • THE KILL SWITCH'S SUBTLETY. Retiring a dead region must not take down a thread the bookmark
-    reader is still asking for.
+
+The kill switch this file used to fence off is gone. `retire_generator` and `generators` were
+deleted on 2026-09-05 (never run, no door in the app), and with them the four tests that covered
+the cascade and the listing, plus `test_re_registration_never_un_retires` — that one asserted an
+automatic path could not un-retire a GENERATOR, and nothing can retire one any more, so the state
+it protected is unreachable. Per-QUERY retirement is untouched and still covered, in
+`tests/kb/test_watchlist.py` and `tests/kb/test_reader_core.py`.
 """
 from __future__ import annotations
 
@@ -71,16 +76,6 @@ def test_emitting_registers_the_channel(conn):
     assert row["votable"] == 0
     assert row["label"] == "the mlx region"
     assert row["status"] == "active"
-
-
-def test_re_registration_never_un_retires(conn):
-    """Retirement is a human decision; an automatic path must not overturn it by accident."""
-    fq.upsert_queries(conn, [_q(SHARED)], generator=REGION, votable=False)
-    fq.retire_generator(conn, REGION)
-    fq.upsert_queries(conn, [_q("something else")], generator=REGION, votable=False)
-    row = conn.execute("SELECT status FROM frontier_generators WHERE generator=?",
-                       (REGION,)).fetchone()
-    assert row["status"] == "retired"
 
 
 # ── the pin ─────────────────────────────────────────────────────────────────────
@@ -128,46 +123,6 @@ def test_a_votable_re_emission_still_resets(conn):
     _drop(conn, SHARED, BOOKMARKS, 15)
     fq.upsert_queries(conn, [_q(SHARED)], generator=BOOKMARKS, votable=True)
     assert _speed(conn, SHARED) == 0
-
-
-# ── the kill switch ─────────────────────────────────────────────────────────────
-def test_retiring_a_region_retires_only_what_it_alone_claimed(conn):
-    solo = "interaction nets GPU compiler"
-    fq.upsert_queries(conn, [_q(SHARED), _q(solo)], generator=REGION, votable=False)
-    fq.upsert_queries(conn, [_q(SHARED)], generator=BOOKMARKS, votable=True)
-
-    out = fq.retire_generator(conn, REGION)
-    assert out["generator_retired"] is True
-    assert out["queries_retired"] == 1
-
-    statuses = {r["normalized"]: r["status"] for r in
-                conn.execute("SELECT normalized, status FROM frontier_queries")}
-    assert statuses[fq.normalize(solo)] == "retired"
-    assert statuses[fq.normalize(SHARED)] == "active"    # the bookmark reader still asks
-
-
-def test_a_retired_channel_stops_counting_as_a_live_claimant(conn):
-    """Retire both claimants in turn and the shared query finally goes with the second."""
-    fq.upsert_queries(conn, [_q(SHARED)], generator=REGION, votable=False)
-    fq.upsert_queries(conn, [_q(SHARED)], generator=OTHER_REGION, votable=False)
-    assert fq.retire_generator(conn, REGION)["queries_retired"] == 0
-    assert fq.retire_generator(conn, OTHER_REGION)["queries_retired"] == 1
-
-
-def test_retiring_an_unknown_channel_changes_nothing(conn):
-    fq.upsert_queries(conn, [_q(SHARED)], generator=BOOKMARKS, votable=True)
-    out = fq.retire_generator(conn, "sitting:never-existed")
-    assert out == {"generator_retired": False, "queries_retired": 0}
-    assert _speed(conn, SHARED) == 0
-
-
-def test_generators_listing_reports_claims_per_channel(conn):
-    fq.upsert_queries(conn, [_q(SHARED), _q("another thread")], generator=REGION, votable=False)
-    fq.upsert_queries(conn, [_q(SHARED)], generator=BOOKMARKS, votable=True)
-    by_name = {r["generator"]: r for r in fq.generators(conn)}
-    assert by_name[REGION]["claims"] == 2
-    assert by_name[BOOKMARKS]["claims"] == 1
-    assert by_name[BOOKMARKS]["votable"] == 1
 
 
 def test_the_reader_prompt_derives_its_source_list_and_never_restates_it():

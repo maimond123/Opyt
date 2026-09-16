@@ -9,8 +9,9 @@ Three things have to hold, and each is easy to break silently:
   1. A whole-page reject issues ZERO vision calls.
   2. A surviving page still gets its image descriptions into the CHUNKED text — the mask is graded
      pre-enrichment and replayed post-enrichment, so the two bodies must stay index-aligned.
-  3. The snapshot stays the FULL page, not the gated subset — `rechunk.py` re-grades from the raw
-     snapshot, so hashing the gated text would break rebuild-from-raw.
+  3. The snapshot stays the FULL page, not the gated subset — the `open()` tool serves that
+     snapshot as an atom's ground truth, so hashing the gated text would hand a reader less
+     than the author wrote and call it complete.
 
 The alignment in (2) rests on one property: `enrich_markdown_images` splices `"\\n*Image:* ..."` with
 a SINGLE newline while `_split_units` splits on BLANK lines, so enrichment lengthens units but never

@@ -21,6 +21,7 @@ from opyt_core import kb as kb_entry
 from pipeline.kb import schema
 from pipeline.kb.ingest_common import store_atom
 from pipeline.kb.raw_store import write_snapshot
+from tests.conftest import reset_atoms_session
 
 A = "github:root/agentkit"
 B = "github:stranger/agents"
@@ -72,9 +73,9 @@ def _clean_session():
     """Session counters are MODULE globals (stdio = one process per session), so they leak
     from test to test unless cleared. Both sides: a test must not inherit a count, and must
     not leave one behind."""
-    atoms_tools._reset_session()
+    reset_atoms_session()
     yield
-    atoms_tools._reset_session()
+    reset_atoms_session()
 
 
 # ── the shape ────────────────────────────────────────────────────────────────────
@@ -384,9 +385,12 @@ def test_three_searches_without_opening_anything_says_so(kb_home, fake_embedder)
     conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
     search = _tools()["search"]
 
-    assert [n["code"] for n in search("framework", mode="bm25")["notices"]] == []
-    assert [n["code"] for n in search("agent", mode="bm25")["notices"]] == []
-    third = search("library", mode="bm25")
+    # k matches each query's exact coverage (3, 3, 2 ranked), so neither the truncation
+    # notice nor the thin-coverage offer (each has its own tests) joins these strict
+    # empty-list assertions.
+    assert [n["code"] for n in search("framework", mode="bm25", k=3)["notices"]] == []
+    assert [n["code"] for n in search("agent", mode="bm25", k=3)["notices"]] == []
+    third = search("library", mode="bm25", k=2)
     assert "nothing_grounded" in [n["code"] for n in third["notices"]]
     assert third["trace"]["session"]["search_n"] == 3
 
@@ -470,49 +474,6 @@ def test_fresh_oracles_add_no_notice(kb_home, fake_embedder, monkeypatch):
     conn.close()
     out = kb_entry.run_kb_search("framework", mode="bm25", k=8)
     assert "oracles_stale" not in [n["code"] for n in out["notices"]]
-
-
-# ── a budget-paused rail rides on `search` too, gated on there being one ────
-#
-# Same argument as the freshness notice one section up, one failure mode over. A rail that hits
-# its daily ceiling writes `budget_paused` to ~/.opyt/<rail>.log, which nothing reads — so the
-# rail goes quiet and looks broken. That is the frozen-Oracle shape: refusing correctly, in
-# private. `search` is where the user actually is when their corpus stops growing.
-
-def test_a_budget_paused_rail_is_reported_on_search(kb_home, fake_embedder, monkeypatch):
-    from pipeline.kb import rail_budgets
-    monkeypatch.setattr(rail_budgets, "paused_today",
-                        lambda: [{"rail": "bookmark_catchup", "label": "bookmark catch-up",
-                                  "spent_usd": 1.0, "ceiling_usd": 1.0}])
-    conn = schema.connect()
-    _add(conn, fake_embedder, A, "github", "repo", "who:1", ["agents"], "an agent framework")
-    conn.close()
-    out = kb_entry.run_kb_search("framework", mode="bm25", k=8)
-    note = next(n for n in out["notices"] if n["code"] == "rails_budget_paused")
-    assert "bookmark catch-up" in note["message"]
-    assert note["rails"][0]["rail"] == "bookmark_catchup"
-
-
-def test_no_paused_rail_adds_no_notice(kb_home, fake_embedder, monkeypatch):
-    """⚠️ GATED ON A REAL PAUSE, not printed every call. `search` is high-frequency, and a block
-    on every call trains the reader to skip the one call where it matters."""
-    from pipeline.kb import rail_budgets
-    monkeypatch.setattr(rail_budgets, "paused_today", lambda: [])
-    conn = schema.connect()
-    _add(conn, fake_embedder, A, "github", "repo", "who:1", ["agents"], "an agent framework")
-    conn.close()
-    out = kb_entry.run_kb_search("framework", mode="bm25", k=8)
-    assert "rails_budget_paused" not in [n["code"] for n in out["notices"]]
-
-
-def test_a_spend_meter_hiccup_never_breaks_a_search(kb_home, fake_embedder, monkeypatch):
-    from pipeline.kb import rail_budgets
-    monkeypatch.setattr(rail_budgets, "paused_today",
-                        lambda: (_ for _ in ()).throw(RuntimeError("stats file is a directory")))
-    conn = schema.connect()
-    _add(conn, fake_embedder, A, "github", "repo", "who:1", ["agents"], "an agent framework")
-    conn.close()
-    assert kb_entry.run_kb_search("framework", mode="bm25", k=8)["hits"]
 
 
 def test_a_freshness_hiccup_never_breaks_a_search(kb_home, fake_embedder, monkeypatch):
@@ -661,3 +622,213 @@ def test_the_search_tool_exposes_the_scope_and_keeps_frontiers_queue_notice_apar
     assert "hits" in out["frontier_atoms"]                 # this query's crawl results
     scoped = mcp.tools["search"]("agent framework library", entry_mode="frontier", mode="bm25")
     assert "frontier_atoms" not in scoped
+
+
+# ── the thin-coverage enrichment offer ──────────────────────────────────────────
+#
+# ⚠️ WHY IT EXISTS. Enrichment (watch a subject + survey the web on it) used to be offered only
+# at onboarding-ish moments — the tour, the handoff. The highest-intent moment is mid-use: a
+# user who searches for a subject their store barely covers has just said, by asking, that they
+# care about something OPYT is thin on. Root-agnostic, and better signal than any tag count.
+
+def test_a_thin_unfiltered_search_offers_enrichment_once(kb_home, fake_embedder):
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    search = _tools()["search"]
+
+    out = search("framework", mode="bm25")            # 3 ranked < the default k=8
+
+    note = next(n for n in out["notices"] if n["code"] == "thin_coverage")
+    assert note["ranked"] == 3 and note["asked"] == 8
+    assert "watchlist" in note["message"] and "web-search" in note["message"]
+
+    again = search("framework", mode="bm25")
+    assert "thin_coverage" not in [n["code"] for n in again["notices"]]
+
+
+def test_a_filtered_thin_search_is_thin_on_purpose_and_gets_no_offer(kb_home, fake_embedder):
+    """A filter narrows deliberately — few results under `who=` or a date bound is the caller's
+    own scoping, not a coverage gap in the store."""
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    search = _tools()["search"]
+
+    out = search("framework", mode="bm25", source_type="paper")
+
+    assert "thin_coverage" not in [n["code"] for n in out["notices"]]
+
+
+def test_a_search_that_fills_its_ask_gets_no_offer(kb_home, fake_embedder):
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    search = _tools()["search"]
+
+    out = search("framework", mode="bm25", k=2)       # 3 ranked >= the 2 asked
+
+    assert "thin_coverage" not in [n["code"] for n in out["notices"]]
+
+
+def test_zero_matches_is_the_strongest_thin_signal_and_still_fires(kb_home, fake_embedder):
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    search = _tools()["search"]
+
+    out = search("sim-to-real transfer in robotics", mode="bm25")
+
+    note = next(n for n in out["notices"] if n["code"] == "thin_coverage")
+    assert note["ranked"] == 0
+
+
+# ── thin ≠ unfinished (2026-09-13) ──────────────────────────────────────────────
+#
+# ⚠️ An import that has not run produces the SAME arithmetic as a genuinely thin store, and the
+# offer above reads that arithmetic as a diagnosis: "the user has just named a subject their store
+# is thin on". On a store whose bookmark import is still queued that is confidently wrong, and
+# expensively so — it asks the user to go web-search for material they already handed OPYT.
+# Measured on David's store 2026-09-13: 0 atoms, 62 signals, and `bookmark_catchup` +
+# `substack_saved_catchup` sitting in rail_jobs.db with `started_at` NULL since 13:50.
+
+def _queue_rail(rail="bookmark_catchup"):
+    from pipeline.kb.rail_jobs import RailJobStore, current_home_id
+    RailJobStore().activate(current_home_id(), rail)
+
+
+def test_a_thin_search_blames_the_unfinished_import_not_the_user(kb_home, fake_embedder):
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    _queue_rail()
+    search = _tools()["search"]
+
+    out = search("framework", mode="bm25")
+    codes = [n["code"] for n in out["notices"]]
+
+    assert "import_incomplete" in codes and "thin_coverage" not in codes
+    note = next(n for n in out["notices"] if n["code"] == "import_incomplete")
+    assert note["waiting"] == ["bookmark_catchup"] and note["ranked"] == 3
+    # The host must be told NOT to make the offer, not merely left without the wording for it.
+    assert "not" in note["message"].lower() and "offer nothing else" in note["message"]
+
+
+def test_a_rail_that_has_already_run_is_not_an_outstanding_promise(kb_home, fake_embedder):
+    """Only `started_at IS NULL` counts. A rail that ran and found nothing is a real observation:
+    the store IS thin, and suppressing the offer there would lose the highest-intent moment there
+    is to the mere existence of a job row."""
+    from pipeline.kb.rail_jobs import RailJobStore, current_home_id
+
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    _queue_rail()
+    store = RailJobStore()
+    job = store.claim_next()
+    store.finish(job, 0, cadence=3600)
+
+    out = _tools()["search"]("framework", mode="bm25")
+    codes = [n["code"] for n in out["notices"]]
+
+    assert "thin_coverage" in codes and "import_incomplete" not in codes
+
+
+def test_a_running_enrichment_is_an_outstanding_promise_too(kb_home, fake_embedder, monkeypatch):
+    """⚠️ ENRICHMENT IS A THREAD, NOT A RAIL ROW. The rail read above cannot see it, and that
+    blindness would restore this exact defect on the flow that replaced it: saved posts now land
+    immediately and fill in their thread context over the next few of x.com's windows, which is a
+    mid-import store by any other name."""
+    from pipeline.kb import enrichment
+
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    monkeypatch.setattr(enrichment, "is_running", lambda: True)
+
+    out = _tools()["search"]("framework", mode="bm25")
+    codes = [n["code"] for n in out["notices"]]
+
+    assert "import_incomplete" in codes and "thin_coverage" not in codes
+    note = next(n for n in out["notices"] if n["code"] == "import_incomplete")
+    assert note["waiting"] == ["enrichment"]
+    # It names WHAT is missing — thread context and image descriptions — rather than implying the
+    # posts themselves are absent. They are not; that is the whole point of the split.
+    assert "enrichment is still running" in note["message"]
+    assert "thread context" in note["message"]
+
+
+def test_a_finished_enrichment_stops_suppressing_the_offer(kb_home, fake_embedder, monkeypatch):
+    """The mirror of the rail rule: once Enrichment is done, a thin result is a real observation
+    about the store, and suppressing the offer forever would lose the highest-intent moment there
+    is to a flag nobody clears."""
+    from pipeline.kb import enrichment
+
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    monkeypatch.setattr(enrichment, "is_running", lambda: False)
+
+    codes = [n["code"] for n in _tools()["search"]("framework", mode="bm25")["notices"]]
+    assert "thin_coverage" in codes and "import_incomplete" not in codes
+
+
+def test_an_unreadable_jobs_database_leaves_the_search_alone(kb_home, fake_embedder, monkeypatch):
+    """Fail-safe (CLAUDE.md): a missing or broken optional input degrades to an empty result, and
+    a notice is never worth failing a query over. Reporting "nothing outstanding" is also the
+    right DIRECTION to be wrong in — search keeps the behavior it has always had."""
+    import mcp_server.atoms_tools as at
+
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    _queue_rail()
+    monkeypatch.setattr("pipeline.kb.rail_jobs.RailJobStore",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db gone")))
+
+    assert at._import_outstanding() == []
+    out = _tools()["search"]("framework", mode="bm25")
+    assert "thin_coverage" in [n["code"] for n in out["notices"]]
+
+
+# ── `cite` — the pre-rendered link ──────────────────────────────────────────────
+# RULED 2026-09-15 on a measured failure, not a worry: `source_url` was on every card and a
+# docstring told the host to show it, and two hosted phone searches still came back linkless
+# because a bare URL doubles the width of a short bullet. `cite` makes the link cost nothing —
+# the title the host was already writing becomes the link. See `opyt_core.kb._cite`.
+def test_every_hit_carries_a_pasteable_markdown_link(kb_home, fake_embedder):
+    """The whole point of the field: a host can paste it and be done."""
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    hits = kb_entry.run_kb_search("framework", mode="bm25", k=8)["hits"]
+    assert hits
+    for h in hits:
+        assert h["cite"].startswith("[") and f"]({h['source_url']})" in h["cite"]
+
+
+def test_cite_never_replaces_source_url(kb_home, fake_embedder):
+    """Presentation is added, never substituted. Anything that PROGRAMS against a hit reads the
+    bare pointer, and collapsing the two would make a formatting choice load-bearing for every
+    non-host consumer of this API."""
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    h = kb_entry.run_kb_search("framework", mode="bm25", k=8)["hits"][0]
+    assert h["source_url"] and "[" not in h["source_url"]
+
+
+def test_an_atom_with_no_url_cites_nothing_rather_than_nowhere(kb_home, fake_embedder):
+    """Fail-safe, and the failure it prevents is specific: `[label]()` renders as a link, reads
+    as a citation, and goes nowhere. `None` is the honest answer and the docstring tells the host
+    to say so plainly."""
+    assert kb_entry._cite(None, "NASA", "x", "2026-06-30") is None
+    assert kb_entry._cite("", "NASA", "x", "2026-06-30") is None
+
+
+def test_a_display_name_with_a_bracket_cannot_break_out_of_the_label(kb_home):
+    """X allows `]` in a display name. Unescaped it closes the markdown label early and spills
+    the rest of the name into the output as loose text beside a truncated link."""
+    out = kb_entry._cite("https://x.com/a/status/1", "Bob [not] Real", "x", "2026-06-30")
+    assert out == "[Bob not Real · 2026-06-30](https://x.com/a/status/1)"
+
+
+def test_a_url_with_parens_is_wrapped_so_the_target_survives(kb_home):
+    """`(disambiguation)`-style URLs are the standard case. A bare paren ends the markdown target
+    early, producing a link that silently points somewhere SHORTER than intended — which is worse
+    than no link, because it looks like it worked."""
+    out = kb_entry._cite("https://en.wikipedia.org/wiki/Mercury_(planet)", None, "blog", None)
+    assert out == "[blog](<https://en.wikipedia.org/wiki/Mercury_(planet)>)"
+
+
+def test_cite_falls_back_through_name_then_type_then_the_word_source(kb_home):
+    """A label is never empty — an atom with no author name and no source type still gets a
+    clickable word rather than `[](url)`."""
+    assert kb_entry._cite("https://e/1", None, None, None) == "[source](https://e/1)"
+    assert kb_entry._cite("https://e/1", None, "paper", None) == "[paper](https://e/1)"
+
+
+def test_open_cites_the_same_way_a_hit_does(kb_home, fake_embedder):
+    """The surface where a claim is actually ASSERTED must spell its citation the same way the
+    surface that routed you there did, or the host learns two habits and keeps the cheaper one."""
+    conn = schema.connect(); _corpus(conn, fake_embedder); conn.close()
+    got = kb_entry.kb_open(C)
+    assert got["cite"] == f"[x · 2024-05-01](https://example/{C})"

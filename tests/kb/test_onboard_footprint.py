@@ -2,7 +2,7 @@
 
 Each source routes exactly once: personal blog/substack through the single-author
 gate to the footprint adapter (gate-skip → affiliation), github to sync_github with
-resolve, org-shaped links to an affiliation, scholar/orcid deferred. The
+resolve, org-shaped links to an affiliation, scholar/orcid not-built. The
 footprint adapters + sync_github are monkeypatched (no network / no embed); the
 affiliation path uses the REAL record_affiliation (mirrors test_affiliation).
 """
@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from pipeline.kb import eligibility, ingest_blog, ingest_github, ingest_substack, resolve, schema
+from pipeline.kb import (eligibility, ingest_blog, ingest_github, ingest_substack, link_router,
+                         resolve, schema)
 from pipeline.kb.eligibility import AuthorshipVerdict, GateDecision
 from pipeline.kb.onboard_footprint import onboard_footprint
 
@@ -97,6 +98,54 @@ def test_github_profile_ingests_and_resolves(conn, monkeypatch):
     assert calls["handles"] == ["simonw"]
 
 
+def test_a_repo_url_in_the_bio_mints_that_repo_not_an_account_crawl(conn, monkeypatch):
+    """`discover_profile` tags every github.com link `github`, so a bio link to ONE repository
+    arrives on the same route as a profile. Taking its last url segment as a login made
+    `github.com/acme/memory` crawl an unrelated account called `memory`; the repository itself was
+    never atomized. It goes through the single-repo minter instead.
+
+    `author_referenced`, not `user-saved`: the Oracle pointed at this repo, David did not save it,
+    and the two modes feed Frontier's query generation differently."""
+    minted = {}
+    monkeypatch.setattr(ingest_github, "sync_github",
+                        lambda *a, **k: pytest.fail("a repo url must not reach the handle crawl"))
+    monkeypatch.setattr(link_router, "mint_artifact",
+                        lambda conn, emb, url, kind, **kw: minted.update(url=url, kind=kind, **kw)
+                        or {"status": "minted", "atom_id": "github:acme/memory"})
+
+    src = _src("github", "https://github.com/acme/memory")
+    out = onboard_footprint(conn, object(), "x:user:7", [src])
+
+    assert out["ingested"] == 1 and out["atoms_added"] == 1
+    assert minted["url"] == "https://github.com/acme/memory" and minted["kind"] == "github"
+    assert minted["entry_mode"] == "author_referenced"
+
+
+def test_a_repo_url_that_mints_nothing_is_an_error_not_a_silent_ingest(conn, monkeypatch):
+    """A dead bio link produced no atom. Reporting it `ingested` with zero atoms is the shape this
+    whole route existed to stop."""
+    monkeypatch.setattr(link_router, "mint_artifact",
+                        lambda *a, **k: {"status": "failed", "atom_id": None})
+    out = onboard_footprint(conn, object(), "x:user:7",
+                            [_src("github", "https://github.com/acme/gone")])
+    assert out["errors"] == 1 and out["ingested"] == 0
+
+
+def test_a_deep_github_url_is_still_the_repo_it_names(conn, monkeypatch):
+    """`/acme/memory/blob/main/README.md` is a link INTO one repository, and the minter keys on
+    `acme/memory` either way — the shape test delegates to `_github_owner_repo`, which strips the
+    deeper path."""
+    minted = {}
+    monkeypatch.setattr(ingest_github, "sync_github",
+                        lambda *a, **k: pytest.fail("a repo url must not reach the handle crawl"))
+    monkeypatch.setattr(link_router, "mint_artifact",
+                        lambda conn, emb, url, kind, **kw: minted.update(url=url)
+                        or {"status": "minted", "atom_id": "github:acme/memory"})
+    onboard_footprint(conn, object(), "x:user:7",
+                      [_src("github", "https://github.com/acme/memory/blob/main/README.md")])
+    assert minted["url"] == "https://github.com/acme/memory/blob/main/README.md"
+
+
 # ── gate SKIP (multi-author) → affiliation, no atoms ──────────────────────────
 
 def test_blog_gate_skip_becomes_affiliation(conn, monkeypatch):
@@ -112,7 +161,7 @@ def test_blog_gate_skip_becomes_affiliation(conn, monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
 
 
-# ── boundaries: untrusted skipped, gate needs-review parked, scholar deferred ─
+# ── boundaries: untrusted skipped, gate needs-review parked, scholar not-built ─
 
 def test_untrusted_non_org_is_parked_not_ingested(conn, monkeypatch):
     # If gate were reached it would raise (proving we never got there for an untrusted src).
@@ -132,10 +181,15 @@ def test_gate_needs_review_parks_the_source(conn, monkeypatch):
     assert out["needs_review"] == 1 and out["ingested"] == 0
 
 
-def test_scholar_is_deferred(conn):
+def test_scholar_is_not_built(conn):
+    """`not-built`, not `deferred`. `deferred` means bounded work something WILL resume — an
+    `oracle(action='ingest')` X pull that hit a rate window, a budget-capped Frontier pair — and
+    nothing resumes scholar/orcid. One word, one meaning, or the user-facing copy promises a
+    continuation no rail performs."""
     src = _src("scholar", "https://scholar.google.com/citations?user=abc", handle="abc")
     out = onboard_footprint(conn, None, "x:user:7", [src])
-    assert out["deferred"] == 1
+    assert out["not_built"] == 1
+    assert out["results"][0]["action"] == "not-built"
 
 
 def test_missing_oracle_id_is_an_error(conn):

@@ -41,20 +41,20 @@ def fake_or_ok():
 
 class TestValidateProvider:
     def test_liveness_success(self, fake_or_ok):
-        ok, msg = llm_client.validate_provider("openrouter", "sk-test")
+        ok, msg = llm_providers.validate_provider("openrouter", "sk-test")
         assert ok and "valid" in msg
 
     def test_liveness_failure_surfaces_backend_error(self):
         real = llm_client._BACKENDS["openrouter"]
         llm_client._set_backend_for_tests("openrouter", _bad_backend)
         try:
-            ok, msg = llm_client.validate_provider("openrouter", "sk-bad")
+            ok, msg = llm_providers.validate_provider("openrouter", "sk-bad")
             assert not ok and "401" in msg
         finally:
             llm_client._set_backend_for_tests("openrouter", real)
 
     def test_unknown_provider_is_a_clean_failure(self):
-        ok, _ = llm_client.validate_provider("not-a-provider", "x")
+        ok, _ = llm_providers.validate_provider("not-a-provider", "x")
         assert not ok
 
     def test_passed_key_is_threaded_to_backend_not_into_env(self, monkeypatch):
@@ -70,7 +70,7 @@ class TestValidateProvider:
         llm_client._set_backend_for_tests("openrouter", capturing)
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-original")
         try:
-            ok, _ = llm_client.validate_provider("openrouter", "sk-candidate")
+            ok, _ = llm_providers.validate_provider("openrouter", "sk-candidate")
             assert ok
             assert seen["api_key"] == "sk-candidate"                  # threaded as a param
             assert os.environ["OPENROUTER_API_KEY"] == "sk-original"  # env untouched
@@ -88,7 +88,7 @@ class TestValidateProvider:
         real = llm_client._BACKENDS["openrouter"]
         llm_client._set_backend_for_tests("openrouter", capturing)
         try:
-            llm_client.validate_provider("openrouter", None)
+            llm_providers.validate_provider("openrouter", None)
             assert seen["api_key"] is None        # no override passed
         finally:
             llm_client._set_backend_for_tests("openrouter", real)
@@ -98,12 +98,6 @@ class TestValidateProvider:
 
 
 class TestProviderDiscovery:
-    def test_openrouter_is_configured(self):
-        assert "openrouter" in llm_client.configured_providers()
-
-    def test_default_provider_is_openrouter(self):
-        assert llm_client.default_provider() == "openrouter"
-
     def test_known_providers_covers_the_backends(self):
         """ONE backend since the direct Anthropic transport was retired 2026-08-13.
 
@@ -111,7 +105,7 @@ class TestProviderDiscovery:
         fails if a second backend is registered without a matching `_PROVIDER_ENV` entry and a
         credential-registry row. The dispatch table surviving at size one is deliberate — it is
         the registration seam for the next provider, not dead generality."""
-        assert llm_client.known_providers() == {"openrouter"}
+        assert llm_providers.known_providers() == {"openrouter"}
 
 
 # ── credentials routing ──────────────────────────────────────────────────────

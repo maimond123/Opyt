@@ -12,8 +12,12 @@ directly) / `gray` (sent to one batched LLM triage call). Fetch list = baseline 
 triage-approved.
 
 Ownership guard (auto-attribute is only safe for the author's OWN content): a hub link is kept
-only if its host is the origin or a subdomain of it (`_is_owned`). Cross-host MIRRORS of a
-baseline post (`_path_key` match) collapse onto the baseline instead of double-ingesting.
+only if it is on the origin host (or a subdomain), or it carries one of the author's identity
+tokens (`_is_owned` + `identity_tokens`). The token arm exists because same-host-only kept 3 of
+55 of one author's own links — his work lives on `karpathy.github.io` and under
+`cs.stanford.edu/people/karpathy/`, and neither is a subdomain of `karpathy.ai`. Cross-host
+MIRRORS of a baseline post (`_path_key` match) collapse onto the baseline instead of
+double-ingesting.
 
 URL structure is a reliable REJECT filter but an unreliable ACCEPT filter (empirically measured
 across 5 sites), so structure only drops confident junk; the LLM decides the gray zone, and the
@@ -28,6 +32,7 @@ from __future__ import annotations
 import json
 import re
 
+from pipeline.ingestion import identity_tokens
 from pipeline.ingestion.sources.blog import is_nav_path  # shared nav denylist (single source)
 from urllib.parse import urlparse
 
@@ -43,19 +48,10 @@ _ASSET_RE = re.compile(
     r"woff2?|ttf|otf|eot|mp4|mov|avi|webm|mkv|mp3|wav|m4a|pdf|rss|atom)(?:[?#]|$)",
     re.I,
 )
-# Social / media / commerce homes — a link to a profile, not an article. Host-anchored so
-# `github.io` custom-domain blogs are NOT caught (only bare github.com/linkedin/etc.).
-_SOCIAL_HOST_RE = re.compile(
-    r"(?:^|\.)(?:twitter\.com|x\.com|t\.co|github\.com|gitlab\.com|linkedin\.com|"
-    r"youtube\.com|youtu\.be|instagram\.com|facebook\.com|threads\.net|mastodon\.|"
-    r"bsky\.app|bluesky|discord\.(?:gg|com)|patreon\.com|reddit\.com|ko-fi\.com|"
-    r"buymeacoffee\.com|paypal\.(?:com|me)|amazon\.|amzn\.|goodreads\.com|producthunt\.com)",
-    re.I,
-)
 # Confident ARTICLE markers: a dated path segment, or a known post/section segment.
 _STRONG_PATH_RE = re.compile(
     r"/(?:19|20)\d\d(?:[/-]\d|/)|"                                        # /2024/…  /2024-…
-    r"/(?:blog|posts?|writing|notes?|essays?|articles?|p|abs|story|pub|newsletter|til)/",
+    r"/(?:blog|posts?|writing|notes?|essays?|articles?|p|story|pub|newsletter|til)/",
     re.I,
 )
 
@@ -64,8 +60,10 @@ def classify_url(url: str, anchor: str = "") -> str:
     """Structural tier for a candidate URL: ``"drop" | "strong" | "gray"``.
 
     URL structure is a reliable REJECT filter and an unreliable ACCEPT filter (empirical), so:
-      • ``drop``   — confident junk: assets/media, social/commerce homes, nav/tag/feed pages,
-                     mailto/non-http, bare homepages. Never fetched.
+      • ``drop``   — confident junk: assets/media, nav/tag/feed pages, mailto/non-http,
+                     bare homepages. Never fetched. Host is NOT consulted: the only caller
+                     (`discover_candidate_urls`) applies `_is_owned` first, so every url that
+                     reaches here is already on the origin.
       • ``strong`` — confident article: a dated path or a post/section segment. Fetched directly.
       • ``gray``   — everything else (marker-less slugs, section pages). Sent to LLM triage.
 
@@ -78,11 +76,8 @@ def classify_url(url: str, anchor: str = "") -> str:
     p = urlparse(u)
     if p.scheme not in ("http", "https"):
         return "drop"
-    host = (p.netloc or "").lower()
     path = p.path or "/"
     if _ASSET_RE.search(path):
-        return "drop"
-    if _SOCIAL_HOST_RE.search(host):
         return "drop"
     if path in ("", "/"):                 # a bare homepage (internal root or external landing)
         return "drop"
@@ -205,14 +200,30 @@ def _host(url: str) -> str:
     return h[4:] if h.startswith("www.") else h
 
 
-def _is_owned(url: str, origin_host: str) -> bool:
-    """True iff ``url``'s host IS the origin host or a SUBDOMAIN of it — i.e. the link lives on
-    the author's OWN site. The ownership guard for auto-attribute: a NOT-owned link (press about
-    the author, another person's site) must never be minted as the author's atom. Conservative —
-    also drops the author's own content on a SHARED platform domain (e.g. ``substack.com/@them``);
-"""
+def _is_owned(url: str, origin_host: str, tokens=frozenset()) -> bool:
+    """True iff the link is the author's own: on the origin host (or a subdomain), or carrying one
+    of their identity tokens as a whole host label or path segment.
+
+    The ownership guard for auto-attribute — a NOT-owned link (another person's site, press about
+    the author) must never be minted as the author's atom.
+
+    The token arm is what reaches the author's own content on a host they do not control:
+    `cs.stanford.edu/people/karpathy/` and `medium.com/@them` are theirs and neither is a
+    subdomain of their site. Measured on karpathy.ai (2026-09-09): the host rule alone kept 3 of
+    his 55 own links, the two arms together keep 48, at the cost of ONE false positive — a
+    journalist's article at `wired.com/2015/01/karpathy/`. That is the same trade
+    `_BLOG_IDENTITY_TYPES` already accepts by ruling.
+
+    `tokens` empty ⇒ the host rule alone, so a caller that has no name and no origin behaves
+    exactly as this function did before the token arm existed.
+    """
+    from pipeline.ingestion.identity_tokens import url_carries_token
     h = _host(url)
-    return bool(h) and bool(origin_host) and (h == origin_host or h.endswith("." + origin_host))
+    if not h:
+        return False
+    if origin_host and (h == origin_host or h.endswith("." + origin_host)):
+        return True
+    return url_carries_token(url, tokens)
 
 
 def _path_key(url: str) -> str:
@@ -281,15 +292,16 @@ def _pick_index_pages(seed_urls: list[str], origin_host: str, exclude_keys: set[
     return picked
 
 
-def discover_candidate_urls(base: str, *, handle: str | None = None,
+def discover_candidate_urls(base: str, *,
                             author_name: str | None = None,
                             known_urls: set[str] | None = None) -> list[dict]:
     """UNION discovery: the sitemap/rss baseline PLUS hub-harvested, triaged extras.
 
     ``known_urls`` is the REFRESH seam: canonical post keys already in the store. Matching GRAY
     candidates are dropped before ``_triage_gray`` so a re-crawl doesn't re-pay an LLM call for
-    urls already ingested; the CALLER must pass ``seen − body_pending`` so atoms rescued by
-    ``schema.load_body_pending`` still get a chance to self-heal
+    urls already ingested. A caller whose rail STORES a body-less stub on a block must subtract
+    ``schema.load_body_pending`` from it, or those atoms never self-heal; ``ingest_blog``, the one
+    caller, writes no row on a block and so passes plain ``seen``
 
     Drop-in for the old ``_fetch_sitemap_urls(base)`` call. Returns entries
     ``{url, lastmod, via, source}`` where ``source`` is ``sitemap`` (baseline, untriaged,
@@ -313,6 +325,9 @@ def discover_candidate_urls(base: str, *, handle: str | None = None,
     baseline_paths = {_path_key(e["url"]) for e in baseline}   # host-independent, for mirror dedup
     hub_page_keys = _hub_page_keys(base)
     origin_host = _host(base)
+    # Both inputs are already here: `base` is the author's site and `author_name` is threaded in
+    # for the triage prompt. No new plumbing, and an absent name just narrows the token set.
+    tokens = identity_tokens.tokens_for(base, author_name)
 
     try:
         hub_links = harvest_hub_links(base)
@@ -354,7 +369,7 @@ def discover_candidate_urls(base: str, *, handle: str | None = None,
         if _path_key(url) in baseline_paths:      # same path, different host = mirror of a baseline post
             mirror_dropped += 1
             continue
-        if not _is_owned(url, origin_host):       # not the author's domain → NOT their atom (auto-attribute guard)
+        if not _is_owned(url, origin_host, tokens):   # not the author's → NOT their atom (auto-attribute guard)
             external_dropped += 1
             continue
         seen_keys.add(key)

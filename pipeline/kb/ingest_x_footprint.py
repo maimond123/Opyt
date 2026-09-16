@@ -36,7 +36,8 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pipeline.timeparse import utc_now
 
 from . import derive, link_router, schema
@@ -78,9 +79,7 @@ def _has_substantive_media(group: list[dict]) -> bool:
 
 # Dispatchable = github / research paper / Substack, the set that becomes its own atom later; any
 # other link counts as no retrievable substance, same as a decorative photo (David 2026-07-20).
-# Re-exported from `link_router` (moved there 2026-08-13 so Hopper shares one host table) under the
-# old private names — these must keep answering on the narrower artifact vocabulary only.
-_PAPER_HOSTS = link_router._PAPER_HOSTS
+# `link_router` owns artifact classification and presence checks.
 _classify_link = link_router.classify_link
 _atom_present = link_router.atom_present
 
@@ -167,7 +166,7 @@ def extract_engagements(raw: list[dict]) -> list[dict]:
       • Targets key on NUMERIC ids (`x:user:{id}`) whenever the payload carries one — reply
         `inReplyToUserId` and `quoted_tweet.author.id` do. A handle-only target is stored as
         `x:@{handle}` VERBATIM (screen names are [A-Za-z0-9_]; never slugified) for later
-        resolution. `inReplyToUsername` is never read: `x_graphql._normalize` does not emit it at
+        resolution. `inReplyToUsername` is never read: `x_graphql_core.normalize` does not emit it at
         all, and the twitterapi.io shape this rule was first written against left it empty 100% of
         the time. The numeric id is the only field either source populated reliably.
       • Self-acts are NOT engagements: a self-reply is a thread continuation, a self-quote/self-
@@ -239,7 +238,7 @@ def _filter_and_stitch(raw: list[dict]) -> list[list[dict]]:
     unit tests hit THIS, no DB / embedder / network.
 
     Reply target = `inReplyToUserId` compared to the AUTHOR's own numeric id — NOT `inReplyToUsername`
-    vs the handle. `x_graphql._normalize` does not emit `inReplyToUsername` at all, so a handle-string
+    vs the handle. `x_graphql_core.normalize` does not emit `inReplyToUsername` at all, so a handle-string
     check would keep every reply outright. It was already the wrong field before the source changed:
     twitterapi.io's profile-fetch shape left it EMPTY (None) on every reply (LIVE-VERIFIED
     2026-07-19: 0/136 populated for @martin_casado) while `inReplyToUserId` was 100% populated — so
@@ -286,11 +285,6 @@ class LinkDispatcher:
     this, marked at submit") and `seen` ("is this durably stored") answer different questions and
     must not be merged.
 
-    It used to carry a who_id list per id, to write a `references` vouch edge once the artifact
-    landed. The `edges` table was deleted 2026-08-23 for having no reader, so only the in-flight
-    half survives — see docs/plans/2026-08-23-delete-edges-and-trust-tiers.md. Do NOT simplify this
-    away with the vouches: dropping it silently re-mints every repeat reference in a flush window.
-
     """
 
     def __init__(self, conn, embedder, *, sink=None, img_cache: dict | None = None,
@@ -324,11 +318,11 @@ class LinkDispatcher:
             self._pending.add(artifact_id)
 
     # ── dispatch ────────────────────────────────────────────────────────────────────────────
-    def dispatch(self, group: list[dict], oracle_who_id: str) -> "Counter":
-        """One group → a kind→count tally of artifacts vouched (minted, already-present, or queued).
+    def dispatch(self, group: list[dict]) -> "Counter":
+        """One group → a kind→count tally of artifacts minted, already present, or queued.
 
-        Cheap + idempotent on a re-run: a PRESENT github/paper artifact is a DB check + an idempotent
-        edge write, no network. (Substack has no url-derived id — its atom keys on the post's numeric
+        Cheap + idempotent on a re-run: a PRESENT github/paper artifact is a DB check,
+        no network. (Substack has no url-derived id — its atom keys on the post's numeric
         id — so it re-fetches to dedup, but skips the re-embed.) Every failure is swallowed — a bad
         link never breaks the footprint pull (fail-safe)."""
         from collections import Counter
@@ -356,16 +350,16 @@ class LinkDispatcher:
             if kind not in ("github", "paper", "substack"):      # bare links are not dispatchable
                 continue
             try:
-                vouched = self._dispatch_one(mint_url, kind, oracle_who_id, content_type=content_type)
+                captured = self._dispatch_one(mint_url, kind, content_type=content_type)
             except Exception as e:           # a single bad link never breaks the pull
                 log(f"[footprint] link dispatch failed for {u}: {e}")
-                vouched = False
-            if vouched:
+                captured = False
+            if captured:
                 kinds[kind] += 1
         self.kinds.update(kinds)
         return kinds
 
-    def _dispatch_one(self, u: str, kind: str, who_id: str, *, content_type: str | None = None) -> bool:
+    def _dispatch_one(self, u: str, kind: str, *, content_type: str | None = None) -> bool:
         """One url → True if the artifact is in the store or on its way there.
 
         The MINT moved to `link_router.mint_artifact` (2026-08-13) so Hopper shares it; what stays
@@ -423,7 +417,20 @@ def _prefetch_one_artifact(url: str, kind: str) -> dict | None:
     return {"paper": paper, "fulltext": ingest_papers.resolve_fulltext(paper)}   # PDF pull
 
 
-def prefetch_referenced_artifacts(groups: list, conn, *, workers: int) -> dict:
+def _prefetch_counters(art_prefetch: dict | None) -> dict:
+    """The artifact prefetch's SHAPE, with the bodies left behind.
+
+    `prefetch_referenced_artifacts` returns `{payloads, links, unique, fetched}` — three counters
+    and a `{url: payload}` cache. The cache is consumed in-process by `LinkDispatcher` and read
+    by nobody afterwards, so only the counters belong in a run summary that a tool renders back
+    to a host. Empty in, empty out: an absent prefetch is not a prefetch of nothing.
+    """
+    if not art_prefetch:
+        return {}
+    return {k: v for k, v in art_prefetch.items() if k != "payloads"}
+
+
+def prefetch_referenced_artifacts(groups: list, *, workers: int) -> dict:
     """Fetch every referenced github repo / paper up front, one future per artifact, so the serial
     consumer's link dispatch doesn't serialize network fetches behind its writes.
 
@@ -498,8 +505,28 @@ def _stage_residual(totals: dict[str, float]) -> dict[str, float]:
 _TIMELINE_PAGES = 60
 
 
+@dataclass(frozen=True)
+class TimelineWalk:
+    """What one `_pull_own_timeline` call actually got — three values, because "how much did we
+    keep" and "how far back can we CLAIM to hold" stopped being the same question on 2026-09-14.
+
+    `tweets`   — the trimmed, deduped window, exactly what the old bare-list return was.
+    `complete` — which of {"posts", "replies"} finished their walk. The caller needs this and not
+                 a bare `partial` bool, because a one-sided walk is a BIASED sample rather than a
+                 shorter one: over one 108-day window, 200 of the 214 tweets found only by the
+                 paid API were replies. See `_pull_own_timeline`.
+    `reached`  — the oldest instant the WALK reached (epoch seconds), or None when it reached
+                 nothing. Computed BEFORE the `_in_window` trim, and the two differ exactly when
+                 a walk overshoots or is cut short: the trim says what the caller asked to keep,
+                 this says how far back we got. `None` for an empty walk.
+    """
+    tweets: list[dict]
+    complete: frozenset[str]
+    reached: float | None
+
+
 def _pull_own_timeline(cookies: dict, headers: dict, user_id: str,
-                       since_ts: int, cap: int) -> list[dict]:
+                       since_ts: int, cap: int) -> TimelineWalk:
     """One account's OWN tweets from `since_ts` to now — the union of X's two user timelines.
 
     BOTH are required for parity, and this is the part that is easy to get wrong. The Posts tab
@@ -516,13 +543,31 @@ def _pull_own_timeline(cookies: dict, headers: dict, user_id: str,
     approximation. `_dedupe_tweets` is the same pure helper the old paid path used; a tweet can
     legitimately appear on both timelines.
 
-    Does NOT sleep. A walk that hits X's window budget raises `XRateLimited` out of here with
-    nothing written, and the rail resumes it on the next run — which is the fail-safe direction,
-    and the reason pacing is not hidden inside this call."""
+    Does NOT sleep. Pacing is the caller's, deliberately — see `enrichment` for the one loop in
+    this repo that is allowed to wait out a window.
+
+    IT KEEPS WHAT IT WALKED (2026-09-14). `XRateLimited` is caught per timeline instead of
+    escaping, and each page is snapshotted through `after_page` as it lands, so a walk cut short
+    returns the tweets it already paid for rather than discarding them. This used to be
+    all-or-nothing, and that one property cost more than anything else in the path: a thin meter
+    produced zero atoms for requests genuinely spent, which in turn justified a pre-emptive
+    reserve that refused whole Oracles before a single request — measured 2026-09-14, two of four
+    Oracles got 0 requests and 0 atoms, twice, permanently. It is also the precondition for
+    finishing this work in the background at all: a killed pass must lose time, never work.
+
+    Snapshotting through `after_page` rather than changing `fetch_user_tweets`' contract is
+    deliberate — that function has other callers, and its accumulator is already handed to the
+    callback after every landed page, so the partial is there for the taking.
+
+    What it does NOT do is make a resume cheap. X paginates newest-first with no `until` bound, so
+    going deeper re-walks everything newer; `snapshot_and_hash` keeps that from re-embedding, but
+    requests are the scarce thing and it does not save those."""
     from pipeline.ingestion import x_graphql_core as core
     from pipeline.ingestion import x_render as xt
+    from pipeline.ingestion.utils import log
 
     walked: list[dict] = []
+    complete: set[str] = set()
 
     def _reached_the_window(acc: list[dict]) -> bool:
         # `cap` counts across BOTH walks, not per walk — it is a bound on the run. Reading only
@@ -534,24 +579,80 @@ def _pull_own_timeline(cookies: dict, headers: dict, user_id: str,
         oldest = min((d.timestamp() for d in stamps if d), default=None)
         return oldest is not None and oldest < since_ts
 
+    def _stamp(t: dict) -> float | None:
+        d = xt._parse_twitter_date(t.get("createdAt", ""))
+        return d.timestamp() if d else None
+
     for timeline in ("posts", "replies"):
-        walked += core.fetch_user_tweets(cookies, headers, user_id, pages=_TIMELINE_PAGES,
-                                         timeline=timeline, after_page=_reached_the_window)
+        # The walk's own accumulator, copied after every landed page. `fetch_user_tweets` builds
+        # it up and discards it on a raise, so this is the only place the partial survives.
+        landed: list[dict] = []
+
+        def _after_page(acc: list[dict], _landed=landed) -> bool:
+            _landed[:] = acc
+            return _reached_the_window(acc)
+
+        try:
+            walked += core.fetch_user_tweets(cookies, headers, user_id, pages=_TIMELINE_PAGES,
+                                             timeline=timeline, after_page=_after_page)
+            complete.add(timeline)
+        except core.XRateLimited as e:
+            # NOT re-raised. The other timeline holds an INDEPENDENT bucket and may still answer,
+            # and what this one already walked is real content that was really paid for.
+            walked += landed
+            log(f"[footprint] x:user:{user_id} ({timeline}): the window ran out {len(landed)} "
+                f"tweets in — keeping them, and claiming no frontier for this walk. {e}")
+
+    # BEFORE the trim. A complete walk reached the bound it was given; a cut-short one reached
+    # only as far as its oldest tweet, which is a shorter window than the caller asked for — and
+    # `complete` is what tells the caller whether that number is defensible as a frontier at all.
+    if len(complete) == 2:
+        reached: float | None = float(since_ts)
+    else:
+        reached = min((s for s in (_stamp(t) for t in walked) if s is not None), default=None)
 
     def _in_window(t: dict) -> bool:
-        d = xt._parse_twitter_date(t.get("createdAt", ""))
-        return d is not None and d.timestamp() >= since_ts
+        s = _stamp(t)
+        return s is not None and s >= since_ts
 
-    return xt._dedupe_tweets([t for t in walked if _in_window(t)])[:cap]
+    return TimelineWalk(tweets=xt._dedupe_tweets([t for t in walked if _in_window(t)])[:cap],
+                        complete=frozenset(complete), reached=reached)
+
+
+_BOTH_TIMELINES = frozenset({"posts", "replies"})
+
+
+def _walk_frontier(walk: TimelineWalk) -> str | None:
+    """The backward frontier this walk may CLAIM — ISO, or None when it may claim none.
+
+    ⚠️ A ONE-SIDED WALK CLAIMS NOTHING, and this is the one rule in the durable-partial-walk work
+    that is load-bearing for correctness rather than for cost. `covered_from` only ever WIDENS —
+    `record_pull` takes the MIN — so a frontier recorded once is a claim nothing ever revisits:
+    `backfill_pair` reads it, sees the target window met, and never goes back.
+
+    `_pull_own_timeline` walks posts then replies against INDEPENDENT buckets, and the Posts tab
+    omits standalone replies. Over one 108-day window, 200 of the 214 tweets found only by the
+    paid API were replies. So a walk that finished posts and never started replies is a BIASED
+    sample rather than a shorter one, and recording its reach would make the missing majority
+    permanently invisible instead of merely missing.
+
+    Atoms from a partial walk still land — that is the point of keeping them, and it does not
+    violate the fail-safe invariant, because no unfinished work is being marked done. Claiming
+    the frontier would be exactly that.
+
+    None is not a degraded answer here: `record_pull` already documents it as "this pull had no
+    lower bound to report", and leaves the stored value alone."""
+    if walk.reached is None or walk.complete != _BOTH_TIMELINES:
+        return None
+    return datetime.fromtimestamp(walk.reached, tz=timezone.utc).isoformat()
 
 
 def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
-                     author_name: str | None = None, since: datetime | None = None,
-                     limit: int = 0) -> dict:
+                     author_name: str | None = None, since: datetime | None = None) -> dict:
     """Ingest a confirmed Oracle's OWN X timeline (from `since`..now) as opinion atoms.
 
-    `handle` names the account; `since` bounds the window (default ~6mo); `limit` caps NEW/CHANGED
-    atoms per run (0 = all — a resumable partial backfill, like the other footprints).
+    `handle` names the account; `since` bounds the window (default ~6mo).
+    All qualifying groups in the fetched window are processed.
 
     FREE: x.com's internal GraphQL API on this machine's own X session cookies. There is no key and
     no non-browser path — a headless deployment cannot run this at all, which is the deliberate
@@ -586,9 +687,8 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
     # A handle names the account; the timeline walk keys on the numeric `rest_id`, which is also
     # what its author filter compares against. One extra request on a 150/15-min bucket.
     from pipeline.ingestion import x_graphql_core as core
-    cookies = core.read_x_cookies()
-    headers = core.auth_headers(cookies, f"https://x.com/{h}")
-    profile = core.fetch_user_profile(cookies, headers, h)
+    session = core.x_session(f"https://x.com/{h}")
+    profile = core.fetch_user_profile(session, session, h)
     if not profile:
         # Suspended, deactivated, protected, or renamed. A FACT about the account, not a transient
         # miss — but `undetermined` is still the honest verdict, because this path cannot tell
@@ -599,7 +699,22 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
 
     log(f"[footprint] x @{h}: posts + replies since {since:%Y-%m-%d} "
         f"(cap {_FETCH_CAP} tweets) — FREE, this session's own cookies")
-    raw = _pull_own_timeline(cookies, headers, profile["user_id"], since_ts, _FETCH_CAP)
+    walk = _pull_own_timeline(session, session, profile["user_id"], since_ts, _FETCH_CAP)
+    if not walk.complete:
+        # ⚠️ NOTHING WAS OBSERVED, so this is still a refusal — and re-raising is what keeps the
+        # fail-safe invariant intact: a failed external call must not mark work done. Both walks
+        # were cut off before either finished, so there is no observation to stamp
+        # `last_pulled_at` with, and letting it return an ordinary empty summary would classify as
+        # `ingested`, restart the pair's TTL, and hide the pair for a full window.
+        #
+        # The bar is `complete`, never the tweet count: an account that genuinely posted nothing
+        # in the window finishes both walks and returns zero tweets, which is a real observation
+        # and must keep stamping. And one finished timeline IS an observation, even an empty one —
+        # it just claims no frontier (see `_walk_frontier`).
+        raise core.XRateLimited(
+            f"@{h}: x.com cut off both timelines before either finished — nothing observed, so "
+            f"nothing is being marked as pulled.")
+    raw = walk.tweets
     log(f"[footprint] x @{h}: fetched {len(raw)} tweets")
 
     # Image descriptions cached by URL (immutable CDN links) → re-runs are free + keep the atom's
@@ -616,7 +731,7 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
         engagements = schema.record_engagements(conn, extract_engagements(raw))
     except Exception as e:
         log(f"[footprint] x @{h}: engagement capture failed (atoms unaffected): {e}")
-    added = skipped = failed = threads = dispatched = submitted = 0   # consumer-owned (single writer)
+    added = skipped = failed = threads = dispatched = 0   # consumer-owned (single writer)
     dispatch_kinds: Counter = Counter()
     dropped = 0                           # producer-phase tallies (many threads) → ride counts_lock
     drop_reasons: Counter = Counter()     # why a group was cut (fragment) — observability
@@ -643,13 +758,11 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
         any X-Article body, render, hash. Touches ONLY per-group locals + thread-safe shared state (the
         AIMD-gated VLM seam, the locked img_cache, the counts_lock-guarded tallies). No conn
         writes. Returns a write-ready result — even for an UNCHANGED group, because the consumer still
-        dispatches its referenced links — or None to skip (no root / dropped fragment / over-limit)."""
+        dispatches its referenced links — or None to skip (no root / dropped fragment)."""
         nonlocal dropped
         root = group[0]                    # chronologically first tweet = the atom's canonical
         root_id = str(root.get("id", ""))
         if not root_id:
-            return None
-        if limit and submitted >= limit:   # best-effort early skip (STRICT cap is on the consumer below)
             return None
         atom_id = f"xprofile:{root_id}"
         is_thread = len(group) > 1
@@ -667,7 +780,7 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
 
         # X-Article body — a FIELD READ, not a fetch. The timeline walk asks for
         # `withArticleRichContentState`, so a tweet that carries an Article arrives with the whole
-        # `content_state` already attached (`x_graphql._normalize` carries the node verbatim, and
+        # `content_state` already attached (`x_graphql_core.normalize` carries the node verbatim, and
         # recurses into `quoted_status_result`, so a QUOTED article needs no separate handling
         # either). This used to be one paid `/twitter/article` call per article, per run.
         #
@@ -728,18 +841,16 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
 
     def _consume_body(res: dict) -> None:
         """CONSUMER (caller's thread, SERIAL): the sole owner of the write path. Dispatches the group's
-        referenced links FIRST (always — the artifact/vouch backfill is independent of whether this body
+        referenced links FIRST (always — artifact capture is independent of whether this body
         re-embeds), persists paid media reads on a cadence, then submits the atom to the batching sink
         when the snapshot changed."""
-        nonlocal skipped, dispatched, cache_pending, submitted, late_reads
-        if limit and submitted >= limit:            # STRICT cap on the serial consumer (matches the old
-            return                                  # break: no dispatch, no submit past `limit` new atoms)
+        nonlocal skipped, dispatched, cache_pending, late_reads
         group = res["group"]
         who_id = res["who_id"]
         # STEP-3 link dispatch — for EVERY kept group (even hash-unchanged) so an already-captured tweet
-        # still backfills the referenced artifact + vouch. Consumer-only (writes conn + the dedup ledgers).
+        # still captures the referenced artifact. Consumer-only (writes conn + the dedup ledgers).
         with timer.stage("link_dispatch"):          # SERIAL: the fetch is prefetched, the write batches
-            dk = dispatcher.dispatch(group, who_id)
+            dk = dispatcher.dispatch(group)
         dispatched += sum(dk.values())
         dispatch_kinds.update(dk)
         cache_pending += res["n_reads"]
@@ -798,7 +909,6 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
             "entry_mode": "oracle-footprint",   # NOT user-saved (curation) / crawled (radar)
         }
         aid, it = res["atom_id"], res["is_thread"]
-        submitted += 1                              # count the NEW-atom submission toward the limit
         # Bookkeeping rides on_written so added/threads/seen count DURABLE atoms, not merely submitted.
         sink.submit(atom, res["md"],
                     on_written=(lambda a=aid, rh=raw_hash, t=it: _mark_written(a, rh, t)))
@@ -811,28 +921,19 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
         with timer.stage("consume"):
             _consume_body(res)
 
-    # PHASE 1+2: read every image FIRST (one future per image) so every lookup in `_work` is a cache
-    # hit.
-    # Skipped when `limit` is set: `limit` bounds spend, and prefetching the whole window would blow
-    # that bound before `_work` gets to early-skip groups past it.
-    prefetch = {}
-    art_prefetch = {}
-    if not limit:
-        with timer.stage("media_prefetch"):
-            prefetch = prefetch_group_media(
-                groups, img_cache, workers=_INGEST_WORKERS,
-                flush_every=_CACHE_FLUSH_EVERY, on_flush=lambda: save_image_cache(home, img_cache))
-        log(f"[footprint] x @{h}: media prefetch — {prefetch['read']} read, "
-            f"{prefetch['failed']} failed, {prefetch['images']} refs "
-            f"({prefetch['dispatched']} unique+uncached)")
-        # Referenced github/paper artifacts — the SAME granularity fix, one layer down. Skipped
-        # under `limit` for the same reason the media prefetch is: it walks the whole window, and a
-        # bounded run must not pay for artifacts of groups it will never ingest.
-        with timer.stage("artifact_prefetch"):
-            art_prefetch = prefetch_referenced_artifacts(groups, conn, workers=_INGEST_WORKERS)
-        if art_prefetch:
-            log(f"[footprint] x @{h}: artifact prefetch — {art_prefetch['fetched']} fetched of "
-                f"{art_prefetch['unique']} unique ({art_prefetch['links']} refs)")
+    # Read images and referenced artifacts before rendering groups.
+    with timer.stage("media_prefetch"):
+        prefetch = prefetch_group_media(
+            groups, img_cache, workers=_INGEST_WORKERS,
+            flush_every=_CACHE_FLUSH_EVERY, on_flush=lambda: save_image_cache(home, img_cache))
+    log(f"[footprint] x @{h}: media prefetch — {prefetch['read']} read, "
+        f"{prefetch['failed']} failed, {prefetch['images']} refs "
+        f"({prefetch['dispatched']} unique+uncached)")
+    with timer.stage("artifact_prefetch"):
+        art_prefetch = prefetch_referenced_artifacts(groups, workers=_INGEST_WORKERS)
+    if art_prefetch:
+        log(f"[footprint] x @{h}: artifact prefetch — {art_prefetch['fetched']} fetched of "
+            f"{art_prefetch['unique']} unique ({art_prefetch['links']} refs)")
 
     # The dispatcher owns every ledger the SERIAL consumer mutates, plus the batching sink, so the
     # single-writer rule those unlocked dicts depend on is a property of one object rather than a
@@ -853,6 +954,12 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
         f"dispatched {dispatched} {dict(dispatch_kinds)}")
     return {"source": "x-footprint", "fetched": len(raw), "groups": len(groups),
             "engagements": engagements,
+            # What this run HOLDS, beside what it added. `partial` says more of this window is
+            # owed; `covered_from` is the frontier it may claim, which is None whenever the claim
+            # would not be defensible — see `_walk_frontier`. Neither rides `run_stats`: that
+            # copies int counters and dict diagnostics, and these two are neither.
+            "partial": walk.complete != _BOTH_TIMELINES,
+            "covered_from": _walk_frontier(walk),
             "added": added, "dropped": dropped, "skipped": skipped, "failed": failed,
             "threads": threads, "drop_reasons": dict(drop_reasons),
             "keep_reasons": dict(keep_reasons), "media_kinds": dict(media_kinds),
@@ -861,7 +968,17 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
             # a partial regression, surfaced as a number instead of just latency.
             "media_prefetch": prefetch, "late_reads": late_reads,
             # A url absent from the payload map failed prefetch; dispatch re-fetches it inline.
-            "artifact_prefetch": art_prefetch, "prefetch_hits": dispatcher.prefetch_hits,
+            #
+            # ⚠️ COUNTERS ONLY — `payloads` NEVER RIDES (2026-09-14). It is a CACHE: built above,
+            # handed to `LinkDispatcher(prefetched=…)`, and read by nobody once this function
+            # returns. But it holds every prefetched artifact body verbatim — full GitHub repo
+            # objects, `node_id`s and all — and `oracles._ingest_oracle` renders this whole dict
+            # into a result row with `str()`. Measured on a real ingest: 41,339 of one row's
+            # 46,473 bytes, which put `oracle(action='progress')` at 110KB and past the host's
+            # token limit, so the completion report for a finished pull could not be read at all.
+            # Every fact a reader wants is already in `stats` as real JSON, in 1.8KB.
+            "artifact_prefetch": _prefetch_counters(art_prefetch),
+            "prefetch_hits": dispatcher.prefetch_hits,
             # Parent−Σ(children) per nested stage — read `consume` against `process` (consumer is
             # SERIAL, so its total is wall clock; `produce` is thread-seconds, not comparable).
             "stage_residual": _stage_residual(timer.totals),

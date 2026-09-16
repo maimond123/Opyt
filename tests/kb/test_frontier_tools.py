@@ -1,8 +1,5 @@
 """Frontier stage 4 — the MCP delivery layer over `frontier_surface`.
 
-Replaces `tests/artifacts/test_frontier_tools.py`, which covered the v1 shape (a taste block, a
-save instruction, a vault-JSON seen-set) that this rewrite removed.
-
 What delivery owes on top of ranking:
   • IT PAGINATES, IT DOES NOT TRUNCATE. `remaining` is reported, so the host can ask for the rest.
     v1's discipline, and the reason it is here: the host cannot rescue what it is never told about.
@@ -29,13 +26,18 @@ def conn(kb_home):
     c.close()
 
 
-def _cand(conn, cid, *, source="arxiv", published="2026-08-11", summary="s" * 1200, payload=None):
+_KIND_OF = {"arxiv": "paper", "openalex": "paper", "github": "repo"}
+
+
+def _cand(conn, cid, *, source="arxiv", published="2026-08-11", summary="s" * 1200, payload=None,
+          title=None, kind=None):
     conn.execute(
         """INSERT INTO frontier_candidates
-             (candidate_id, source, title, url, published, summary, payload,
+             (candidate_id, source, kind, title, url, published, summary, payload,
               status, first_seen_at, last_seen_at)
-           VALUES (?,?,?,?,?,?,?,'new',?,?)""",
-        (cid, source, f"title {cid}", f"https://example/{cid}", published, summary,
+           VALUES (?,?,?,?,?,?,?,?,'new',?,?)""",
+        (cid, source, kind or _KIND_OF.get(source, source), title or f"title {cid}",
+         f"https://example/{cid}", published, summary,
          json.dumps(payload or {}), "2026-08-11", "2026-08-11"))
     conn.commit()
     return cid
@@ -45,7 +47,7 @@ def test_deliver_ranks_records_shown_and_reports_the_remainder(conn):
     for i in range(7):
         _cand(conn, f"arxiv:{i}")
 
-    out = ft.deliver(limit=3, conn=conn)
+    out = ft.deliver(limit=3)
 
     assert out["status"] == "ok"
     assert out["showing"] == 3 and out["total"] == 7 and out["remaining"] == 4
@@ -62,8 +64,8 @@ def test_calling_again_advances_because_being_shown_demotes(conn):
     for i in range(10):
         _cand(conn, f"arxiv:{i:02d}")
 
-    first = [c["candidate_id"] for c in ft.deliver(limit=4, conn=conn)["candidates"]]
-    second = [c["candidate_id"] for c in ft.deliver(limit=4, conn=conn)["candidates"]]
+    first = [c["candidate_id"] for c in ft.deliver(limit=4)["candidates"]]
+    second = [c["candidate_id"] for c in ft.deliver(limit=4)["candidates"]]
 
     assert not set(first) & set(second), "a fresh candidate outranks one already shown"
 
@@ -78,7 +80,7 @@ def test_repeated_calls_starve_nothing(conn):
 
     seen = set()
     for _ in range(3):                      # ceil(10/4) calls is enough to sweep the queue
-        seen |= {c["candidate_id"] for c in ft.deliver(limit=4, conn=conn)["candidates"]}
+        seen |= {c["candidate_id"] for c in ft.deliver(limit=4)["candidates"]}
 
     assert len(seen) == 10, f"starved: {10 - len(seen)} candidate(s) never surfaced"
 
@@ -89,7 +91,7 @@ def test_dismiss_is_recorded_and_the_row_comes_back_in_the_same_response(conn):
     _cand(conn, "arxiv:keep")
     _cand(conn, "arxiv:stop")
 
-    out = ft.deliver(dismiss=["arxiv:stop"], conn=conn)
+    out = ft.deliver(dismiss=["arxiv:stop"])
 
     assert out["dismissed"] == 1
     by_id = {c["candidate_id"]: c for c in out["candidates"]}
@@ -103,15 +105,15 @@ def test_include_dismissed_false_reports_exactly_what_it_hid(conn):
     _cand(conn, "arxiv:b")
     fs.record_dismissed(conn, ["arxiv:b"])
 
-    out = ft.deliver(include_dismissed=False, conn=conn)
+    out = ft.deliver(include_dismissed=False)
     assert [c["candidate_id"] for c in out["candidates"]] == ["arxiv:a"]
     assert out["hidden_by_include_dismissed"] == 1, "even the opt-out is not silent"
 
-    assert "hidden_by_include_dismissed" not in ft.deliver(conn=conn)
+    assert "hidden_by_include_dismissed" not in ft.deliver()
 
 
 def test_an_empty_store_is_a_note_not_an_error(conn):
-    out = ft.deliver(conn=conn)
+    out = ft.deliver()
     assert out["status"] == "ok" and out["candidates"] == []
     assert "NO CANDIDATES STAGED" in out["note"]
     assert "not an error" in out["note"]
@@ -119,7 +121,7 @@ def test_an_empty_store_is_a_note_not_an_error(conn):
 
 def test_a_card_carries_state_and_reasons_but_no_stored_score(conn):
     _cand(conn, "repo:x", source="github", summary="one-liner", payload={"stars": 4200})
-    card = ft.deliver(conn=conn)["candidates"][0]
+    card = ft.deliver()["candidates"][0]
 
     assert card["state"] == "new" and card["shown_before"] == 0
     assert "4200 stars" in card["why"]
@@ -130,7 +132,7 @@ def test_a_card_carries_state_and_reasons_but_no_stored_score(conn):
 
 def test_limit_zero_shows_nothing_and_records_nothing(conn):
     _cand(conn, "arxiv:a")
-    out = ft.deliver(limit=0, conn=conn)
+    out = ft.deliver(limit=0)
     assert out["showing"] == 0 and out["remaining"] == 1
     assert conn.execute("SELECT COUNT(*) FROM frontier_candidate_events").fetchone()[0] == 0
 
@@ -197,3 +199,34 @@ def test_the_tool_docstring_does_not_promise_an_admission_path(kb_home):
     assert "AUTONOMOUS" in doc                            # ...replaced by what is actually true
     assert "never as \"not good enough\"" in doc          # `rejected` is mechanical, never quality
     assert "Nothing is ever filtered out" in doc
+
+
+def test_a_repo_and_a_paper_that_match_on_title_stay_two_cards(conn):
+    """Kind is part of artifact identity. A GitHub `repo` and an OpenAlex `paper` can share a
+    title and a date, and neither carries a first author — `_artifact_key` reads `payload.authors`,
+    which a repo row never has. Without `kind` in the key those three fields matched and the two
+    collapsed onto one card, so the user was shown one of the two artifacts and never learnt the
+    other existed. Asserted through `deliver` because that is the only surface a user sees."""
+    _cand(conn, "repo:acme/agent", source="github", kind="repo", title="Detecting An AI Agent",
+          published="2026-07-29", summary="a repo one-liner", payload={"stars": 12})
+    _cand(conn, "openalex:W1", source="openalex", kind="paper", title="Detecting An AI Agent",
+          published="2026-07-29", summary="an abstract " * 40)
+
+    out = ft.deliver()
+
+    assert out["showing"] == 2
+    assert {c["candidate_id"] for c in out["candidates"]} == {"repo:acme/agent", "openalex:W1"}
+    assert not any(c.get("duplicate_of") for c in out["candidates"])
+
+
+def test_two_rows_of_the_SAME_kind_still_collapse(conn):
+    """The other half of the contract: adding `kind` must not stop the merge it was added beside.
+    Two OpenAlex forms of one preprint are still one card."""
+    for cid in ("openalex:W1", "openalex:W2"):
+        _cand(conn, cid, source="openalex", kind="paper", title="Detecting An AI Agent",
+              published="2026-07-29", summary="an abstract " * 40,
+              payload={"authors": ["V. Choudhary"]})
+
+    out = ft.deliver()
+
+    assert out["showing"] == 1

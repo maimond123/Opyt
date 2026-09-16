@@ -1,19 +1,21 @@
 """
 pipeline/ingestion/x_graphql_core.py
-Shared primitives for local-session X GraphQL reads (Lists / following / likes / …):
-cookie read, auth headers, the self-healing queryId resolve->discover->cache, and the
-GraphQL GET with drift handling. Requests run as the logged-in user, from their own
-session cookies — no official API, no per-read billing. Bookmarks (x_graphql.py) stays
-on its own copy for now rather than migrating onto this core; see the companion doc.
+Shared primitives for X GraphQL reads (Bookmarks / Lists / following / likes / …): local
+cookie reads, the self-healing queryId resolve->discover->cache, and GraphQL drift/rate
+handling. Local installs construct request headers from OPYT's managed session; hosted installs
+delegate each request to the persistent Chrome profile through ``hosted_x``.
 """
 
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 
 from pipeline.ingestion.utils import log, SyncAuthError
 from pipeline.ingestion import browser_cookies as _bc
+from pipeline.ingestion import x_lists as xlists
 
 GRAPHQL_HOST = "https://x.com/i/api/graphql"
 
@@ -25,16 +27,123 @@ FALLBACK_BEARER = ("AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%
                    "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA")
 
 
+def normalize(result: dict) -> dict | None:
+    """Map an X GraphQL tweet `result` to the normalized tweet dict every renderer and
+    consumer in this repo reads. Media/quote paths are best-effort.
+
+    The shape was originally twitterapi.io's, because that provider was the only producer when
+    this was written. It is now the ONLY shape — the provider was removed on 2026-08-30 and this
+    function is the sole producer — so it is just "the normalized tweet", not a translation into
+    somebody else's vocabulary."""
+    if not result:
+        return None
+    if result.get("__typename") == "TweetWithVisibilityResults":
+        result = result.get("tweet", {}) or {}
+    legacy = result.get("legacy") or {}
+    if not legacy:
+        return None
+
+    user_result = (((result.get("core") or {}).get("user_results") or {})
+                   .get("result") or {})
+    u_legacy = user_result.get("legacy") or {}
+    u_core = user_result.get("core") or {}
+    # screen_name/name/id_str live in `core`/`rest_id`, not `u_legacy`. Read that one
+    # path; if X moves it again, `username` goes visibly "unknown" rather than silently
+    # falling through a dead fallback.
+    username = u_core.get("screen_name") or "unknown"
+    name = u_core.get("name") or username
+    user_id = user_result.get("rest_id") or ""
+    # Author's bio outbound URL — the cross-platform identity seed Stage-3 joins on.
+    # `legacy` is the only home of it on this surface; no fallback to `profile_bio.entities`
+    # (that path doesn't exist here — see the Lists/Following surface for contrast).
+    # Absent → "".
+    u_urls = (((u_legacy.get("entities") or {}).get("url") or {}).get("urls") or [])
+    u_site = u_urls[0].get("expanded_url", "") if u_urls else ""
+
+    tweet_id = legacy.get("id_str") or result.get("rest_id") or ""
+    note = (((result.get("note_tweet") or {}).get("note_tweet_results") or {})
+            .get("result") or {})
+    text = note.get("text") or legacy.get("full_text", "")
+
+    norm = {
+        "id": tweet_id,
+        "author": {"userName": username, "name": name, "id": user_id, "site": u_site},
+        "text": text,
+        "createdAt": legacy.get("created_at", ""),
+        "likeCount": legacy.get("favorite_count", 0),
+        "entities": legacy.get("entities", {}),
+        # MUST stay camelCase: _render_media reads `extendedEntities`. Emitting X's
+        # snake_case `extended_entities` here silently drops every photo/video/GIF.
+        "extendedEntities": legacy.get("extended_entities", {}),
+        # Link card passthrough: X's result.card.legacy.binding_values already matches
+        # the {key, value:{string_value}} shape _parse_card reads. Absent card → no key
+        # → _render_link_cards falls back to the bare entities.urls link.
+        "card": {"binding_values": (((result.get("card") or {}).get("legacy") or {})
+                                    .get("binding_values") or [])},
+        "url": f"https://x.com/{username}/status/{tweet_id}",
+        "isQuote": legacy.get("is_quote_status", False),
+        "conversationId": legacy.get("conversation_id_str", tweet_id),
+        "isReply": bool(legacy.get("in_reply_to_status_id_str")),
+        "replyCount": legacy.get("reply_count", 0),
+        # The two fields ingest_x_footprint._filter_and_stitch decides on (drop RTs +
+        # replies-to-others, keep originals + self-threads). `isRetweet` reads
+        # `legacy.retweeted_status_result` (not the forgeable "RT @" text prefix);
+        # `inReplyToUserId` reads the numeric `legacy.in_reply_to_user_id_str`, not the
+        # handle field (unreliable). One path each, no `or` fallback — see
+        "isRetweet": bool(legacy.get("retweeted_status_result")),
+        "inReplyToUserId": legacy.get("in_reply_to_user_id_str") or "",
+    }
+    # X-Article body: with the article toggles ON, X nests the full body at
+    # result.article.article_results.result.content_state.blocks. Carry the whole
+    # `article` node; `_render_article` digs out title + blocks. Absent → normal post.
+    article = result.get("article")
+    if article:
+        norm["article"] = article
+
+    quoted = (result.get("quoted_status_result") or {}).get("result")
+    if quoted:
+        norm["quoted_tweet"] = normalize(quoted)
+    return norm
+
+
 # ── Browser session ─────────────────────────────────────────────────────────
 
-def read_x_cookies(profile: str | None = None) -> dict:
-    """Cookie dict for the chosen X session (delegates to the shared multi-browser
-    reader — explicit `profile`/$X_CHROME_PROFILE wins, else a lone logged-in
-    browser auto-picks, else a SyncAuthError listing the options). Raises rather than
-    returning empty, so a caller records a broken source instead of a silent '0'."""
-    cookies = _bc.read_cookies(
-        ["x.com", "twitter.com"], "auth_token",
-        profile=profile, env_var="X_CHROME_PROFILE", source="X")
+def x_session(referer: str):
+    """The one X transport a caller may use.
+
+    Hosted callers receive an opaque Chrome-backed session. Local callers retain the established
+    cookie/header transport unchanged. Keeping selection here means a rail cannot choose the
+    plaintext path for a hosted home by accident.
+    """
+    from pipeline.ingestion import hosted_browser, hosted_x
+    if hosted_browser.enabled():
+        return hosted_x.HostedXSession(referer)
+    cookies = read_x_cookies()
+    return _LocalXSession(cookies, auth_headers(cookies, referer))
+
+
+class _LocalXSession:
+    """The existing local cookie transport behind the same call shape as hosted Chrome."""
+
+    def __init__(self, cookies: dict, headers: dict) -> None:
+        self.cookies = cookies
+        self.headers = headers
+
+    def resolve_query_id(self, op: str, **kwargs) -> str:
+        return resolve_query_id(op, self.cookies, **kwargs)
+
+    def graphql_get(self, op: str, query_id: str, variables: dict, features: dict, **kwargs) -> dict:
+        return graphql_get(op, query_id, variables, features, self.headers, **kwargs)
+
+    def viewer_id(self) -> str | None:
+        return viewer_id(self.cookies)
+
+def read_x_cookies() -> dict:
+    """Cookie dict from OPYT's one managed X session; never returns an empty dict."""
+    from pipeline.ingestion import hosted_browser
+    if hosted_browser.enabled():
+        raise RuntimeError("hosted X must use the Chrome request runner, never read_x_cookies")
+    cookies = _bc.read_opyt_cookies(["x.com", "twitter.com"], "auth_token", source="X")
     if not cookies.get("ct0"):
         log("[x-graphql] warning: ct0 (csrf) cookie missing — request may 403")
     return cookies
@@ -44,6 +153,10 @@ def viewer_id(cookies: dict) -> str | None:
     """The logged-in user's own numeric id (rest_id), decoded from the `twid` cookie
     (`u=<id>`). This is the identity we match list OWNERSHIP against — handles rename,
     ids don't. None if twid is absent (caller should fail safe, not guess)."""
+    if isinstance(cookies, _LocalXSession):
+        return cookies.viewer_id()
+    if hasattr(cookies, "viewer_id"):
+        return cookies.viewer_id()
     twid = (cookies.get("twid") or "").replace("u%3D", "").replace("u=", "")
     return twid or None
 
@@ -111,6 +224,9 @@ def resolve_query_id(op: str, cookies: dict, *, default_seed: str = "",
                      page_url: str = "https://x.com/home") -> str:
     """env override → baked seed → cache → live discovery → raise. Mirrors the
     Bookmarks resolver, parameterized by operation."""
+    if isinstance(cookies, _LocalXSession) or hasattr(cookies, "resolve_query_id"):
+        return cookies.resolve_query_id(op, default_seed=default_seed, env_var=env_var,
+                                        page_url=page_url)
     if env_var and os.getenv(env_var):
         return os.getenv(env_var)
     if default_seed:
@@ -129,9 +245,37 @@ def resolve_query_id(op: str, cookies: dict, *, default_seed: str = "",
         f"override.")
 
 
+def _runtime_chunk_urls(html: str, op: str, base: str) -> set[str]:
+    """The operation-named chunks from X's inline Webpack `p.u` name/hash maps.
+
+    Mirrored in JavaScript by `hosted_x._RUNTIME_CHUNK_JS_RE`, because the hosted scan runs
+    inside Chrome and may not hand page contents back to Python. If X changes this format, both
+    have to change. That comment carries the measurement for why the mirror is worth its cost.
+    """
+    runtime = re.search(
+        r'\.u=(?P<key>\w+)=>""\+\(\(\{(?P<names>.*?)\}\)\[(?P=key)\]\|\|(?P=key)\)'
+        r'\+"\."\+\(\{(?P<hashes>.*?)\}\)\[(?P=key)\]\+"a\.js"',
+        html,
+    )
+    if not runtime:
+        return set()
+
+    op_key = op.lower()
+    urls: set[str] = set()
+    names = runtime.group("names")
+    hashes = runtime.group("hashes")
+    for chunk_id, name in re.findall(r'(\d+):"([^"]+)"', names):
+        if op_key not in name.lower():
+            continue
+        chunk_hash = re.search(rf'(?:^|,){chunk_id}:"([0-9a-f]+)"', hashes)
+        if chunk_hash:
+            urls.add(f"{base}{name}.{chunk_hash.group(1)}a.js")
+    return urls
+
+
 def discover_query_id(op: str, page_url: str, cookies: dict) -> str | None:
-    """Best-effort: fetch an authenticated x.com page, harvest the client-web JS chunk
-    filenames it references (webpack manifest), and scan them for
+    """Best-effort: fetch an authenticated x.com page, harvest external entry bundles and
+    inline-runtime chunks, and scan them for
     `queryId:"…",operationName:"<op>"`. Op-named chunks are scanned first. None on miss
     → caller falls back to env/seed. (Generalized from the Bookmarks discovery.)"""
     try:
@@ -155,9 +299,10 @@ def discover_query_id(op: str, page_url: str, cookies: dict) -> str | None:
         log(f"[x-graphql] {op} queryId discovery: page fetch failed: {e}")
         return None
 
-    entry = set(re.findall(
+    entry = dict.fromkeys(re.findall(
         r'https://abs\.twimg\.com/responsive-web/client-web[^"\']+?\.js', html))
     chunks: set[str] = set(entry)
+    chunks.update(_runtime_chunk_urls(html, op, base))
     for url in list(entry)[:6]:
         try:
             js = _get(url)
@@ -191,9 +336,92 @@ def discover_query_id(op: str, page_url: str, cookies: dict) -> str | None:
 # ── The request ─────────────────────────────────────────────────────────────
 
 class XRateLimited(RuntimeError):
-    """x.com returned 429 — the shared session's request budget for this window is spent.
-    Distinct from a per-account failure: a multi-account loop must STOP entirely here,
-    not skip the one account and keep going."""
+    """x.com's request budget for this OPERATION's window is spent.
+
+    Distinct from a per-account failure: a multi-account loop must STOP entirely here, not skip
+    the one account and keep going. Carries `reset_at` — the unix instant the bucket refills, off
+    `x-rate-limit-reset` — so a caller can say WHEN rather than "try again later". None when the
+    server did not say (a 429 with no header).
+    """
+
+    def __init__(self, message: str, *, op: str | None = None, reset_at: float | None = None):
+        super().__init__(message)
+        self.op = op
+        self.reset_at = reset_at
+
+
+# ── The per-operation request budget ────────────────────────────────────────
+# Every x.com GraphQL response carries `x-rate-limit-limit` / `-remaining` / `-reset`, and each
+# operation holds its OWN bucket per 15-minute window (measured: UserTweets 50, UserByScreenName
+# 150, TweetResultsByRestIds 500). Reading them here — the one call every X request passes
+# through — is what makes the budget self-calibrating: nothing has to encode X's numbers, and a
+# caller cannot opt out of the meter by not knowing about it.
+#
+# Pacing belonged here rather than in each caller for a measured reason: `candidate_probe` slept
+# between requests and `sync_x_footprint` did not, so the deep-backfill path ran with no budget at
+# all and a 4-Oracle backfill spent the UserTweets window mid-walk.
+#
+# ⚠️ A SINGLE global sleep-per-request would be wrong in both directions — 10x too slow for a
+# 500/window operation, and no protection at all against a 51-request burst on a 50/window one.
+# The bucket is per operation, so the budget is too.
+#
+# Process-local, and that is a real limitation worth stating: rails are detached children, so a
+# fresh process starts blind. It is blind for exactly ONE request — the bucket is server-side, so
+# the first response's `remaining` already accounts for every other process's spending.
+_RATE_STATE: dict[str, tuple[int, float]] = {}       # op -> (remaining, reset unix-epoch)
+_RATE_LOCK = threading.Lock()
+
+
+def _record_rate_headers(op: str, resp_headers) -> float | None:
+    """Store this operation's budget off the response headers. Returns the reset instant.
+
+    Fail-safe: a response without the headers (a proxy stripped them, a shape change) leaves the
+    state untouched rather than recording a zero — an absent meter must not look like a spent one.
+    """
+    try:
+        remaining = int(resp_headers.get("x-rate-limit-remaining"))
+        reset = float(resp_headers.get("x-rate-limit-reset"))
+    except (TypeError, ValueError):
+        return None
+    _record_rate_values(op, remaining, reset)
+    return reset
+
+
+def _record_rate_values(op: str, remaining: int, reset: float) -> None:
+    """Store the two rate fields the hosted Chrome boundary explicitly permits."""
+    with _RATE_LOCK:
+        _RATE_STATE[op] = (remaining, reset)
+
+
+def rate_budget(op: str) -> tuple[int, float] | None:
+    """This operation's last-known `(remaining, reset)`, or None if we have never seen it."""
+    with _RATE_LOCK:
+        return _RATE_STATE.get(op)
+
+
+def _refuse_if_spent(op: str) -> None:
+    """Raise BEFORE issuing a request the server has already told us it will refuse.
+
+    Refuses rather than sleeps. A rail is a one-shot detached child holding a single-flight lease
+    and a SQLite connection; sleeping out a 15-minute window inside one blocks every other rail
+    for the duration and still finishes no sooner than the next session would. `XRateLimited` is
+    already the "stop, resume later" signal every X caller handles, and refusing locally means the
+    429 is never issued — a request X counts against the bucket we are trying to protect."""
+    state = rate_budget(op)
+    if state is None:
+        return
+    remaining, reset = state
+    if remaining > 0:
+        return
+    now = time.time()
+    if now >= reset:                                 # the window already rolled over
+        with _RATE_LOCK:
+            _RATE_STATE.pop(op, None)
+        return
+    raise XRateLimited(
+        f"{op}: this 15-minute window's request budget is spent — {round(reset - now)}s until it "
+        f"refills. Not issued (refused locally, so it does not count against the bucket).",
+        op=op, reset_at=reset)
 
 
 def graphql_get(op: str, query_id: str, variables: dict, features: dict,
@@ -202,9 +430,17 @@ def graphql_get(op: str, query_id: str, variables: dict, features: dict,
     """One GraphQL GET. On 401/403 -> SyncAuthError (dead session). On 400/404 -> clear
     the queryId cache (queryId/features drifted) and raise so the next run re-discovers.
     `tolerate_errors`: X often returns a partial `errors` array alongside valid `data`;
-    when True, keep `data` and just log the error count instead of hard-failing."""
+    when True, keep `data` and just log the error count instead of hard-failing.
+
+    Budgeted per operation off x.com's own headers — see `_refuse_if_spent`."""
+    if isinstance(headers, _LocalXSession) or hasattr(headers, "graphql_get"):
+        return headers.graphql_get(op, query_id, variables, features,
+                                   field_toggles=field_toggles,
+                                   tolerate_errors=tolerate_errors)
+
     from curl_cffi import requests as cffi
 
+    _refuse_if_spent(op)
     params = {
         "variables": json.dumps(variables, separators=(",", ":")),
         "features": json.dumps(features, separators=(",", ":")),
@@ -213,12 +449,15 @@ def graphql_get(op: str, query_id: str, variables: dict, features: dict,
         params["fieldToggles"] = json.dumps(field_toggles, separators=(",", ":"))
     url = f"{GRAPHQL_HOST}/{query_id}/{op}"
     resp = cffi.get(url, params=params, headers=headers, impersonate="chrome120", timeout=30)
+    # Recorded on EVERY status, 429 included — a 429 is the one response whose reset instant we
+    # most need, and reading it only on success is how a spent bucket stays invisible.
+    reset = _record_rate_headers(op, resp.headers)
 
     if resp.status_code == 429:
         raise XRateLimited(
-            f"{op} rate-limited (429) by x.com — too many requests in a short window. "
-            f"Wait a few minutes before retrying. (If this fired mid-pagination it means "
-            f"a loop failed to terminate — that is a bug, not just throttling.)")
+            f"{op} rate-limited (429) by x.com — this operation's 15-minute window is spent. "
+            f"(If this fired with budget left on the meter it means a loop failed to terminate — "
+            f"that is a bug, not just throttling.)", op=op, reset_at=reset)
     if resp.status_code in (401, 403):
         raise SyncAuthError(
             f"x.com rejected the session ({resp.status_code}) — cookie expired or "
@@ -251,24 +490,14 @@ _FOLLOWING_MAX_PAGES = 100
 _FOLLOWING_PAGE_SIZE = 100
 
 
-def _following_features() -> dict:
-    """The Following op shares the web client's timeline feature bundle with Lists/Likes.
-    Reference it rather than duplicate 40 drift-prone lines; override via
-    $X_FOLLOWING_FEATURES (JSON) if a live capture ever shows a different set."""
-    from pipeline.ingestion import x_lists as xlists   # lazy: x_lists imports THIS module
-    override = os.getenv("X_FOLLOWING_FEATURES")
-    return json.loads(override) if override else xlists.LISTS_FEATURES
-
-
 def fetch_following(cookies: dict, headers: dict, viewer_id: str) -> list[dict]:
     """Walk the viewer's Following timeline → one normalized user per followed account
     (the `x_lists._normalize_user` shape, `site` included as the identity seed). Dedups by
     rest_id and stops the instant a page adds no NEW user — the only terminator that holds
     against X's forever-advancing infinite-scroll cursor (same guard as likes/lists)."""
-    from pipeline.ingestion import x_lists as xlists   # lazy: avoids the import cycle
     qid = resolve_query_id(FOLLOWING_OP, cookies, default_seed=DEFAULT_FOLLOWING_QID,
                            env_var="X_FOLLOWING_QUERY_ID", page_url="https://x.com/home")
-    features = _following_features()
+    features = xlists.LISTS_FEATURES
     out: list[dict] = []
     seen_ids: set[str] = set()
     cursor: str | None = None
@@ -311,16 +540,9 @@ _CONVO_MAX_ANCESTORS = 20         # bound a pathologically deep reply chain (kee
 _CONVO_MAX_CONTINUATION = 25      # bound a long self-thread
 
 
-def _tweetdetail_features() -> dict:
-    from pipeline.ingestion import x_lists as xlists   # lazy: shared timeline bundle
-    override = os.getenv("X_TWEETDETAIL_FEATURES")
-    return json.loads(override) if override else xlists.LISTS_FEATURES
-
-
 def _convo_tweets(data: dict) -> tuple[list[dict], list[dict]]:
     """(top-level tweets in order, conversationthread module tweets in order), normalized to the
-    x_graphql._normalize shape. Both live under threaded_conversation_with_injections_v2."""
-    from pipeline.ingestion import x_graphql as xg
+    normalize shape. Both live under threaded_conversation_with_injections_v2."""
     root = ((data.get("data") or {})
             .get("threaded_conversation_with_injections_v2") or {})
     top: list[dict] = []
@@ -331,14 +553,14 @@ def _convo_tweets(data: dict) -> tuple[list[dict], list[dict]]:
             c = e.get("content", {}) or {}
             if eid.startswith("tweet-"):
                 res = ((c.get("itemContent") or {}).get("tweet_results") or {}).get("result")
-                n = xg._normalize(res) if res else None
+                n = normalize(res) if res else None
                 if n and n.get("id"):
                     top.append(n)
             elif eid.startswith("conversationthread-"):
                 for it in c.get("items", []) or []:
                     res = ((((it.get("item") or {}).get("itemContent") or {})
                             .get("tweet_results") or {}).get("result"))
-                    n = xg._normalize(res) if res else None
+                    n = normalize(res) if res else None
                     if n and n.get("id"):
                         modules.append(n)
     return top, modules
@@ -347,7 +569,7 @@ def _convo_tweets(data: dict) -> tuple[list[dict], list[dict]]:
 def _author_key(t: dict) -> str:
     """Same-author match key: `author.userName`, lowercased; "" if absent.
 
-    Written to be shape-agnostic because two backends fed it — `x_graphql._normalize` and
+    Written to be shape-agnostic because two backends fed it — `normalize` and
     twitterapi.io's thread_context, which both populated that field. Only the first survives
     (2026-08-30), so this is no longer a compatibility choice, just the right field."""
     return ((t.get("author") or {}).get("userName") or "").lower()
@@ -359,7 +581,7 @@ def reconstruct_chain(tweets: list[dict], focal_id: str, *,
     """From a flat, conversation-ordered tweet list → the chain the focal sits in:
     `[ancestors…, focal, same-author self-continuation…]`. Ancestors = tweets before the focal
     (the DEBATE context); continuation = same-author tweets after it (the self-thread). Shape-
-    agnostic (matches on author.userName), so the cookie AND twitterapi.io backends share it.
+    agnostic (matches on author.userName).
     Returns [] when there's no real context (len ≤ 1). Deduped, order-preserving."""
     focal_id = str(focal_id)
     idx = next((i for i, t in enumerate(tweets) if str(t.get("id")) == focal_id), None)
@@ -385,8 +607,8 @@ def reconstruct_chain(tweets: list[dict], focal_id: str, *,
 
 def fetch_conversation(focal_id: str, cookies: dict, headers: dict) -> list[dict]:
     """The ordered chain a tweet sits in — `[ancestors…, focal, same-author self-continuation]` —
-    via the FREE cookie-scrape TweetDetail (the keyless fallback; the twitterapi.io thread_context
-    path is primary). Returns [] on no-context or any failure (fail-safe: caller renders solo).
+    via the free cookie-scrape TweetDetail, which is the only path. Returns [] on no-context or
+    any failure (fail-safe: caller renders solo).
     Subject to X's 150/15-min TweetDetail limit — the caller paces + degrades on that."""
     qid = resolve_query_id(TWEETDETAIL_OP, cookies, default_seed=DEFAULT_TWEETDETAIL_QID,
                            env_var="X_TWEETDETAIL_QUERY_ID", page_url="https://x.com/home")
@@ -403,7 +625,7 @@ def fetch_conversation(focal_id: str, cookies: dict, headers: dict) -> list[dict
     # `ingest_x._fetch_one_tweet` splices that copy back over the chain's). An ancestor renders as
     # its text, never as an article body, so asking for 16 KB of `content_state` per ancestor would
     # buy bytes nothing reads.
-    data = graphql_get(TWEETDETAIL_OP, qid, variables, _tweetdetail_features(), headers,
+    data = graphql_get(TWEETDETAIL_OP, qid, variables, xlists.LISTS_FEATURES, headers,
                        tolerate_errors=True)
     top, modules = _convo_tweets(data)
     # Flatten: ancestors + focal live in `top` (in order), replies/continuation in `modules` after.
@@ -418,6 +640,11 @@ def fetch_conversation(focal_id: str, cookies: dict, headers: dict) -> list[dict
 # only ceiling, and every GraphQL consumer here shares one session budget, so this
 # function deliberately does not sleep — pacing is left to the caller.
 USERTWEETS_OP = "UserTweets"
+# The replies timeline's own operation — its OWN rate bucket, same 50/15min shape. Named rather
+# than left a literal inside `_TIMELINES` because a caller budgeting a footprint pull has to
+# reason about BOTH: `ingest_x_footprint._pull_own_timeline` walks posts then replies, so the two
+# buckets drain together and the binding one is whichever has less left.
+USERREPLIES_OP = "UserRepliesTimeline"
 # Empty on purpose: a baked seed survives rotation as a permanent 404 since
 # resolve_query_id never re-checks a non-empty seed. Empty routes to
 # env -> cache -> live JS-bundle discovery, which self-heals.
@@ -452,7 +679,7 @@ DEFAULT_USERTWEETS_QID = ""
 _TIMELINES = {
     "posts":   (USERTWEETS_OP, "X_USERTWEETS_QUERY_ID",
                 {"withQuickPromoteEligibilityTweetFields": True}),
-    "replies": ("UserRepliesTimeline", "X_USERREPLIES_QUERY_ID",
+    "replies": (USERREPLIES_OP, "X_USERREPLIES_QUERY_ID",
                 {"withCommunity": True}),
 }
 _USERTWEETS_PAGE_SIZE = 20        # what one request returns (~20-41 tweets observed)
@@ -471,14 +698,6 @@ class XUserUnavailable(RuntimeError):
     """The account exists as an id but its timeline can't be read — suspended, deactivated,
     or protected. Raised rather than returned as `[]`, since those are opposite facts
     about a candidate (unreadable vs. "posts nothing")."""
-
-
-def _usertweets_features() -> dict:
-    """UserTweets shares the web client's timeline feature bundle with Lists/Likes/Following.
-    Reference it rather than duplicate 40 drift-prone lines; override via $X_USERTWEETS_FEATURES."""
-    from pipeline.ingestion import x_lists as xlists   # lazy: x_lists imports THIS module
-    override = os.getenv("X_USERTWEETS_FEATURES")
-    return json.loads(override) if override else xlists.LISTS_FEATURES
 
 
 def _user_timeline_root(data: dict) -> tuple[dict, str | None]:
@@ -537,7 +756,7 @@ def fetch_user_tweets(cookies: dict, headers: dict, user_id: str, *, pages: int 
                       page_size: int = _USERTWEETS_PAGE_SIZE,
                       after_page=None, timeline: str = "posts") -> list[dict]:
     """Walk `pages` of one account's own timeline -> normalized tweets (the
-    `x_graphql._normalize` / twitterapi.io shape).
+    `normalize` shape).
 
     `timeline` selects which of X's two user-scoped timelines to walk — "posts" (the default,
     unchanged for every existing caller) or "replies" for the standalone replies the Posts tab
@@ -559,9 +778,8 @@ def fetch_user_tweets(cookies: dict, headers: dict, user_id: str, *, pages: int 
         raise ValueError(f"timeline must be one of {sorted(_TIMELINES)}, got {timeline!r}")
     qid = resolve_query_id(op, cookies, default_seed=DEFAULT_USERTWEETS_QID,
                            env_var=qid_env, page_url="https://x.com/home")
-    from pipeline.ingestion import x_graphql as xg      # lazy: shared tweet normalizer
 
-    features = _usertweets_features()
+    features = xlists.LISTS_FEATURES
     # Clamped, not trusted: a cap a caller can raise past isn't a cap.
     want = max(1, int(pages))
     n_pages = min(want, _USERTWEETS_MAX_PAGES)
@@ -602,7 +820,7 @@ def fetch_user_tweets(cookies: dict, headers: dict, user_id: str, *, pages: int 
         new = 0            # NEW tweets by this account
         others = 0         # NEW tweets by somebody else (a replies page's conversation partners)
         for res in page:
-            norm = xg._normalize(res)
+            norm = normalize(res)
             if not norm or not norm.get("id") or norm["id"] in seen_ids:
                 continue
             seen_ids.add(norm["id"])
@@ -643,11 +861,6 @@ USERBYSCREENNAME_OP = "UserByScreenName"
 # Empty for the same reason as every other queryId here: `resolve_query_id` returns a non-empty
 # seed WITHOUT validating it, so a baked id survives rotation as a permanent 404.
 DEFAULT_USERBYSCREENNAME_QID = ""
-# Measured 2026-08-30 off `x-rate-limit-limit`: 150 per 15 minutes, its own bucket. Recorded
-# because it is the number that decides whether a caller walking many handles needs to pace.
-_USERBYSCREENNAME_LIMIT_PER_WINDOW = 150
-
-
 def _expand_tco(url: str, url_entities: dict) -> str:
     """A t.co short link -> the real destination, via the `urls` list X ships beside it. Returns
     `url` unchanged when nothing matches, so a caller never gets an empty string for a link that
@@ -679,7 +892,6 @@ def fetch_user_profile(cookies: dict, headers: dict, screen_name: str) -> dict |
     beside the entities block it needs. Self-links to x.com are deliberately NOT filtered — that
     is a consumer policy (one caller blanks them, the other skips the source) and the two disagree.
     """
-    from pipeline.ingestion import x_lists as xlists   # lazy: x_lists imports THIS module
     qid = resolve_query_id(USERBYSCREENNAME_OP, cookies,
                            default_seed=DEFAULT_USERBYSCREENNAME_QID,
                            env_var="X_USERBYSCREENNAME_QUERY_ID",
@@ -711,7 +923,7 @@ def fetch_user_profile(cookies: dict, headers: dict, screen_name: str) -> dict |
         "display_name": core_.get("name") or "",
         "bio": bio.get("description") or "",
         "website": _expand_tco(site, entities.get("url") or {}),
-        # The OTHER homes a person lists — a Substack, a podcast, a personal site. Expanded and
+        # The OTHER homes a person lists — a Substack or a personal site. Expanded and
         # de-t.co'd here; classifying them is the caller's job.
         "bio_urls": [u.get("expanded_url") or u.get("url") or ""
                      for u in ((entities.get("description") or {}).get("urls") or [])
@@ -732,9 +944,6 @@ def fetch_user_profile(cookies: dict, headers: dict, screen_name: str) -> dict |
 # tweet was invisible to every keyless path. This fetches the post itself.
 TWEETSBYIDS_OP = "TweetResultsByRestIds"
 DEFAULT_TWEETSBYIDS_QID = ""      # empty -> discovery, like every other op here
-# Measured 2026-08-30 off `x-rate-limit-limit`: 500 per 15 minutes, its own bucket — the most
-# generous surface on this core, and more generous than the paid endpoint it replaces.
-_TWEETSBYIDS_LIMIT_PER_WINDOW = 500
 # X's per-request maximum. Deliberately NOT wrapped in a chunking loop: every caller today asks
 # for exactly one id, so a loop would be code for a caller that does not exist. Passing more
 # raises, because the alternative — letting X truncate the list — loses tweets silently.
@@ -742,15 +951,13 @@ _TWEETSBYIDS_MAX_IDS = 100
 
 
 def fetch_tweets_by_ids(cookies: dict, headers: dict, ids: list) -> list[dict]:
-    """Tweets by id -> normalized tweets (the `x_graphql._normalize` shape), misses DROPPED.
+    """Tweets by id -> normalized tweets (the `normalize` shape), misses DROPPED.
 
     X answers positionally — ask for four ids and get four entries, with a deleted or protected
     post as an empty `{}` in its slot. Those are dropped rather than returned as placeholders, so
     the result is "the tweets that exist" and a caller matches on `id` instead of on position.
 
     Raises ValueError past `_TWEETSBYIDS_MAX_IDS`; see that constant for why there is no loop."""
-    from pipeline.ingestion import x_graphql as xg      # lazy: shared tweet normalizer
-    from pipeline.ingestion import x_lists as xlists    # lazy: x_lists imports THIS module
 
     wanted = [str(i) for i in (ids or []) if str(i).strip()]
     if not wanted:
@@ -775,7 +982,7 @@ def fetch_tweets_by_ids(cookies: dict, headers: dict, ids: list) -> list[dict]:
     out: list[dict] = []
     for entry in ((data.get("data") or {}).get("tweetResult") or []):
         res = entry.get("result")
-        norm = xg._normalize(res) if res else None
+        norm = normalize(res) if res else None
         if norm and norm.get("id"):
             out.append(norm)
     return out

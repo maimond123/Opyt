@@ -266,7 +266,7 @@ def test_footprint_collides_with_curation_save_no_duplicate(conn, fake_embedder,
            "publication_url": _PUB, "wordcount": 900, "audience": "everyone", "slug": "scaling-laws",
            "url": f"{_PUB}/p/scaling-laws", "preview": "preview"}
     monkeypatch.setattr(sub, "read_substack_cookies", lambda profile=None: {"substack.sid": "x"})
-    monkeypatch.setattr(sub, "fetch_saved_posts", lambda cookies: [rec])
+    monkeypatch.setattr(sub, "fetch_saved_posts", lambda src: sub.SavedPosts([rec], True))
     monkeypatch.setattr(sub, "_fetch_full_post", lambda base, slug, cookies: {"body_html": _BODY})
     monkeypatch.setattr(sub, "_is_paywalled", lambda r: False)
     ic.sync_substack_saved(conn, fake_embedder)
@@ -376,3 +376,35 @@ def test_atom_from_url_reader_url_resolved_then_minted(conn, fake_embedder, monk
     assert atom_id == "substack:800"
     assert conn.execute("SELECT who_id FROM atoms WHERE atom_id='substack:800'"
                         ).fetchone()["who_id"] == "substack:a16zcrypto"
+
+
+# ── Which HOSTS the direct post parser accepts, and why that is not the host boundary ────────
+
+def test_atom_from_url_mints_a_custom_domain_substack(conn, fake_embedder, monkeypatch):
+    """`_SUBSTACK_POST_RE` accepts ANY host with `/p/{slug}`, deliberately. A Substack on its own
+    domain is indistinguishable from a generic blog without a fetch, so `classify_link` cannot
+    sniff one and it arrives here only through Hopper's explicit `kind_hint`. `derive
+    .substack_entity_id` keys it on the custom host — a host test HERE would delete that path."""
+    _patch_post(monkeypatch, _full_post(900, slug="rate-cuts", host="https://noahpinion.blog"))
+    atom_id = fp.substack_atom_from_url(conn, fake_embedder,
+                                        "https://noahpinion.blog/p/rate-cuts")
+    assert atom_id == "substack:900"
+    assert conn.execute("SELECT who_id FROM atoms WHERE atom_id='substack:900'"
+                        ).fetchone()["who_id"] == "substack:noahpinion.blog"
+
+
+def test_atom_from_url_on_a_host_that_serves_no_post_api_writes_nothing(conn, fake_embedder,
+                                                                        monkeypatch):
+    """The lookalike-host fail-safe. `classify_link` no longer routes `not-substack.com` here
+    (tests/kb/test_link_router.py), and if a hint forces it, the per-post fetch raises and the
+    whole call SKIPS — no atom, no entity, nothing marked seen."""
+    from pipeline.ingestion.sources import substack as sub
+
+    def _blocked(base, slug, cookies):
+        raise sub.SubstackFetchError(f"no post api at {base}")
+    monkeypatch.setattr(sub, "_fetch_full_post", _blocked)
+
+    assert fp.substack_atom_from_url(conn, fake_embedder,
+                                     "https://not-substack.com/p/not-a-post") is None
+    assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 0

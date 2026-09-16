@@ -4,7 +4,7 @@
 `$OPYT_HOME`, so a test never touches the real `~/.opyt`. `fake_embedder` is a
 deterministic bag-of-words embedder — it lets us prove the retrieval MECHANICS
 (tag filter, BM25 arm, max-pool semantic arm, fusion, trust re-rank) offline, with no
-paid API. The hosted embedder's own behavior (query prefix, cost, kb_meta guard) is
+network call. The hosted embedder's own behavior (query prefix, token metadata, kb_meta guard) is
 proven separately in test_embed.py against the live API.
 """
 from __future__ import annotations
@@ -133,6 +133,47 @@ class FakeEmbedder:
 
 
 @pytest.fixture()
+def no_venue(monkeypatch):
+    """This site is not a research venue — the answer OpenAlex gives for 14 of 15 real blog hosts.
+
+    Requested explicitly, never autouse. Rooting a site URL asks OpenAlex once whether the host
+    resolves to a single source (`oracles._openalex_root`), so a test that roots one either stubs
+    that answer or trips the live-network guard. Making it automatic would hide the call from the
+    very tests that exercise the blog path, and a test that WANTS the venue path simply does not
+    ask for this."""
+    from pipeline.kb import frontier_sources as fs
+    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "sources_by_name", lambda self, name: [])
+
+
+@pytest.fixture()
+def no_deep_probe(monkeypatch):
+    """This page declares no DOI — the answer a real fetch of a blog post gives.
+
+    `hopper.preview` pays one bounded page read whenever a reference would fall through to the
+    `article` catch-all, to check whether the page declares `citation_doi` and is really a paper.
+    Any test that hoppers an article url reaches a live socket without this. Named rather than
+    autouse, same contract as `no_venue` and `solo_site`: a test that is ABOUT the probe asks for
+    something else instead.
+    """
+    from pipeline.kb import link_router
+    monkeypatch.setattr(link_router, "classify_link_deep", lambda url: None)
+
+
+@pytest.fixture()
+def solo_site(monkeypatch):
+    """This site is one person's — the second question rooting a site URL asks, after `no_venue`.
+
+    `oracles._multi_author_refusal` runs `eligibility.classify_authorship` before the `oracles`
+    row is written, so confirming a website root fetches its home page on a cache miss. Same
+    contract as `no_venue` and requested for the same reason: explicit, never autouse, so a test
+    that wants the REFUSAL seeds a `multi` verdict in the cache instead of asking for this.
+    """
+    from pipeline.kb import eligibility
+    monkeypatch.setattr(eligibility, "classify_authorship",
+                        lambda conn, url: eligibility.AuthorshipVerdict("single", reason="stub"))
+
+
+@pytest.fixture()
 def fake_embedder():
     # Vocabulary spanning the test corpus' distinguishing words.
     return FakeEmbedder([
@@ -199,3 +240,17 @@ def last_run(conn, *, status: str | None = None, generator: str | None = None):
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY ran_at DESC, run_id DESC LIMIT 1"
     return conn.execute(sql, tuple(args)).fetchone()
+
+
+@pytest.fixture(autouse=True)
+def _openalex_pacing_off(monkeypatch):
+    """Courtesy pacing is a LIVE-NETWORK property, and this suite has no network — `tests/conftest`
+    fails any test that reaches a real socket. Left on, `ingest_papers._openalex_read` sleeps its
+    declared second per read and the paper tests alone spent ~6s asleep proving nothing.
+
+    The pacing itself is covered directly, in `test_ingest_papers.py`, against the clock rather
+    than against the wall.
+    """
+    from pipeline.kb import frontier_sources, ingest_papers
+    monkeypatch.setattr(frontier_sources.OpenAlexWorksAdapter, "min_interval_s", 0.0)
+    monkeypatch.setattr(ingest_papers, "_OPENALEX_NEXT_AT", 0.0)

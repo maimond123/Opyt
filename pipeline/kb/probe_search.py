@@ -20,7 +20,7 @@ import sqlite3
 
 import numpy as np
 
-from . import probe_store, schema
+from . import probe_store
 from .embed import stored_dtype
 
 # Passages shown per account. Raised only if a real screen shows three is too thin.

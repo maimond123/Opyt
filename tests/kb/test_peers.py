@@ -318,20 +318,6 @@ def test_an_unresolvable_handle_says_whose_knowledge_base_lacks_them(two_kbs):
     assert notice["kb"] == "peer"
 
 
-def test_notices_about_the_readers_own_install_stay_out_of_a_foreign_read(two_kbs, monkeypatch):
-    """`rails_budget_paused` reports the READER's paused collection rails. Inside somebody else's
-    results it says their corpus is missing recent material, which is not true and not knowable
-    from here."""
-    from pipeline.kb import rail_budgets
-    monkeypatch.setattr(rail_budgets, "paused_today",
-                        lambda: [{"rail": "x", "label": "X backfill", "spent_usd": 1.0,
-                                  "ceiling_usd": 1.0}])
-    local = kb_entry.run_kb_search("react", mode="bm25", kb="me")
-    foreign = kb_entry.run_kb_search("rollup", mode="bm25", kb="peer")
-    assert "rails_budget_paused" in {n["code"] for n in local["notices"]}
-    assert "rails_budget_paused" not in {n["code"] for n in foreign["notices"]}
-
-
 def test_an_empty_peer_does_not_tell_the_reader_to_onboard(two_kbs, tmp_path):
     """`onboard` sets up the READER's install and would not put an atom in somebody else's store,
     so the local sentence sends them to fix the wrong thing.
@@ -369,6 +355,7 @@ def test_the_frontier_notice_does_not_ride_a_foreign_result(two_kbs, monkeypatch
     """Frontier's queue is the reader's OWN staged artifacts. Riding it on a foreign search tells
     them their backlog grew because they looked at somebody else's KB."""
     from mcp_server import atoms_tools
+    from tests.conftest import reset_atoms_session
 
     class _Mcp:
         def __init__(self):
@@ -382,12 +369,12 @@ def test_the_frontier_notice_does_not_ride_a_foreign_result(two_kbs, monkeypatch
 
     monkeypatch.setattr("mcp_server.frontier_tools.notice",
                         lambda: {"message": "3 new artifacts staged"}, raising=False)
-    atoms_tools._reset_session()
+    reset_atoms_session()
     mcp = _Mcp()
     atoms_tools.register_atoms_tools(mcp)
     assert "frontier" in mcp.tools["search"]("react", mode="bm25")
 
-    atoms_tools._reset_session()
+    reset_atoms_session()
     assert "frontier" not in mcp.tools["search"]("rollup", mode="bm25", kb="peer")
 
 

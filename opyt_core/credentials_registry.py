@@ -54,8 +54,14 @@ REGISTRY: tuple[Credential, ...] = (
         env="GITHUB_TOKEN",
         service="github",
         tier="optional",
-        purpose="raises the GitHub rate limit from 60 to 5000 req/hr; a token with NO scopes "
-                "ticked is enough, since OPYT only reads public repos",
+        # TWO limits, and the row used to name only the one its live consumer does not use.
+        # `github_client.readme`/`repo` hit the CORE REST budget (60/hr anonymous, 5000/hr with a
+        # token). `frontier_sources.GitHubAdapter` hits `/search/repositories`, which has its own
+        # far smaller budget: 10/min anonymous, 30/min with a token. The rail is PACED for the
+        # anonymous search limit, so this key is throughput, never capability.
+        purpose="triples GitHub search from 10 to 30 requests/min and raises other GitHub reads "
+                "from 60 to 5000 req/hr; without it everything still works, just slower. A token "
+                "with NO scopes ticked is enough, since OPYT only reads public repos",
         signup_url="https://github.com/settings/tokens",
     ),
     Credential(

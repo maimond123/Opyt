@@ -226,3 +226,59 @@ def test_prefetch_failure_is_not_cached_so_the_render_retries(ocr):
     out = vision.prefetch_group_media([[_norm(text="", n_photos=2)]], cache, workers=20)
     assert out["failed"] == 2 and out["read"] == 0
     assert cache == {}, "a failure must never be cached"
+
+
+# ── _photos_pending — the third term of ingest_x's skip gate (2026-09-13) ──────
+#
+# Deferring VLM to Enrichment makes `atom in seen and tid in convo_checked` true forever after the
+# first Enrichment run (`_ConvoFetcher.chain` marks the tid on ANY successful read, an empty chain
+# included), so without a third term the photo is never described. These pin that the third term
+# asks the SAME question `_cascade_node_photos` asks — a pending set that disagrees with what the
+# renderer actually reads is worse than no pending set at all.
+
+def test_photos_pending_is_false_once_every_photo_is_described(ocr):
+    norm = _norm(text="", n_photos=2)
+    cache: dict = {}
+    assert vision._photos_pending(norm, cache) is True
+    vision.enrich_tweet_media(norm, cache, describe_all=True)
+    assert vision._photos_pending(norm, cache) is False
+
+
+def test_photos_pending_counts_a_legacy_bare_string_as_a_miss(ocr):
+    """Presence is NOT a hit. `ocr_cascade.from_cache` returns None for a legacy bare-string entry
+    and every reader in this file treats that as absent — so a gate that tested `url in cache`
+    would skip a photo the renderer is about to re-read inline."""
+    norm = _norm(text="", n_photos=1)
+    assert vision._photos_pending(norm, {"https://pbs/0.jpg": "an old describe_image gloss"}) is True
+    assert vision._photos_pending(
+        norm, {"https://pbs/0.jpg": {"text": "x", "kind": "document", "substance": True}}) is False
+
+
+def test_photos_pending_sees_a_quoted_nodes_photo(ocr):
+    """Two levels, the same two the renderer walks. One level would leave a quoted chart to a
+    silent inline read inside a producer thread."""
+    root = _with_quote("text-only quoter", "", quote_photos=1)
+    assert vision._photos_pending(root, {}) is True
+
+
+def test_photos_pending_uses_the_same_url_fallback_as_the_reader(ocr):
+    """`media_url_https or url` — not a single key. A pending check reading only `media_url_https`
+    would call a `url`-only photo pending forever and never let the bookmark settle."""
+    norm = {"id": "1", "text": "", "extendedEntities": {
+        "media": [{"type": "photo", "url": "https://pbs/alt.jpg"}]}}
+    cache: dict = {}
+    assert vision._photos_pending(norm, cache) is True
+    vision.enrich_tweet_media(norm, cache, describe_all=True)
+    assert list(cache) == ["https://pbs/alt.jpg"]
+    assert vision._photos_pending(norm, cache) is False
+
+
+def test_a_failed_read_leaves_the_photo_pending(ocr):
+    """The poison-value rule seen from the gate's side: a failure is never cached, so the bookmark
+    comes back next Enrichment run. Self-healing, at the cost of retrying a dead image URL."""
+    ocr.respond(lambda url, context: None)
+    norm = _norm(text="", n_photos=1)
+    cache: dict = {}
+    vision.enrich_tweet_media(norm, cache, describe_all=True)
+    assert cache == {}
+    assert vision._photos_pending(norm, cache) is True

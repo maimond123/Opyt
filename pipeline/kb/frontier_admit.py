@@ -22,14 +22,13 @@ import argparse
 import json
 import os
 import sqlite3
-import subprocess  # unused directly — tests patch `fa.subprocess.Popen` to intercept spawn_rail()'s Popen call
 from datetime import datetime
 from pipeline.timeparse import utc_iso, utc_now
 
-from pipeline.kb.rail_runtime import COALESCE_DEFAULT, models_unroutable, spawn_rail
+from pipeline.kb.rail_runtime import models_unroutable
 from pipeline.ingestion.utils import log
 
-from . import schema
+from . import frontier_sources as fs, schema
 from .ingest_common import FETCH_UNDETERMINED
 
 # The mode this rail writes. Never `user-saved` — that's approval, not discovery. (It was also
@@ -98,7 +97,7 @@ def _known_metadata(row) -> dict:
     abstract-less atom into the store permanently, since papers are immutable under Policy B.
 
     Source-agnostic by construction: every paper adapter already writes its title into `title`,
-    its abstract into `summary`, its author names into `payload["authors"]` and an open PDF url,
+    its abstract into `summary`, its authors into `payload["authors"]` and an open PDF url,
     when it has one, into `payload["pdf_url"]` — so there is no per-source branch to write here
     and none to forget when the next paper source lands.
     """
@@ -106,14 +105,19 @@ def _known_metadata(row) -> dict:
         payload = json.loads(row["payload"] or "{}")
     except (TypeError, ValueError):
         payload = {}
-    names = [n for n in (payload.get("authors") or []) if isinstance(n, str) and n.strip()]
     pdf_url = payload.get("pdf_url")
     return {"title": row["title"], "abstract": row["summary"],
-            # No `authorId`: an OpenAlex author id is not a Semantic Scholar one, and
-            # `derive_paper` reads that key to mint `who_id = scholar:{id}`. A name-only author
-            # falls to the honest `paper-authors:{paper_id}` placeholder instead of asserting a
-            # scholar identity that does not exist. S2's own authors still win when it answers.
-            "authors": [{"name": n} for n in names],
+            # `openalexId`, never `authorId`: an OpenAlex author id is not a Semantic Scholar one,
+            # and `derive_paper` reads `authorId` to mint `who_id = scholar:{id}`. Writing it
+            # there would assert a scholar identity that does not exist; under its own key it is
+            # an honest second registry id that `derive_paper` ignores and `atomize_paper` keeps
+            # on the atom. `who_id` still falls to the `paper-authors:{paper_id}` placeholder when
+            # no S2 id resolved. S2's own authors still win outright when S2 answers.
+            "authors": [{"name": a["name"],
+                         **({"openalexId": oid} if (oid := a.get("openalex_id")) else {}),
+                         **({"orcid": orc} if (orc := a.get("orcid")) else {}),
+                         **({"position": pos} if (pos := a.get("position")) else {})}
+                        for a in fs.payload_authors(payload)],
             "publicationDate": row["published"],
             # The finder's open PDF, in S2's field name, so `_fulltext_pdf_urls` picks it up with
             # NO change of its own — it already reads `openAccessPdf.url`, and `_merge_paper`
@@ -286,24 +290,9 @@ def requeue_rejected(conn, *, last_error: str | None = None) -> int:
     return n
 
 
-# ── The detached spawn ──────────────────────────────────────────────────────────
-def spawn_frontier_admit(force: bool = False, coalesce_window: float = COALESCE_DEFAULT) -> bool:
-    """Fire one admission pass as a detached, non-blocking child and return immediately.
-
-    This rail owns its spawner rather than riding as a tail of stage 2, so the two can be disabled
-    independently (they fail on different things: upstream index vs. fetch/embed).
-
-    Cheap to fire often: a pass with nothing pending exits after one SELECT, and the per-run cap
-    bounds the expensive case regardless of trigger rate.
-    """
-    return spawn_rail("pipeline.kb.frontier_admit", slug="frontier_admit",
-                      force=force, coalesce=coalesce_window)
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Frontier stage 3 — admit candidates into atoms")
     ap.add_argument("--once", action="store_true")
-    ap.add_argument("--force", action="store_true", help="accepted for spawn parity; no TTL here")
     ap.add_argument("--dry-run", action="store_true", help="report what would be tried, write none")
     ap.add_argument("--limit", type=int, default=None, help="override ADMIT_MAX_PER_RUN")
     ap.add_argument("--requeue-rejected", nargs="?", const="", default=None, metavar="SLUG",

@@ -29,6 +29,14 @@ def _seed_atom(conn, atom_id, *, source_type, who_id, when_ts):
                               "who_id": who_id, "when_ts": when_ts, "description": "d"})
 
 
+def _member(conn, entity_id, *, profile=None, identity_links=None):
+    """The exact row shape `schema.entities_for_canonical` supplies to source registration."""
+    schema.upsert_entity(conn, entity_id, profile=profile, identity_links=identity_links)
+    return conn.execute(
+        "SELECT entity_id, identity_links, profile FROM entities WHERE entity_id=?", (entity_id,)
+    ).fetchone()
+
+
 # ── flat TTLs ───────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("stype,base", [("x", 72.0), ("substack", 168.0),
                                         ("blog", 336.0), ("github", 336.0)])
@@ -112,32 +120,44 @@ def test_latest_atom_ts_maxes_over_every_cluster_member(kb_home):
 
 
 # ── entity → pair mapping ───────────────────────────────────────────────────────
-def test_pair_from_member_per_platform():
-    assert st.pair_from_member({"entity_id": "x:user:9",
-                                "profile": '{"handle": "willccbb"}'}) == ("x", "willccbb")
-    assert st.pair_from_member({"entity_id": "substack:foo",
-                                "identity_links": '["https://foo.substack.com"]'}) \
-        == ("substack", "https://foo.substack.com")
-    assert st.pair_from_member({"entity_id": "blog:willcb.com"}) == ("blog", "https://willcb.com")
-    assert st.pair_from_member({"entity_id": "github:willccbb"}) == ("github", "willccbb")
+def test_pair_from_member_per_platform(kb_home):
+    conn = schema.connect()
+    try:
+        assert st.pair_from_member(_member(conn, "x:user:9", profile={"handle": "willccbb"})) \
+            == ("x", "willccbb")
+        assert st.pair_from_member(_member(conn, "substack:foo",
+                                            identity_links=["https://foo.substack.com"])) \
+            == ("substack", "https://foo.substack.com")
+        assert st.pair_from_member(_member(conn, "blog:willcb.com")) == ("blog", "https://willcb.com")
+        assert st.pair_from_member(_member(conn, "github:willccbb")) == ("github", "willccbb")
+    finally:
+        conn.close()
 
 
-def test_pair_from_member_refuses_unpullable_members():
+def test_pair_from_member_refuses_unpullable_members(kb_home):
     # An X entity with no stored handle: the adapter pulls `from:handle`, so an id is not enough.
-    assert st.pair_from_member({"entity_id": "x:user:9"}) is None
-    assert st.pair_from_member({"entity_id": "org:acme.com"}) is None
-    assert st.pair_from_member({"entity_id": "blog:unknown"}) is None
-    # `github:{owner}/{name}` is an ATOM id (and a `forked` edge target), never a feed.
-    assert st.pair_from_member({"entity_id": "github:willccbb/vllm"}) is None
+    conn = schema.connect()
+    try:
+        assert st.pair_from_member(_member(conn, "x:user:9")) is None
+        assert st.pair_from_member(_member(conn, "org:acme.com")) is None
+        assert st.pair_from_member(_member(conn, "blog:unknown")) is None
+        # `github:{owner}/{name}` is an ATOM id, never a feed.
+        assert st.pair_from_member(_member(conn, "github:willccbb/vllm")) is None
+    finally:
+        conn.close()
 
 
-def test_substack_handle_id_reconstructs_a_publication_url():
+def test_substack_handle_id_reconstructs_a_publication_url(kb_home):
     """`substack_entity_id` keys on the author HANDLE when it has one and on the host otherwise —
     a dot is the only thing telling the two apart."""
-    assert st.pair_from_member({"entity_id": "substack:bob"}) == ("substack",
-                                                                  "https://bob.substack.com")
-    assert st.pair_from_member({"entity_id": "substack:news.example.com"}) \
-        == ("substack", "https://news.example.com")
+    conn = schema.connect()
+    try:
+        assert st.pair_from_member(_member(conn, "substack:bob")) == ("substack",
+                                                                         "https://bob.substack.com")
+        assert st.pair_from_member(_member(conn, "substack:news.example.com")) \
+            == ("substack", "https://news.example.com")
+    finally:
+        conn.close()
 
 
 def test_github_owner_recovered_from_identity_links():
@@ -168,7 +188,7 @@ def test_seed_registers_one_row_per_source_and_is_idempotent(kb_home):
         assert {(r.source_type, r.source_key) for r in rows} == {
             ("x", "willccbb"), ("blog", "https://willcb.com"), ("github", "willccbb")}
         assert all(r.status == "trusted" for r in rows)
-        # cursor comes from the corpus; last_pulled_at from ingest_to (unset here → never pulled)
+        # cursor comes from the corpus; seeding stamps no pull, so `last_pulled_at` stays NULL
         assert next(r for r in rows if r.source_type == "x").cursor_ts == "2026-07-20"
         assert next(r for r in rows if r.source_type == "x").last_pulled_at is None
 
@@ -178,29 +198,32 @@ def test_seed_registers_one_row_per_source_and_is_idempotent(kb_home):
         conn.close()
 
 
-def test_seed_adopts_the_onboarding_coverage_marker(kb_home):
-    """A freshly onboarded Oracle must NOT be immediately re-pulled: the onboarding pull IS the
-    first pull, and `oracles.ingest_to` is the record of it."""
+def test_seeding_claims_no_coverage(kb_home):
+    """Seeding registers ROWS; it must never claim a pull happened.
+
+    It used to copy `oracles.ingest_to` into `last_pulled_at`, and that column was written
+    unconditionally at the end of an onboarding ingest — including on a run whose X pull raised.
+    A person with zero X atoms therefore got a row claiming a fresh X pull, `upsert_source`'s
+    COALESCE froze it, and no rail would ever pick them up again."""
     conn = st.connect()
     try:
         _make_oracle(conn)
-        schema.set_oracle_window(conn, "x:user:1", NOW - timedelta(days=180), NOW)
         st.seed_from_entities(conn)
         row = next(r for r in st.list_sources(conn) if r.source_type == "x")
-        assert row.last_pulled_at is not None
-        assert not st.is_stale(row, NOW + timedelta(hours=1))
+        assert row.last_pulled_at is None
+        assert row.covered_from is None
+        assert st.is_stale(row, NOW)                       # infinitely stale → sorts first
+        assert st.staleness_hours(row, NOW) == float("inf")
     finally:
         conn.close()
 
 
 def test_reseed_never_rewinds_a_pair_the_loop_already_refreshed(kb_home):
     """The registry is re-seeded after EVERY ingest, so this is the property that keeps that safe:
-    a stored `last_pulled_at` must survive a seed that would otherwise write the older marker."""
+    a stored `last_pulled_at` must survive a later seed."""
     conn = st.connect()
     try:
         _make_oracle(conn)
-        schema.set_oracle_window(conn, "x:user:1", NOW - timedelta(days=180),
-                                 NOW - timedelta(days=30))
         st.seed_from_entities(conn)
         row = next(r for r in st.list_sources(conn) if r.source_type == "x")
         st.record_pull(conn, row, last_status="ingested", cursor_ts="2026-08-08", stamp=True)
@@ -212,6 +235,45 @@ def test_reseed_never_rewinds_a_pair_the_loop_already_refreshed(kb_home):
                     if r.source_type == "x").last_pulled_at == fresh_stamp
     finally:
         conn.close()
+
+
+# ── covered_from: the backward frontier ────────────────────────────────────────
+def test_covered_from_only_widens(kb_home):
+    """`covered_from` answers "how far back do we go", so a narrower later pull must not shrink
+    it — the atoms from the wider pull are still in the store."""
+    conn = st.connect()
+    try:
+        _make_oracle(conn)
+        st.seed_from_entities(conn)
+        row = next(r for r in st.list_sources(conn) if r.source_type == "x")
+
+        st.record_pull(conn, row, last_status="ingested", covered_from="2026-03-01", stamp=True)
+        assert _x(conn).covered_from == "2026-03-01"
+        st.record_pull(conn, row, last_status="ingested", covered_from="2026-06-01", stamp=True)
+        assert _x(conn).covered_from == "2026-03-01"       # narrower → unchanged
+        st.record_pull(conn, row, last_status="ingested", covered_from="2025-01-01", stamp=True)
+        assert _x(conn).covered_from == "2025-01-01"       # wider → adopted
+    finally:
+        conn.close()
+
+
+def test_covered_from_none_leaves_the_frontier_alone(kb_home):
+    """None means "this pull had no lower bound to report", not "unbounded" — so a stored NULL
+    means exactly one thing, no lower bound recorded."""
+    conn = st.connect()
+    try:
+        _make_oracle(conn)
+        st.seed_from_entities(conn)
+        row = next(r for r in st.list_sources(conn) if r.source_type == "x")
+        st.record_pull(conn, row, last_status="ingested", covered_from="2026-03-01", stamp=True)
+        st.record_pull(conn, row, last_status="ingested", covered_from=None, stamp=True)
+        assert _x(conn).covered_from == "2026-03-01"
+    finally:
+        conn.close()
+
+
+def _x(conn):
+    return next(r for r in st.list_sources(conn) if r.source_type == "x")
 
 
 def test_record_pull_stamp_false_leaves_the_pair_stale(kb_home):

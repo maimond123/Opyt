@@ -4,8 +4,8 @@
 uncached part of the region's chain, then the host reduces the per-part outputs in-session. What
 these lock:
 
-  • ONE CALL PER UNCACHED (PART, LENS), and ZERO on re-invocation. Closed parts are frozen, so the
-    cache needs no invalidation rule and steady state is one call for the open tail. A cache that
+  • ONE CALL PER UNCACHED (PART, LENS), and ZERO on re-invocation unless atom removal invalidates
+    the cache. Steady state is one call for the open tail. A cache that
     silently missed would make every lens on every region cost the whole chain, every time.
   • THE LOOP IS CODE. A host handed a cursor protocol and told to walk the chain itself answers
     early from partial material — rejected on exactly that ground.
@@ -73,7 +73,7 @@ def sitting(conn):
 class _Resp:
     def __init__(self, text):
         self.text, self.model = text, "fake-model"
-        self.input_tokens, self.output_tokens, self.cost_usd = 100, 20, 0.01
+        self.input_tokens, self.output_tokens = 100, 20
         self.raw = {}
 
 
@@ -116,9 +116,8 @@ def test_a_sitting_scoped_lens_writes_a_receipt_but_never_reads_the_sitting(conn
                        (sitting, lens)).fetchone()
     assert row is not None and row["status"] == "ok"
     assert row["consensus"] is None and row["emitted"] is None
-    # The run row carries what the map spent. Reporting $0 for a call that spent would make the
-    # lens rail invisible in every spend report there is.
-    assert row["cost_usd"] == 0.01 and row["model"] == "fake-model"
+    assert row["model"] == "fake-model"
+    assert row["in_tokens"] == 100 and row["out_tokens"] == 20
     assert sst.get_sitting(conn, sitting)["read_at"] is None
 
 
@@ -204,17 +203,28 @@ def test_every_part_of_the_chain_is_mapped_once(conn, chain, transport):
         assert n in res["document"]
 
 
-def test_a_second_call_costs_nothing(conn, chain, transport):
-    """A closed part is FROZEN, so it is mapped once per lens EVER — which is why this cache needs
-    no invalidation rule at all, and why steady state on any region is one call for the open tail.
-    A silently-missing cache would make every lens on every region re-pay the whole chain."""
+def test_a_second_call_reuses_the_cached_parts(conn, chain, transport):
+    """An unchanged closed part reuses its output; steady state is one call for the open tail.
+    A silently-missing cache would re-run every lens over the whole chain."""
     first = sl.read_lens(conn, "trajectory", sitting_id=chain[-1])
     n = len(transport)
     again = sl.read_lens(conn, "trajectory", sitting_id=chain[-1])
     assert len(transport) == n
     assert again["document"] == first["document"]
     assert all(p["cached"] for p in again["parts"])
-    assert again["spent_usd"] == 0.0 and first["spent_usd"] > 0.0
+
+
+def test_forgetting_an_atom_remaps_the_part_without_its_content(conn, sitting, transport):
+    from pipeline.kb import forget
+
+    sl.read_lens(conn, "trajectory", sitting_id=sitting)
+    assert "a:near body" in transport[-1]["user"]
+    assert forget.atom(conn, "a:near", confirm=True)["status"] == "forgotten"
+    result = sl.read_lens(conn, "trajectory", sitting_id=sitting)
+    assert len(transport) == 2
+    assert not result["parts"][0]["cached"]
+    assert "a:near body" not in transport[-1]["user"]
+    assert "a:seed body" in transport[-1]["user"]
 
 
 def test_each_lens_maps_the_chain_separately(conn, chain, transport):
@@ -253,14 +263,46 @@ def test_the_claim_never_reaches_the_map(conn, chain, transport):
 def test_a_part_that_cannot_be_mapped_is_named(conn, chain, monkeypatch, transport):
     """FAIL-SAFE, but never silent: a lens is prose for a person, so a region missing one stretch
     is a degraded answer while refusing the whole lens over one bad call is a worse one. The join
-    must say which stretch is absent or it reads as complete."""
+    must say which stretch is absent or it reads as complete.
+
+    ⚠️ This is the PARTIAL case, and until 2026-09-05 this test did not exercise it — it failed
+    every call, so it asserted the TOTAL case while being named and documented for the partial one.
+    That conflation is why the total case (below) went unnoticed: the one test covering the ground
+    was pinning the wrong behaviour as correct.
+    """
+    def _third_part_only(role, *, system, user, **kw):
+        if "a:2" in user:                       # the newest stretch, part 3 of the chain
+            raise RuntimeError("transport down")
+        return _Resp("map output")
+    monkeypatch.setattr(llm_client, "call", _third_part_only)
+
+    res = sl.read_lens(conn, "briefing", sitting_id=chain[-1])
+    assert res["status"] == "ok", "a region with a HOLE is still a usable answer"
+    assert res["missing_parts"] == [3] and "missing that stretch" in res["note"]
+    assert [p["part"] for p in res["parts"]] == [1, 2] and res["document"]
+
+
+def test_a_lens_whose_every_part_failed_skips_rather_than_returning_an_empty_document(
+        conn, chain, monkeypatch, transport):
+    """THE TOTAL CASE, and it is not a degraded answer — it is no answer.
+
+    Before 2026-09-05 this returned `status: "ok"`, `document: ""`, `parts: []` and a note reading
+    "the answer below is missing that stretch", which presupposes an answer. The tool contract
+    (`mcp_server/sitting_tools.py`) then instructs the host to "read `document` following
+    `instruction` and write the answer yourself" — from an empty string. The most ordinary way to
+    get here is degrade-open: no API key.
+
+    `skipped`, not `failed`: this rail reserves `failed` for the breaker's diet, and a missing key
+    is not a failure to count against it.
+    """
     def _boom(role, *, system, user, **kw):
         raise RuntimeError("transport down")
     monkeypatch.setattr(llm_client, "call", _boom)
 
     res = sl.read_lens(conn, "briefing", sitting_id=chain[-1])
-    assert res["status"] == "ok" and res["parts"] == []
-    assert res["missing_parts"] == [1, 2, 3] and "missing that stretch" in res["note"]
+    assert res["status"] == "skipped" and res["missing_parts"] == [1, 2, 3]
+    assert res["reason"] and res["parts"] == []
+    assert "document" not in res, "an empty document must not be offered as one"
     assert conn.execute("SELECT COUNT(*) FROM sitting_lens_outputs").fetchone()[0] == 0
 
 

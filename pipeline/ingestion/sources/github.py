@@ -19,6 +19,22 @@ from pipeline.ingestion.utils import log
 FETCH_DELAY = 0.5  # seconds between API calls
 
 
+class GitHubRateLimited(Exception):
+    """GitHub refused with a rate-limit 403.
+
+    RAISED, not returned as ``None``, and the distinction is the whole point. A swallowed rate
+    limit makes a truncated crawl indistinguishable from "this account has few repos", and
+    ``ingest_common.classify_run`` then reads the run as `ingested` — so ``_pull_pair`` advances
+    the cursor, widens `covered_from` to a window the crawl never reached, and stamps the TTL.
+    Raising is what makes ``sync_github`` report BLOCKED, and BLOCKED is the one outcome that
+    stops all three of those writes.
+
+    Per-IP and session-wide, exactly like ``XRateLimited`` — every later GitHub request fails
+    identically until the window resets, so stopping the crawl loses nothing a retry would not
+    also lose. Adapter BOUNDARIES convert it back into a returned summary carrying `error` +
+    `undetermined`, because `d7dbcfcf` requires adapters to signal a hard stop by returning."""
+
+
 # ── API helpers ──────────────────────────────────────────────────────────────
 
 def _gh_headers() -> dict:
@@ -36,9 +52,13 @@ def _gh_get(url: str, params: dict | None = None) -> requests.Response | None:
         if resp.status_code == 200:
             return resp
         if resp.status_code == 403 and "rate limit" in resp.text.lower():
-            log(f"  [warn] GitHub rate limit hit — set GITHUB_TOKEN for 5000 req/hr")
-        elif resp.status_code not in (404,):
+            # No "set GITHUB_TOKEN" advice: `f4269d2b` deleted the in-app path for it, so the
+            # only remaining route is a terminal. The key is throughput, never capability.
+            raise GitHubRateLimited(f"GitHub rate limit reached at {url}")
+        if resp.status_code not in (404,):
             log(f"  [warn] GitHub API {resp.status_code}: {url}")
+    except GitHubRateLimited:
+        raise                    # the refusal is the signal; the catch-all below would erase it
     except Exception as e:
         log(f"  [warn] GitHub request failed: {e}")
     return None
@@ -151,7 +171,7 @@ def _repo_to_markdown(
         body += f"**Category:** {category}\n"
     body += "\n"
     if is_fork:
-        body += f"*Forked repo*\n\n"
+        body += "*Forked repo*\n\n"
 
     if readme:
         max_len = 8000

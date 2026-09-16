@@ -77,10 +77,10 @@ def _body(queries, consensus="the consensus", verdicts=None):
     return json.dumps(obj)
 
 
-def _fake_call(text: str, *, cost: float = 0.42):
+def _fake_call(text: str):
     def call(role, *, system, user, **kw):
         return type("R", (), {"text": text, "model": "fake/model", "input_tokens": 100,
-                              "output_tokens": 50, "cost_usd": cost, "raw": {}})()
+                              "output_tokens": 50, "raw": {}})()
     return call
 
 
@@ -459,9 +459,7 @@ def test_a_bad_response_leaves_an_EXISTING_query_set_untouched(conn, sitting, re
     assert [tuple(r) for r in conn.execute(
         "SELECT * FROM frontier_queries ORDER BY query_id")] == before
     run = last_run(conn)
-    # The call WAS attempted, so the recorded figure is the real charge when the response carried
-    # one, and 0.0 only when it did not — never NULL, which means "never reached the provider".
-    assert run["status"] == "failed" and run["cost_usd"] is not None
+    assert run["status"] == "failed" and run["in_tokens"] == 100
 
 
 def test_truncation_is_reported_as_truncation_not_as_bad_json(conn, sitting, ready, monkeypatch):
@@ -471,7 +469,7 @@ def test_truncation_is_reported_as_truncation_not_as_bad_json(conn, sitting, rea
     def call(role, *, system, user, **kw):
         return type("R", (), {
             "text": '{"consensus": "cut off mid',
-            "model": "m", "input_tokens": 1, "output_tokens": 32000, "cost_usd": 0.9,
+            "model": "m", "input_tokens": 1, "output_tokens": 32000,
             "raw": {"choices": [{"finish_reason": "length"}]}})()
     monkeypatch.setattr(llm_client, "call", call)
     res = sr.read_sitting(conn, sitting, now=_NOW)
@@ -482,7 +480,7 @@ def test_truncation_is_reported_as_truncation_not_as_bad_json(conn, sitting, rea
 def _cli_envelope(result_text: str, *, ok: bool = True):
     return json.dumps({
         "is_error": not ok, "subtype": "success" if ok else "error_during_execution",
-        "result": result_text, "total_cost_usd": 0.21,
+        "result": result_text,
         "usage": {"input_tokens": 2, "cache_creation_input_tokens": 216000,
                   "cache_read_input_tokens": 0, "output_tokens": 900},
         "modelUsage": {"claude-sonnet-5": {}}})
@@ -598,14 +596,12 @@ def test_a_full_read_on_the_cli_backend_writes_queries(conn, sitting, monkeypatc
     assert last_run(conn, status="ok")["model"].startswith("claude-cli:")
 
 
-def test_a_missing_cli_degrades_open_without_spending(conn, sitting, monkeypatch):
-    """A preflight failure never reached a provider, so `cost_usd` stays NULL — the distinction
-    that separates "we could not call" from "we called and it failed"."""
+def test_a_missing_cli_degrades_open(conn, sitting, monkeypatch):
     monkeypatch.setenv("OPYT_FRONTIER_BACKEND", core.BACKEND_CLI)
     monkeypatch.setattr("shutil.which", lambda n: None)
     res = sr.read_sitting(conn, sitting, now=_NOW)
     assert res["status"] == "failed" and "not on PATH" in res["reason"]
-    assert last_run(conn)["cost_usd"] is None
+    assert last_run(conn)["status"] == "failed"
 
 
 def test_an_unknown_backend_fails_closed_rather_than_guessing(conn, sitting, monkeypatch):

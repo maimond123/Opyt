@@ -235,7 +235,7 @@ def _sync_speed(conn: sqlite3.Connection, query_id: str) -> None:
     Votable-only (since 2026-08-12): a claim that can never change its mind stays at
     `miss_count=0` forever, and including it in the MIN would pin a query to the fastest tier
     permanently regardless of other claims' drops. The fallback is 0 (daily) when a query has no
-    votable claim at all — the fail-safe direction is over-pulling, not under-pulling. See
+    votable claim at all — the fail-safe direction is over-pulling, not under-pulling.
     """
     conn.execute(
         """UPDATE frontier_queries SET
@@ -254,8 +254,9 @@ def register_generator(conn: sqlite3.Connection, generator: str, *, label: str |
 
     `votable` and `label` are declared by the READER and refreshed on re-registration, so a fixed
     flag takes effect going forward — but not retroactively: it does not re-run `_sync_speed` for
-    queries already claimed, which lags rather than loses. `status` is never touched here;
-    retirement is a human decision an automatic path must not undo
+    queries already claimed, which lags rather than loses. `status` is not written here — and
+    since `retire_generator` was deleted on 2026-09-05 nothing writes it anywhere. See the
+    column's note in `schema.py`.
     """
     stamp = now or utc_iso()
     conn.execute(
@@ -288,48 +289,6 @@ def unretire_query(conn: sqlite3.Connection, text: str) -> bool:
                        (normalize(text),))
     conn.commit()
     return bool(cur.rowcount)
-
-
-def retire_generator(conn: sqlite3.Connection, generator: str) -> dict:
-    """Kill a whole CHANNEL. Returns `{generator_retired, queries_retired}`.
-
-    The per-region answer to "that turned out to be a dead end" — retiring 10-25 queries one
-    exact string at a time through `retire_query` is the chore that doesn't get done. Only
-    queries whose LAST live claimant this was are retired; one a second live channel still wants
-    keeps running. A cascade at retire time, not a filter inside `active_queries` — that list is
-    both what stage 2 executes and what a reader is shown, so retirement stays a readable write
-    rather than an invisible filter. `status` is only ever set here or in `retire_query`, both
-    human acts.
-    """
-    cur = conn.execute("UPDATE frontier_generators SET status='retired' WHERE generator=?",
-                       (generator,))
-    gen_hit = bool(cur.rowcount)
-    q = conn.execute(
-        """UPDATE frontier_queries SET status='retired'
-            WHERE status != 'retired'
-              AND query_id IN (SELECT g.query_id FROM frontier_query_generators g
-                                WHERE g.generator = ?)
-              AND query_id NOT IN (
-                    SELECT g2.query_id FROM frontier_query_generators g2
-                      LEFT JOIN frontier_generators fg2 ON fg2.generator = g2.generator
-                     WHERE COALESCE(fg2.status, 'active') != 'retired')""",
-        (generator,))
-    conn.commit()
-    return {"generator_retired": gen_hit, "queries_retired": q.rowcount}
-
-
-def generators(conn: sqlite3.Connection, *, include_retired: bool = True) -> list[sqlite3.Row]:
-    """Every channel, with its label, votability, status and how many queries it still claims.
-
-    The answer to "which queries came from where" at channel granularity — the origin column on
-    `frontier_queries` answers it for ONE query, and answers only "who emitted it first".
-    """
-    sql = ("SELECT fg.*, ("
-           "  SELECT COUNT(*) FROM frontier_query_generators g WHERE g.generator = fg.generator"
-           ") AS claims FROM frontier_generators fg")
-    if not include_retired:
-        sql += " WHERE fg.status != 'retired'"
-    return list(conn.execute(sql + " ORDER BY fg.last_seen_at DESC"))
 
 
 def record_run(conn: sqlite3.Connection, **fields) -> int:
@@ -385,19 +344,32 @@ USER_GENERATOR = "user"
 _SPEED = {1.0: "daily", 7.0: "weekly", 30.0: "monthly"}
 
 
-def retired_texts(conn: sqlite3.Connection, *, generator: str) -> list[str]:
-    """Questions this generator claims that a HUMAN has retired. The third bucket of the watchlist
-    diff, and the only one no machine path can fill: drops only SLOW a query (the decay tiers exist
-    so nothing ever needs to remove one), so a query leaving the list is always a person's doing.
+def retired_texts(conn: sqlite3.Connection, *, generator: str | None = None) -> list[str]:
+    """Questions a HUMAN has retired — the exact complement of `active_queries`, and the only
+    bucket no machine path can fill: drops only SLOW a query (the decay tiers exist so nothing ever
+    needs to remove one), so a query leaving the list is always a person's doing.
 
-    Always per-generator: the diff this feeds is a region's, and a corpus-wide retired list would
-    report another region's drops as this one's."""
-    rows = conn.execute(
-        "SELECT q.text FROM frontier_queries q "
-        "  JOIN frontier_query_generators g ON g.query_id = q.query_id "
-        " WHERE q.status = 'retired' AND g.generator = ? ORDER BY q.last_emitted_at DESC",
-        (generator,))
-    return [r[0] for r in rows]
+    Scoped and unscoped serve different readers, which is why `generator` is optional here exactly
+    as it is on `active_queries`. The watchlist DIFF must always pass one — it reports what changed
+    for a region, and unscoped it would read another region's drops as this one's. The watchlist
+    SURFACE (`show='retired'`) passes one only when the user named a region; unscoped is the whole
+    point there, because "what did I drop weeks ago" is not a question about one region.
+
+    Ordered `last_emitted_at DESC`, not `created_at`: there is no retirement timestamp, and last
+    emission is the closest available proxy for recency of retirement — a query retired last week
+    ran until last week, whereas `created_at` sorts a long-standing query that was just dropped to
+    the bottom, which is the opposite of what a reader looking for a recent drop needs."""
+    if generator:
+        sql = ("SELECT q.text FROM frontier_queries q "
+               "  JOIN frontier_query_generators g ON g.query_id = q.query_id "
+               " WHERE q.status = 'retired' AND g.generator = ? "
+               " ORDER BY q.last_emitted_at DESC")
+        args: tuple = (generator,)
+    else:
+        sql = ("SELECT text FROM frontier_queries WHERE status = 'retired' "
+               " ORDER BY last_emitted_at DESC")
+        args = ()
+    return [r[0] for r in conn.execute(sql, args)]
 
 
 def watchlist(conn: sqlite3.Connection, *, generator: str | None = None) -> list[dict]:
@@ -442,21 +414,37 @@ def watchlist(conn: sqlite3.Connection, *, generator: str | None = None) -> list
     return out
 
 
-# Where a user-typed question runs. The general-purpose ones, not every adapter: the domain feeds
-# (biorxiv, pubmed, clinicaltrials, sec_edgar) answer a question that was asked in their domain,
-# and pointing a generic phrase at them buys noise a person then has to dismiss.
+# Where a user-typed question runs. EVERY name here must have an adapter in
+# `frontier_sources.adapters()`, and that rule is what distinguishes this tuple from
+# `reader_core.VALID_SOURCES`. The reader PROPOSES a source per query, so an unbuilt name there is
+# an occasional `no_adapter` row that keeps the gap visible. This tuple is unconditional: every
+# name runs against every question a user types, forever, with no way to opt out. An unbuilt name
+# here is not a to-do list, it is a permanent error row per query — `semantic_scholar` and
+# `hackernews` sat here until 2026-09-04 and neither adapter had existed in any commit, so two of
+# every five pairs a user query generated were dead on arrival.
+#
+# The general-purpose ones only. The domain feeds in `VALID_SOURCES` (biorxiv, pubmed,
+# clinicaltrials, sec_edgar) answer a question asked in their domain, and pointing a generic
+# phrase at them would buy noise a person then has to dismiss — so they would not belong here even
+# once they are built.
 #
 # openalex belongs here and is not a domain feed — it indexes published literature across every
 # discipline, so it is the only entry that answers a user's question when the question leaves
 # computer science. Without it, a typed question about biology or economics runs against arxiv and
 # github, neither of which indexes the field it was asked about.
-USER_QUERY_SOURCES: tuple[str, ...] = ("arxiv", "github", "semantic_scholar", "hackernews",
-                                       "openalex")
+USER_QUERY_SOURCES: tuple[str, ...] = ("arxiv", "github", "openalex")
 
 
 def add_user_query(conn: sqlite3.Connection, text: str) -> str | None:
-    """Put a question the USER typed onto the watchlist. Returns its `query_id`, or None if the
+    """Put a question the USER typed onto the watchlist. Returns what HAPPENED to it: `"added"`,
+    or `"still_retired"` when the text lands on a row a human already retired, or None when the
     text was empty.
+
+    It returned the `query_id` until 2026-09-05 and no caller ever read it. The OUTCOME is what
+    callers branch on, and this is the only place positioned to report it: `upsert_queries`
+    deliberately never writes `status`, so a retired row survives the write unchanged and looks
+    exactly like a fresh add from the outside. Reporting `added` for that row told the user their
+    question was running when it was not.
 
     `votable=False` is load-bearing, not a default copied from somewhere. `_sync_speed` takes the
     MIN `miss_count` over VOTABLE claims only, and nothing ever renders a verdict on a
@@ -471,43 +459,35 @@ def add_user_query(conn: sqlite3.Connection, text: str) -> str | None:
         conn, [{"text": text, "rationale": "added by the user",
                 "target_sources": list(USER_QUERY_SOURCES), "atom_ids": []}],
         generator=USER_GENERATOR, votable=False, label="your own watchlist")
-    return res["query_ids"][0] if res["query_ids"] else None
+    # Exactly one id: the text is non-empty here, so it normalizes non-empty and survives
+    # `upsert_queries`' intra-run dedup as a single row.
+    status = conn.execute("SELECT status FROM frontier_queries WHERE query_id=?",
+                          (res["query_ids"][0],)).fetchone()[0]
+    return "still_retired" if status == "retired" else "added"
 
 
 def main(argv: list[str] | None = None) -> int:
-    """The hand-retirement CLI. This is the only door out of the query set."""
+    """The hand-retirement CLI: retire a query, or list every row including the retired ones.
+
+    Deliberately smaller than it was. `--retire-generator` and `--generators` were deleted on
+    2026-09-05 along with the functions behind them, and `--unretire` moved onto the `sitting`
+    tool's `watchlist` action, where the destructive direction (`drop`) already lived. An undo
+    reachable only from a CLI nothing advertises is not an undo.
+
+    The bare no-flag listing selects every status, so it stays the one place outside that tool
+    where a retired query is visible without asking for it.
+    """
     from . import schema
 
     ap = argparse.ArgumentParser(description="Frontier standing queries — list and hand-retire")
     ap.add_argument("--retire", metavar="TEXT", help="stop executing this query for good")
-    ap.add_argument("--unretire", metavar="TEXT", help="put a retired query back into execution")
-    ap.add_argument("--list", action="store_true", help="print every query with its state")
-    ap.add_argument("--retire-generator", metavar="GEN",
-                    help="kill a whole channel ('bookmark-reader' | 'sitting:<slug>'); retires "
-                         "only the queries whose last LIVE claimant it was")
-    ap.add_argument("--generators", action="store_true",
-                    help="print every channel with its label, votability and claim count")
     args = ap.parse_args(argv)
 
     conn = schema.connect()
     try:
-        if args.retire_generator:
-            out = retire_generator(conn, args.retire_generator)
-            print(json.dumps({"action": "retire-generator",
-                              "generator": args.retire_generator, **out,
-                              "note": None if out["generator_retired"]
-                              else "no such generator — nothing was registered under that name"},
-                             indent=2))
-            return 0 if out["generator_retired"] else 1
-        if args.generators:
-            print(json.dumps([dict(r) for r in generators(conn)], indent=2, default=str))
-            return 0
-        if args.retire or args.unretire:
-            text = args.retire or args.unretire
-            act = retire_query if args.retire else unretire_query
-            ok = act(conn, text)
-            print(json.dumps({"action": "retire" if args.retire else "unretire",
-                              "text": text, "changed": ok,
+        if args.retire:
+            ok = retire_query(conn, args.retire)
+            print(json.dumps({"action": "retire", "text": args.retire, "changed": ok,
                               "note": None if ok else "no query with that text"}, indent=2))
             return 0 if ok else 1
         rows = conn.execute(

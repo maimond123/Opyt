@@ -40,20 +40,10 @@ def log(msg: str) -> None:
 class SyncAuthError(Exception):
     """A source's credential is dead/expired (e.g. X OAuth refresh token revoked).
 
-    Fatal to the whole source: must never be reported as "caught up / 0 new", and per-item
-    guards re-raise it rather than routing it through ``skip_item``.
+    Fatal to the whole source: must never be reported as "caught up / 0 new". A per-item guard
+    that swallows this reports a dead credential as an empty inbox, which is the failure the
+    class exists to name.
     """
-
-
-def skip_item(source: str, item_id: str, exc: Exception) -> None:
-    """Log a per-item ingest failure and move on, without marking it synced.
-
-    A poison item (malformed payload, render crash) must not abort the loop and starve
-    every item after it; leaving it unsynced means it retries next run. Only for genuine
-    per-item errors — ``SyncAuthError`` propagates instead of routing here.
-    """
-    log(f"  [skip] {source}: item {item_id} failed "
-        f"({type(exc).__name__}: {exc}) — left unsynced for retry")
 
 
 # ── State tracking ────────────────────────────────────────────────────────────

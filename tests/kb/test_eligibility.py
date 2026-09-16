@@ -40,6 +40,18 @@ def _mock_llm(monkeypatch, verdict_json, *, counter=None):
     monkeypatch.setattr(llm_client, "call", fake_call)
 
 
+def test_article_urls_classify_the_site_home_and_share_that_evidence(conn, monkeypatch):
+    calls = []
+    monkeypatch.setattr(eligibility, "_fetch_home_text",
+                        lambda url: calls.append(url) or "A publication by Alice and Bob.")
+    _mock_llm(monkeypatch, '{"authorship":"multi","author_name":null}')
+    # The old cache could contain an article's author under the whole-site key.
+    schema.put_authorship(conn, "team.example", "single", "Alice")
+    assert eligibility.gate(conn, "https://team.example/alice-post", expected_author="Alice").decision == "skip"
+    assert eligibility.gate(conn, "https://team.example/bob-post", expected_author="Bob").decision == "skip"
+    assert calls == ["https://team.example"]
+
+
 # ── the 4-way decision ───────────────────────────────────────────────────────────
 
 def test_single_author_is_eligible_and_cached(conn, monkeypatch):
@@ -49,7 +61,7 @@ def test_single_author_is_eligible_and_cached(conn, monkeypatch):
     d = eligibility.gate(conn, "https://carol.example.com")
     assert d.decision == "ingest"
     # verdict cached under the person-independent bare-host key
-    row = schema.get_authorship(conn, "carol.example.com")
+    row = schema.get_authorship(conn, "https://carol.example.com")
     assert row["authorship"] == "single" and row["author_name"] == "Carol"
 
 
@@ -60,7 +72,7 @@ def test_multi_author_is_skipped_and_no_atom_stored(conn, monkeypatch):
     d = eligibility.gate(conn, "https://anthropic.com")
     assert d.decision == "skip"
     assert schema.count_atoms(conn, "blog") == 0          # the adapter never ran
-    assert schema.get_authorship(conn, "anthropic.com")["authorship"] == "multi"
+    assert schema.get_authorship(conn, "https://anthropic.com")["authorship"] == "multi"
 
 
 def test_llm_failure_degrades_to_needs_review_and_is_not_cached(conn, monkeypatch):
@@ -76,7 +88,7 @@ def test_llm_failure_degrades_to_needs_review_and_is_not_cached(conn, monkeypatc
     d = eligibility.gate(conn, "https://carol.example.com")
     assert d.decision == "needs-review" and d.verdict.authorship == "unknown"
     # transient failure must NOT be cached — a re-run can still succeed
-    assert schema.get_authorship(conn, "carol.example.com") is None
+    assert schema.get_authorship(conn, "https://carol.example.com") is None
 
 
 def test_missing_key_degrades_closed(conn, monkeypatch):
@@ -86,14 +98,14 @@ def test_missing_key_degrades_closed(conn, monkeypatch):
 
     d = eligibility.gate(conn, "https://carol.example.com")
     assert d.decision == "needs-review" and d.verdict.authorship == "unknown"
-    assert schema.get_authorship(conn, "carol.example.com") is None
+    assert schema.get_authorship(conn, "https://carol.example.com") is None
 
 
 def test_fetch_failure_degrades_to_needs_review(conn, monkeypatch):
     _mock_fetch(monkeypatch, text=None)                   # no fetchable home text
     d = eligibility.gate(conn, "https://carol.example.com")
     assert d.decision == "needs-review" and d.verdict.authorship == "unknown"
-    assert schema.get_authorship(conn, "carol.example.com") is None
+    assert schema.get_authorship(conn, "https://carol.example.com") is None
 
 
 def test_single_author_mismatch_is_needs_review(conn, monkeypatch):

@@ -25,7 +25,7 @@ import pytest
 
 from opyt_core import credentials_registry as registry
 from opyt_core import keys as core_keys
-from pipeline import credentials, llm_client
+from pipeline import credentials, llm_client, llm_providers
 
 
 # The exact literals that lived in the five hand-maintained lists, as of the commit before the
@@ -161,7 +161,7 @@ class TestEveryRowReachesEverySurface:
         branch returns `True, "No validation available"`, which reports a DEAD key as fine.
 
         The concrete validators are stubbed, so this asserts routing and touches no network."""
-        monkeypatch.setattr(llm_client, "validate_provider",
+        monkeypatch.setattr(llm_providers, "validate_provider",
                             lambda provider, key: (True, f"routed:{provider}"))
         for name in ("_validate_github", "_validate_s2",
                      "_validate_opyt_service_token"):

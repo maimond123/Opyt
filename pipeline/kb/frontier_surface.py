@@ -27,6 +27,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pipeline.timeparse import utc_iso, utc_now
 
+from . import frontier_sources
+
 # ── Weights ─────────────────────────────────────────────────────────────────────
 # Additive and each bounded, so no term can drive a score to infinity and turn a demotion into a
 # de-facto exclusion.
@@ -104,18 +106,29 @@ def _artifact_key(d: dict) -> tuple | None:
     atom id; the other two mint two atoms, so an atom-id key would leave 5 of the 12 uncollapsed
     while costing a `paper_from_url` parse per row.
 
-    Title + first author + date, all three required. Title alone is not enough (a series of
-    identically-titled weekly reports is real), and a MISSING title returns None rather than
+    Kind + title + first author + date, all four required. Title alone is not enough (a series of
+    identically-titled weekly reports is real), and a MISSING field returns None rather than
     merging every untitled row into one heap — a key that groups on absence is how a collapse
     turns into a silent mass delete.
+
+    KIND is in the key because two kinds are never the same artifact. A `repo` and a `paper` can
+    share a title, a date and an empty author list — `_artifact_key` reads no author for a repo —
+    and merging them drops one of two genuinely different things onto the other's card. Requiring
+    it NON-NULL also keeps the pre-split rows (`kind` is NULL by decision, no backfill — see
+    `schema.init_kb_schema`) unkeyable, so a legacy row is its own card instead of merging with
+    another legacy row on title alone.
     """
+    kind = (d.get("kind") or "").strip().lower()
     title = " ".join((d.get("title") or "").lower().split())
     published = (d.get("published") or "").strip()
-    if not title or not published:
+    if not kind or not title or not published:
         return None
-    authors = d["payload"].get("authors") or []
-    first = str(authors[0] or "").lower().strip() if authors else ""
-    return (title, first, published)
+    # NAME only, never the whole author dict: the arXiv and OpenAlex adapters describe the same
+    # first author with different keys (arXiv has no id), so keying on the dict would stop the two
+    # rows for one preprint collapsing onto one card — which is the whole job of this key.
+    authors = frontier_sources.payload_authors(d["payload"])
+    first = authors[0]["name"].lower().strip() if authors else ""
+    return (kind, title, first, published)
 
 
 def _collapse_duplicates(rows: list[dict]) -> list[dict]:
@@ -324,28 +337,32 @@ def _why(d: dict) -> list[str]:
 
 # ── The event log ───────────────────────────────────────────────────────────────
 def record_event(conn: sqlite3.Connection, candidate_ids, event: str, *,
-                 surface: str | None = None, at: str | None = None) -> int:
+                 at: str | None = None) -> int:
     """APPEND one row per (candidate, event). Never an UPDATE and never an upsert: showing the
-    same candidate twice is two facts, and the second must not overwrite the first."""
+    same candidate twice is two facts, and the second must not overwrite the first.
+
+    A `surface` argument rode down all three of these until 2026-09-06, recording which carrier
+    emitted the row. One caller passed it, always the same constant, and nothing ever read the
+    column — see `schema._drop_candidate_event_surface`."""
     stamp = at or utc_iso()
     ids = [c for c in dict.fromkeys(candidate_ids) if c]
     if not ids:
         return 0
     conn.executemany(
-        "INSERT INTO frontier_candidate_events (candidate_id, event, surface, at) VALUES (?,?,?,?)",
-        [(cid, event, surface, stamp) for cid in ids])
+        "INSERT INTO frontier_candidate_events (candidate_id, event, at) VALUES (?,?,?)",
+        [(cid, event, stamp) for cid in ids])
     conn.commit()
     return len(ids)
 
 
-def record_shown(conn, candidate_ids, *, surface: str | None = None) -> int:
-    return record_event(conn, candidate_ids, "shown", surface=surface)
+def record_shown(conn, candidate_ids) -> int:
+    return record_event(conn, candidate_ids, "shown")
 
 
-def record_dismissed(conn, candidate_ids, *, surface: str | None = None) -> int:
+def record_dismissed(conn, candidate_ids) -> int:
     """The user said stop. Recorded, and the row keeps being returned — demoted below everything
     live and labelled `dismissed`, per constraint 6."""
-    return record_event(conn, candidate_ids, "dismissed", surface=surface)
+    return record_event(conn, candidate_ids, "dismissed")
 
 
 # ── The push notice ─────────────────────────────────────────────────────────────

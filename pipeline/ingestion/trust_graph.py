@@ -3,10 +3,10 @@ pipeline/ingestion/trust_graph.py
 
 `propagate(edges, x_attested)` — the binary trust model. Pure function, no I/O.
 
-Trust is reachability over a directed edge graph rooted at the person's X
-profile. Four rules, evaluated to a fixed point:
+Trust is reachability over a directed edge graph rooted at the person's confirmed
+profile. Five rules, evaluated to a fixed point:
 
-  Rule 1  X-attested → trusted (root). A URL in the person's X bio is trusted outright.
+  Rule 1  Confirmed profile → trusted (root).
 
   Rule 2  Bidirectional with ANY trusted node → trusted. Candidate C links to trusted node T
           and T links back to C (T may be a root or a node trusted earlier this run).
@@ -26,7 +26,6 @@ changes; termination is guaranteed since `trusted` only grows and is bounded by 
 Input contract: `edges` and `x_attested` are already canonicalized
 (`url_canon.canonical_identity`); this module does no URL parsing.
 
-Full rationale for Rule 2's relaxation and Rule 5's identity-edge design:
 """
 
 from __future__ import annotations
@@ -40,15 +39,12 @@ from pipeline.ingestion.trust_types import Edge, TrustEvidence
 IDENTITY_VIA = frozenset({
     "identity_verified",   # platform-verified connection (Substack is_connected_account=true)
     "identity_declared",   # typed self-declared account (userLinks entry, unverified)
-    "x_website",           # the X profile's website field — the person's own site
 })
 
 
 def _edge_dict(index: dict, source: str, target: str) -> dict:
     """Render the (source→target) edge as a plain dict for evidence trails."""
-    e = index.get((source, target))
-    if e is None:
-        return {"source": source, "target": target, "via": "", "found_by": ""}
+    e = index[(source, target)]
     return {"source": e.source, "target": e.target, "via": e.via, "found_by": e.found_by}
 
 
@@ -61,7 +57,7 @@ def propagate(
 
     Args:
         edges:       directed canonical edges (source → target).
-        x_attested:  canonical URLs attested by the X profile = trust roots.
+        x_attested:  canonical confirmed profiles = trust roots.
         candidates:  discovered sources to evaluate even if no edge touches them,
                      so a source nobody links still gets a "no corroboration"
                      verdict from here rather than a caller-side fallback.
@@ -79,6 +75,7 @@ def propagate(
     index: dict[tuple, Edge] = {}                   # (source, target) → Edge
     nodes: set[str] = set(x_attested) | set(candidates or ())
 
+    priority = {"identity_verified": 2, "identity_declared": 1}
     for e in edges:
         if e.source == e.target:
             # Self-loops carry no trust signal; keep the node, drop the edge.
@@ -86,7 +83,12 @@ def propagate(
             continue
         out[e.source].add(e.target)
         inc[e.target].add(e.source)
-        index.setdefault((e.source, e.target), e)
+        key = (e.source, e.target)
+        # The graph owns duplicate evidence. Typed declarations outrank ordinary links.
+        previous = index.get(key)
+        if previous is None or (priority.get(e.via, 0), e.via, e.found_by) > (
+                priority.get(previous.via, 0), previous.via, previous.found_by):
+            index[key] = e
         nodes.add(e.source)
         nodes.add(e.target)
 
@@ -96,9 +98,9 @@ def propagate(
     # Rule 1 — roots.
     for r in x_attested:
         trusted.add(r)
-        result[r] = TrustEvidence(trusted=True, reasons=["X-attested (root)"], edges=[])
+        result[r] = TrustEvidence(trusted=True, reasons=["Confirmed root"], edges=[])
 
-    # Rules 2 & 3 to a fixed point.
+    # Rules 2, 3 and 5 to a fixed point.
     changed = True
     while changed:
         changed = False
@@ -111,8 +113,7 @@ def propagate(
             # string. Sorted for a deterministic source.
             id_src = next(
                 (t for t in sorted(inc[c])
-                 if t in trusted and t != c
-                 and index.get((t, c)) is not None
+                 if t in trusted
                  and index[(t, c)].via in IDENTITY_VIA),
                 None,
             )
@@ -166,10 +167,8 @@ def propagate(
                 f"Near miss — linked by 1 trusted source ({trusted_pointers[0]}); "
                 f"needs a 2nd trusted link (Rule 3) or a link back (Rule 2)"
             ]
-        elif len(trusted_pointers) == 0:
+        else:
             reasons = ["No trusted source links this — discovered independently, no corroboration"]
-        else:  # ≥2 would have graduated; defensive only
-            reasons = [f"{len(trusted_pointers)} trusted links present but did not graduate"]
         result[c] = TrustEvidence(trusted=False, reasons=reasons, edges=ev_edges)
 
     return result

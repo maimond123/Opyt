@@ -92,7 +92,7 @@ def latency_distribution(since: dict | None = None) -> dict[str, dict]:
 def upstream_distribution(since: dict | None = None) -> dict[str, dict]:
     """Per-UPSTREAM per-CALL latency — who actually served this run's calls, and how fast.
 
-    The audit trail for `provider.sort: "throughput"`: the chosen upstream legitimately changes
+    The audit trail for `provider.sort` (latency-ranked): the chosen upstream legitimately changes
     between runs, so a routing regression has no other symptom. A concentration on one upstream is
     the healthy shape; a denied upstream appearing at all, or an `"unknown"` bucket, is the alarm.
 

@@ -37,7 +37,8 @@ def register_sitting_tools(mcp) -> None:
                 sitting_id: str | None = None, atom_ids: list[str] | None = None,
                 floor: float | None = None, budget_tokens: int | None = None,
                 lens: str | None = None, claim: str | None = None,
-                add: list[str] | None = None, drop: list[str] | None = None) -> dict:
+                add: list[str] | None = None, drop: list[str] | None = None,
+                unretire: list[str] | None = None, show: str | None = None) -> dict:
         """Read one topic of the user's knowledge base end to end, in publication order — as
         standing research queries, a briefing, a trajectory, or a search for what contradicts or
         is missing from it.
@@ -91,9 +92,27 @@ def register_sitting_tools(mcp) -> None:
             SHOW THIS ONLY WHEN ASKED — "what am I watching", "show my watchlist", "did anything
             change". Never volunteer it at the start of a session or alongside unrelated work.
             `add` puts questions the user names onto the list; those never decay and are removed
-            only by `drop`. `drop` retires a question EVERYWHERE — a question two regions both
+            only by `drop`.
+            ⚠️ A WATCH IS A COMMITMENT, NOT A TRANSCRIPTION. It runs forever, in the user's
+            name, in exactly the words it was added with — so the wording is the user's
+            decision: PROPOSE the query text, let them correct or reject it, and add only what
+            they confirmed. Never turn a list of interests into a watch per phrase; when they
+            name more than two or three, distill first — web-search the landscape, offer the
+            threads you find, and watch the picks.
+            ⚠️ AND WATCHES ARE NOT A FIRST MOVE. A user naming their interests — during
+            onboarding, or over a store with nothing in it — is not asking for watches: fill
+            the store first (web-search the landscape, show the strong finds, save what they
+            pick) and raise watches later, once there is material they have actually read.
+            An add starts its first pull in the BACKGROUND. Do not wait for it or poll: the
+            call returns immediately, and what the pull finds surfaces on a later search or
+            via `frontier` when the user asks. `drop` retires a question EVERYWHERE — a question two regions both
             watch is retired for both, because the list is one list of questions, not a copy per
             region. Say so before dropping something the user did not name precisely.
+            A dropped question is NOT on the list any more and re-`add`ing it does not restart it:
+            the result says `still_retired` instead of `added`. `unretire` is what restarts one,
+            and `show='retired'` is how you find its exact text. When the user asks to bring back
+            something they dropped, pass `show='retired'` first and unretire the text you get
+            back verbatim — the match is on the text, so a paraphrase finds nothing.
 
           • `lens` (SPENDS only on material never lensed before) — hand back an `instruction` plus
             a `document`, and read them YOURSELF, right here in this conversation, to answer the
@@ -146,6 +165,10 @@ def register_sitting_tools(mcp) -> None:
 
         A region is read once per lens (by `read`). A second `read` of the same `sitting_id` with
         the SAME lens is refused as already read — it would be the same input for the same money.
+        It is a guard on SUCCESS, so a read that FAILED is not refused: call it again with the
+        same `sitting_id` and `lens` and it retries. That is the only way to retry a `claims`
+        read that reached the model and came back unusable, because the automatic pass that pays
+        down missing claims skips exactly those (a deterministic failure repeats).
         The two `read` lenses do not share this guard: a region read for `queries` can still be
         read for `claims`, and the reverse. A region is re-read (same lens) when it has GAINED
         enough new material to be worth redoing, and the rail decides that on its own; to force it,
@@ -179,6 +202,12 @@ def register_sitting_tools(mcp) -> None:
             add: for `watchlist` only — questions to start watching, in the user's own words.
             drop: for `watchlist` only — questions to stop watching, matched on their text.
                 Retires them for every region, not just this one.
+            unretire: for `watchlist` only — questions to start running again, matched on their
+                exact text. The inverse of `drop`, and the only way back: re-`add`ing a dropped
+                question does not restart it. Get the exact text from `show='retired'`.
+            show: for `watchlist` only — pass "retired" to add a `retired` list of the questions
+                the user has dropped. Omit it and the response is unchanged; the list is hidden by
+                default because it only ever grows.
 
         Returns a dict whose `status` is one of "preview", "ok" (a read or lens landed), "skipped"
         (with a `reason` — most often already read), "failed", or "error". A "skipped" or "failed"
@@ -208,14 +237,15 @@ def register_sitting_tools(mcp) -> None:
 
             if action == "watchlist":
                 return _watchlist(conn, sitting_id=sitting_id, query=query,
-                                  add=add, drop=drop)
+                                  add=add, drop=drop, unretire=unretire, show=show)
 
             if action == "lens":
                 return _lens(conn, sb, lens=lens, sitting_id=sitting_id, claim=claim, query=query,
                             atom_ids=atom_ids, floor=floor, budget_tokens=budget_tokens)
 
             if action == "read" and sitting_id:
-                return {**_read(conn, sitting_id, lens=lens), **_dispose(conn)}
+                read = _read(conn, sitting_id, lens=lens)
+                return {**read, **(_dispose(conn) if read.get("status") != "error" else {})}
 
             if not (query or atom_ids):
                 return {"status": "error",
@@ -234,8 +264,9 @@ def register_sitting_tools(mcp) -> None:
             if action == "preview":
                 return {"status": "preview", **report, **_dispose(conn)}
             # `read` with a fresh phrase: the region was just built above, so this reads THAT.
-            return {**_read(conn, built["sitting_id"], lens=lens), "scope": report,
-                    **_dispose(conn)}
+            read = _read(conn, built["sitting_id"], lens=lens)
+            return {**read, "scope": report,
+                    **(_dispose(conn) if read.get("status") != "error" else {})}
         finally:
             conn.close()
 
@@ -270,7 +301,7 @@ def _lens(conn, sb, *, lens, sitting_id, claim, query, atom_ids, floor, budget_t
 
     ⚠️ THIS SPENDS, on cache misses only. `sitting_lenses.read_lens` is MAP-REDUCE since
     2026-08-24: one model call per part that has never been mapped under this lens, and nothing at
-    all for a part that has. A closed part is frozen, so it is mapped once per lens EVER and steady
+    all for a part that has, unless atom removal invalidated its cached output. Steady
     state on any region is one call for the open tail. `sprouts` still calls nothing — it has no
     chain and no part to cache against. The REDUCE is always free: the host reading this tool's
     result is the only reader the joined document ever gets.
@@ -303,28 +334,35 @@ def _lens(conn, sb, *, lens, sitting_id, claim, query, atom_ids, floor, budget_t
 
 
 def _dispose(conn) -> dict:
-    """Fire the read-queue scheduler NOW if it has work, and surface its health only when it is bad.
+    """Make the read-queue scheduler due NOW if it has work, and surface its health only when bad.
 
-    Not redundant with the session-open spawner: that one coalesces hourly, which would suppress
-    the spawn right when it matters most (someone just pointed at a region). This only changes WHEN
-    the read happens, never whether — the scheduler drains pointed regions unattended regardless.
-    Silent on the happy path so a fresh spawn doesn't read as "the scheduler has never run."
+    Not redundant with the rail's own hourly cadence: that would leave a just-pointed-at region
+    unread for up to an hour, which is exactly when it matters least to wait. This only changes
+    WHEN the read happens, never whether — the scheduler drains pointed regions unattended
+    regardless. Silent on the happy path so a fresh request doesn't read as "the scheduler has
+    never run."
+
+    The claim is written by `read_lens` before this runs, so the queued job can never be claimed
+    ahead of the work that justifies it.
     """
     try:
         from pipeline.kb import sitting_scheduler as sch
+        from pipeline.kb.rail_jobs import request_now
         h = sch.health(conn)
-        # A tripped breaker means the child would exit without reading, so do not fork one.
-        spawned = bool(h["claims_waiting"] and not h["breaker_open"]
-                       and sch.spawn_sitting_scheduler(force=True))
-        return {"scheduler": h} if (h["needs_attention"] and not spawned) else {}
+        # A tripped breaker means the child would exit without reading, so do not queue one. This
+        # is an optimisation, not the only guard: the child honours the breaker itself (S3), and
+        # the worker's registry command carries no override for a request to smuggle through.
+        queued = bool(h["claims_waiting"] and not h["breaker_open"]
+                      and request_now("sitting_scheduler"))
+        return {"scheduler": h} if (h["needs_attention"] and not queued) else {}
     except Exception:
         # FAIL-SAFE: a scheduling hiccup never breaks a tool call. The read the caller asked for has
         # already happened by the time this runs.
         return {}
 
 
-def _watchlist(conn, *, sitting_id, query, add, drop) -> dict:
-    """The watchlist surface: list, add, drop. Calls no model and grows no region.
+def _watchlist(conn, *, sitting_id, query, add, drop, unretire, show) -> dict:
+    """The watchlist surface: list, add, drop, unretire. Calls no model and grows no region.
 
     PULL-ONLY (AMENDED 2026-08-25, David). This is reachable when the user asks for it and inside
     the result of a read they themselves triggered — never pushed at session open. Standing queries
@@ -335,8 +373,23 @@ def _watchlist(conn, *, sitting_id, query, add, drop) -> dict:
     Scoping to a region resolves the region WITHOUT building one: an existing `sitting_id` names it,
     a phrase names it only if a region for that phrase already exists. A watchlist request must not
     quietly buy an embedding and mint a new region as a side effect of asking what is being watched.
+
+    `unretire` moved here from the `frontier_queries` CLI on 2026-09-05 because `drop` lives here.
+    The destructive direction was on the tool surface and the undo was behind a flag nothing
+    advertises, which is not an undo. It is the exact inverse of `drop` and reads the same way.
+
+    `show='retired'` is the only way to SEE a retired question, and `unretire` is unusable without
+    it — otherwise you must recall the exact text of something you dropped weeks ago. It is gated
+    rather than always-on so the default response never grows: the retired set only accumulates,
+    and a block that rides every call would keep getting longer forever. Gating costs nothing here
+    that it would cost on a CLI, because the parameter sits in the tool schema the caller reads on
+    every call.
     """
     from pipeline.kb import frontier_queries as fq, sitting_reader as sr, sitting_store as sst
+
+    if show is not None and show != "retired":
+        return {"status": "error",
+                "reason": f"show takes 'retired' — the only hidden bucket (got {show!r})"}
 
     gen, scope = None, "everything"
     if sitting_id:
@@ -346,28 +399,197 @@ def _watchlist(conn, *, sitting_id, query, add, drop) -> dict:
         gen, scope = sr.generator_for(s["seed_ref"]), s["seed_ref"]
     elif query:
         gen, scope = sr.generator_for(query), query
-        if not fq.active_queries(conn, generator=gen):
+        # Retired rows count as "this region exists". A region whose questions have ALL been
+        # dropped is exactly the one you ask `show='retired'` or `unretire` about, and testing
+        # only the active list would refuse the request that needs answering most.
+        if not (fq.active_queries(conn, generator=gen) or fq.retired_texts(conn, generator=gen)):
             return {"status": "error",
                     "reason": f"nothing is being watched for {scope!r} — read that region first "
                               f"(action='read'), or ask for the whole watchlist with no query"}
 
-    added = [t for t in (add or []) if fq.add_user_query(conn, t)]
+    outcomes = [(t, fq.add_user_query(conn, t)) for t in (add or [])]
+    added = [t for t, o in outcomes if o == "added"]
+    still_retired = [t for t, o in outcomes if o == "still_retired"]
     dropped = [t for t in (drop or []) if fq.retire_query(conn, t)]
-    missed = [t for t in (drop or []) if t not in dropped]
+    unretired = [t for t in (unretire or []) if fq.unretire_query(conn, t)]
+    missed = ([t for t in (drop or []) if t not in dropped]
+              + [t for t in (unretire or []) if t not in unretired])
+
+    if added:
+        # The adds must be ON DISK before the pull thread opens its own connection.
+        conn.commit()
+        _schedule_the_repeat()
+    first_pull = _first_pull_background(added) if added else None
 
     out = {"status": "ok", "scope": scope, "watching": fq.watchlist(conn, generator=gen)}
     if added:
         out["added"] = added
         out["added_note"] = ("these run until you drop them — nothing retires a question you "
                              "added yourself")
+    if first_pull:
+        out["first_pull"] = first_pull
+    if added and _store_is_empty(conn):
+        # The one fact the host cannot see from this response alone, at the moment it is most
+        # likely to close the conversation on a success that is not one: six watches and an
+        # empty store is a user with nothing to do next. Measured, not judged — atoms == 0.
+        out["store_note"] = (
+            "the store itself holds no material yet — a watch stages candidates (an inbox), "
+            "it does not fill the library. End your reply with the user's next steps: the "
+            "content routes (connect X or Substack, name people to follow, or web-search "
+            "their topics and offer the finds to save).")
+    if still_retired:
+        # SHOW DECIDED, DON'T HIDE, on the one path that used to lie. `upsert_queries` never
+        # writes `status`, so re-adding a hand-retired question leaves it retired — correct, since
+        # a machine re-emission must not undo a human retirement, but the user re-typing it was
+        # told `added` and shown an empty watchlist in the same response.
+        out["still_retired"] = still_retired
+        out["still_retired_note"] = (
+            "you retired this before, so re-adding it does not restart it — nothing automatic may "
+            "undo a retirement. pass unretire=[...] with this exact text to put it back")
     if dropped:
         out["dropped"] = dropped
         out["dropped_note"] = "retired everywhere, not only for this region"
+    if unretired:
+        out["unretired"] = unretired
+        out["unretired_note"] = "running again everywhere, not only for this region"
     if missed:
-        # SHOW DECIDED, DON'T HIDE: a drop that matched nothing is a fact the user needs, not a
-        # silent no-op that reads as success.
+        # SHOW DECIDED, DON'T HIDE: a drop or unretire that matched nothing is a fact the user
+        # needs, not a silent no-op that reads as success.
         out["not_found"] = missed
+    if show == "retired":
+        out["retired"] = fq.retired_texts(conn, generator=gen)
+        if out["retired"]:
+            out["retired_note"] = ("not running — you retired these by hand. pass unretire=[...] "
+                                   "with the exact text to put one back")
     return out
+
+
+def _store_is_empty(conn) -> bool:
+    """Zero atoms, read on the caller's own connection. False on a broken read — "your store
+    is empty" is a claim about the user's data, and a read error must never be what makes it."""
+    try:
+        return conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
+    except Exception:
+        return False
+
+
+def _spawn(target) -> None:
+    """Start `target` on a daemon thread. An indirection with exactly one job: tests replace it
+    with a synchronous call, because a real thread outliving a test's monkeypatching would hit
+    the actual network after the stub is gone."""
+    import threading
+    threading.Thread(target=target, name="opyt-first-pull", daemon=True).start()
+
+
+def _schedule_the_repeat() -> bool:
+    """Make sure the rail that RE-runs standing queries has a durable row. True iff it does.
+
+    ⚠️ FOUND BY THE 2026-09-16 RAIL AUDIT, and it is the same shape as the two the handoff names:
+    the event that STARTS a pull was not the event that scheduled its repeat. Measured on a clean
+    home — `sitting(action='watchlist', add=[...])` wrote the standing query, ran `_first_pull_
+    background` once, and left `rail_jobs.db` EMPTY. `frontier_execute`'s only other producer is a
+    sitting READ that added queries (`sitting_scheduler`), and a hand-added watch goes through
+    neither `_dispose` nor a read — so a user who adds watches and never reads a region got one
+    pull, ever, and a watchlist that looked exactly like one finding nothing new.
+
+    `request_in`, not `request_now`: the first pull is walking these exact pairs on a thread right
+    now and `frontier_execute` has no single-flight lock, so a due-now child would duplicate its
+    requests. One cadence out, those pairs are stamped and no longer due. `activate` keeps
+    `MIN(due_at)`, so this cannot postpone a row some other producer already made due.
+
+    HERE AND NOT INSIDE `_first_pull_background`: that function is fail-safe and returns None when
+    the spawn fails — the case where the repeat matters MOST. The schedule must not be a passenger
+    on the pull.
+
+    Fail-safe: a failed queue means the questions run when something else makes the rail due,
+    which is the old behaviour, not a worse one.
+    """
+    # The rail's own cadence (`rail_worker.RAILS['frontier_execute']`, hourly). Not imported:
+    # `rail_worker` imports `rail_jobs`, and the MCP side must not pull the worker in to name a
+    # number. A drift here costs one delayed first repeat, never a lost one.
+    try:
+        from pipeline.kb.rail_jobs import request_in
+        return request_in("frontier_execute", 3600.0)
+    except Exception:
+        return False
+
+
+def _first_pull_background(added: list[str]) -> dict | None:
+    """Start the just-added standing queries' first pull in the BACKGROUND, and say so.
+
+    ⚠️ BLOCK ON DECISIONS, NEVER ON MACHINE WORK (RULED 2026-09-12, David). The first cut of
+    this ran the pull in the foreground, sized for one watch (three requests). Then a live user
+    added ten topics in one call: 30 paced HTTP pulls, five minutes of spinner in the middle of
+    onboarding. The pull is machine work, so no human waits on it — the add returns immediately
+    and the thread runs behind the conversation. Same-turn delivery becomes same-SESSION
+    delivery: stage 2 stages candidates mid-session and `search`'s frontier notice was built to
+    trip mid-session, so the finds surface while the user is playing with the store anyway.
+
+    THE THREAD OPENS ITS OWN CONNECTION (`conn=None`): SQLite connections are not shared across
+    threads, and the caller's is mid-request. The caller commits the adds before spawning so
+    the new rows are on disk when this connection opens.
+
+    WHAT IT SPENDS: nothing in this call. Stage 2 is API pulls only (arXiv, GitHub, OpenAlex —
+    keyless or Opyt-owned budgets) and stages candidates. It does make the ADMIT rail — which
+    fetches and embeds — due, since 2026-09-16: `run_frontier_execute` owns that chaining now, so
+    this door gets it like the worker's does. It used to sit in `frontier_execute.main()`, which
+    this path never enters, and the first pull's candidates therefore sat in `frontier_candidates`
+    as `new` with nothing queued to admit them until the whole chain happened to cycle. That is
+    still the worker spending on its own schedule, not this call spending — the row only says
+    "there is work".
+
+    SCOPED to the added texts via the deterministic id (`query_id_for(normalize(text))`), so an
+    add on an established store never piggybacks every other due pair.
+
+    FAIL-SAFE, in layers: `run_frontier_execute` never raises; the thread body swallows
+    anything above it; a spawn failure returns None and the add still succeeded; and a pull
+    that dies with the process is recovered by the scheduled rail, which sees the same pairs
+    as ordinary never-pulled ones. Nothing here can lose work or break the add.
+    """
+    try:
+        from pipeline.kb import frontier_queries as fq
+        ids = {fq.query_id_for(fq.normalize(t)) for t in added}
+
+        def pull():
+            try:
+                from pipeline.kb import frontier_execute as fe
+                fe.run_frontier_execute(query_ids=ids)
+            except Exception:
+                pass
+
+        _spawn(pull)
+        return {"status": "running",
+                "note": ("the first pull is running in the background against arXiv, GitHub "
+                         "and OpenAlex — do NOT wait for it or poll; carry on, and what it "
+                         "finds surfaces on a later search or via `frontier` when the user "
+                         "asks")}
+    except Exception:
+        return None
+
+
+def _say_why_if_blocked(res: dict) -> dict:
+    """A sitting read that FAILED, plus the reason when the reason is the model provider.
+
+    Both lenses already degrade correctly and in their own words — `sitting_reader._fail` and
+    `sitting_claims._fail` record an unread sitting so the ledger keeps asking for it, and return
+    `{"status": "failed", "reason": ...}`. The reason is a transport sentence ("provider rejected
+    the prompt (HTTP 402)"), which tells a reader what happened and nothing about what to do.
+
+    ⚠️ IT ATTACHES HERE AND NOT IN `_fail`. Those functions run under the scheduler with nobody
+    watching, and what they return is written to a run record; host-instruction prose belongs on
+    the answer a person is reading, not in a stored `reason` column. This is that answer.
+
+    Mutates and returns the same dict so both lenses pass through one door. Fail-safe: a failure
+    to explain a failure must not replace it with a different one.
+    """
+    try:
+        if res.get("status") == "failed":
+            from pipeline.kb.allowance_notice import allowance_notice
+            if (blocked := allowance_notice()) is not None:
+                res["model_provider"] = blocked
+    except Exception:
+        pass
+    return res
 
 
 def _read(conn, sitting_id: str, *, lens: str | None = None) -> dict:
@@ -389,7 +611,7 @@ def _read(conn, sitting_id: str, *, lens: str | None = None) -> dict:
     lens = lens or "queries"
     from pipeline.kb import sitting_claims as scl
     if lens == "claims":
-        return scl.read_claims(conn, sitting_id)
+        return _say_why_if_blocked(scl.read_claims(conn, sitting_id))
     if lens != "queries":
         from pipeline.kb import sitting_lenses as sl
         return {"status": "error",
@@ -398,7 +620,7 @@ def _read(conn, sitting_id: str, *, lens: str | None = None) -> dict:
                          f"the `lens` action instead (spends only on never-mapped material)"}
     # The same ritual the scheduler runs, from the one place it is spelled: a tool-initiated read
     # closes a part exactly as a scheduled one does.
-    res = scl.read_part(conn, sitting_id)
+    res = _say_why_if_blocked(scl.read_part(conn, sitting_id))
     if res.get("status") == "ok":
         # PULL-ONLY, and this is one of its two doors: a read the USER triggered ends at a natural
         # decision point, so the diff and the list it changed are shown here and nowhere else. The

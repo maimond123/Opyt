@@ -145,7 +145,7 @@ def enrich_markdown_images(md: str, cache: dict, *, context: str = "", base_url:
 
 def _photos(norm: dict) -> list[dict]:
     """The still-image media items of a normalized tweet (photos only — video frames aren't described
-    in v1). Reads the twitterapi.io shape `extendedEntities.media` x_graphql._normalize maps to."""
+    in v1). Reads `extendedEntities.media`, the normalized shape `x_graphql_core.normalize` emits."""
     media = (norm.get("extendedEntities") or {}).get("media") or norm.get("media") or []
     return [m for m in media if isinstance(m, dict) and m.get("type") == "photo"]
 
@@ -239,6 +239,30 @@ def _iter_node_photos(norm: dict):
             url = m.get("media_url_https") or m.get("url", "")
             if url:
                 yield url, ctx
+
+
+def _photos_pending(norm: dict, cache: dict) -> bool:
+    """Does this tweet still carry a photo nobody has described?
+
+    The third term of `ingest_x`'s skip gate, and the reason deferring VLM to Enrichment is safe.
+    Without it the gate is `atom in seen and tid in convo_checked` — and Enrichment's very first
+    run makes both true (`_ConvoFetcher.chain` adds the tid on ANY successful read, an empty chain
+    included), so the photo of a bookmark written bare would never be read again. Silent, and on
+    David's store it would hit all 258 photo-bearing bookmarks.
+
+    Walks through `_iter_node_photos` rather than re-deriving the walk: it covers the SAME two
+    levels the renderer does (`norm` plus `norm["quoted_tweet"]`) with the same
+    `media_url_https or url` fallback. A pending check that walked fewer levels than the render
+    would leave the missed image to a silent inline read inside a producer thread.
+
+    PRESENCE IS NOT A HIT — `ocr_cascade.from_cache` returns None for a legacy bare-string entry,
+    and every caller in this file treats that as a miss. A failed read is deliberately never cached
+    (the poison-value rule in `_cascade_node_photos`), so a photo stays pending until it succeeds:
+    self-healing by construction, at the cost of retrying a permanently dead image URL."""
+    from pipeline import ocr_cascade
+
+    return any(url not in cache or ocr_cascade.from_cache(cache[url]) is None
+               for url, _ctx in _iter_node_photos(norm))
 
 
 def prefetch_group_media(groups: list, cache: dict, *, workers: int,

@@ -1,10 +1,16 @@
-"""OpenRouter upstream routing — deny what is broken, then rank what is left by throughput.
+"""OpenRouter upstream routing — deny what is broken, then rank what is left by latency.
 
 The two halves do different jobs and BOTH are needed. `ignore` is a snapshot we maintain by hand;
 `sort` is a policy OpenRouter re-evaluates live. Proof that the deny-list alone is insufficient
 (2026-07-31, 6 calls per arm, interleaved): banning DeepInfra moved the tail to AkashML (p50 2.28 s,
-max 10.49 s) while `sort: "throughput"` collapsed it outright (p50 0.79 s, max 1.20 s). Slowness was
+max 10.49 s) while a speed sort collapsed it outright (p50 0.79 s, max 1.20 s). Slowness was
 never a property of one provider — it was a property of not selecting on speed at all.
+
+WHICH speed sort changed on 2026-09-15, when the classify roles moved to gpt-oss-120b:
+re-measured three arms x 6 calls on content_quality-size payloads, sort:"latency" (p50 1.45 s,
+spread 1.4x, ~half throughput's cost) beat sort:"throughput" (p50 1.19 s, spread 13.7x) on
+cost-consistency and sort:"price" (p50 14.60 s) outright. See
+docs/plans/2026-09-15-cheaper-classify-models-and-latency-sort.md.
 
 Two rules the tests below pin, because both fail SILENTLY:
   - the sort must yield to a caller's explicit `order` (embed's Nebius-over-SiliconFlow preference
@@ -54,10 +60,14 @@ from pipeline import llm_client
 def cold_routing_cache():
     """The routing policy is memoized per process (it sits in the hot path of every call). Without a
     reset, whichever test ran first would pin the value for the rest of the file and the
-    settings-override tests would pass or fail depending on collection order."""
-    core_config._reset_routing_cache_for_tests()
+    settings-override tests would pass or fail depending on collection order.
+
+    Clearing the module global directly, rather than through a production reset helper: a seam
+    that exists only for a test is production code paying for the test layer's isolation, and
+    this file is the only thing that ever needed it."""
+    core_config._routing_cache = None
     yield
-    core_config._reset_routing_cache_for_tests()
+    core_config._routing_cache = None
 
 
 class _PassthroughBreaker:
@@ -129,25 +139,25 @@ def test_merge_does_not_mutate_callers_dict():
     assert base == {"require_parameters": True}, "caller's dict must be left alone"
 
 
-# ── the throughput sort ──────────────────────────────────────────────────────────
+# ── the sort policy ──────────────────────────────────────────────────────────────
 
 
-def test_sort_defaults_to_throughput():
-    """Default routing picks the CHEAPEST upstream, which is what produced the tail. The deny-list
+def test_sort_defaults_to_latency():
+    """Unsorted routing picks the CHEAPEST upstream, which is what produced the tail. The deny-list
     alone does not fix it — banning DeepInfra just relocated the tail to AkashML (10.49 s max)."""
-    assert core_config.merge_provider_routing({})["sort"] == "throughput"
+    assert core_config.merge_provider_routing({})["sort"] == "latency"
 
 
 def test_sort_yields_to_an_explicit_order():
     """THE Fork-1 guard. An `order` from the call site states a preference the sort cannot see:
-    embed's order picks Nebius over SiliconFlow for full precision, and a throughput ranking would
+    embed's order picks Nebius over SiliconFlow for full precision, and a speed ranking would
     happily choose the fp8 upstream — writing quantized vectors into a full-precision index, which
     degrades similarity with no error raised anywhere."""
     out = core_config.merge_provider_routing({"order": ["Nebius", "SiliconFlow"]})
-    assert "sort" not in out, "throughput sort overrode an explicit precision preference"
+    assert "sort" not in out, "sort overrode an explicit precision preference"
     assert out["order"] == ["Nebius", "SiliconFlow"]
     # An EMPTY order is not a preference — it must not suppress the sort.
-    assert core_config.merge_provider_routing({"order": []})["sort"] == "throughput"
+    assert core_config.merge_provider_routing({"order": []})["sort"] == "latency"
 
 
 def test_sort_does_not_clobber_require_parameters_or_ignore():
@@ -156,21 +166,21 @@ def test_sort_does_not_clobber_require_parameters_or_ignore():
     out = core_config.merge_provider_routing({"require_parameters": True, "ignore": ["SomeOther"]})
     assert out["require_parameters"] is True
     assert out["ignore"] == ["SomeOther", "DeepInfra", "Cloudflare"]
-    assert out["sort"] == "throughput"
+    assert out["sort"] == "latency"
 
 
 def test_caller_sort_wins():
     """A call site that names its own policy keeps it — the default is a default, not an override."""
-    assert core_config.merge_provider_routing({"sort": "latency"})["sort"] == "latency"
+    assert core_config.merge_provider_routing({"sort": "throughput"})["sort"] == "throughput"
 
 
 def test_sort_survives_a_disabled_denylist(monkeypatch):
     """The two knobs are independent. The original merge returned early when the deny-list was
     empty — which would have skipped the sort entirely for anyone who turned the deny-list off."""
     monkeypatch.setattr(core_config, "settings", lambda: {"openrouter": {"deny_upstreams": []}})
-    core_config._reset_routing_cache_for_tests()
+    core_config._routing_cache = None
     out = core_config.merge_provider_routing({})
-    assert out == {"sort": "throughput"}
+    assert out == {"sort": "latency"}
 
 
 # ── resolution: overrides, memoization, fail-safe ────────────────────────────────
@@ -184,7 +194,7 @@ def test_settings_can_override_and_disable(monkeypatch):
     monkeypatch.setattr(core_config, "settings", lambda: {"openrouter": {"deny_upstreams": []}})
     # The resolution is memoized per process, so a mid-test config change must invalidate it. This
     # is the intended contract, not a workaround: at runtime config is read once at startup.
-    core_config._reset_routing_cache_for_tests()
+    core_config._routing_cache = None
     assert core_config.openrouter_deny_upstreams() == []
     assert "ignore" not in core_config.merge_provider_routing({})
 
@@ -201,7 +211,7 @@ def test_resolution_is_memoized(monkeypatch):
         return {}
 
     monkeypatch.setattr(core_config, "settings", counting_settings)
-    core_config._reset_routing_cache_for_tests()
+    core_config._routing_cache = None
     for _ in range(25):
         core_config.merge_provider_routing({"require_parameters": True})
     assert calls["n"] == 1, f"settings.yaml re-read {calls['n']}x — the memo is not holding"
@@ -215,7 +225,7 @@ def test_unreadable_config_keeps_the_guard(monkeypatch):
         raise OSError("no config")
     monkeypatch.setattr(core_config, "settings", boom)
     assert "DeepInfra" in core_config.openrouter_deny_upstreams()
-    assert core_config.merge_provider_routing({})["sort"] == "throughput"
+    assert core_config.merge_provider_routing({})["sort"] == "latency"
 
 
 # ── surface 1: chat completions (llm_client) ─────────────────────────────────────
@@ -229,7 +239,7 @@ def test_chat_request_routes_on_deny_and_sort(captured_chat):
     llm_client.call("vision", system="", user="hi")
     prefs = captured_chat["body"]["provider"]
     assert prefs["ignore"] == ["DeepInfra", "Cloudflare"]
-    assert prefs["sort"] == "throughput"
+    assert prefs["sort"] == "latency"
 
 
 def test_json_mode_require_parameters_survives(captured_chat):
@@ -240,7 +250,7 @@ def test_json_mode_require_parameters_survives(captured_chat):
     prefs = captured_chat["body"]["provider"]
     assert prefs["require_parameters"] is True, "JSON-mode guarantee was clobbered by routing"
     assert "DeepInfra" in prefs["ignore"]
-    assert prefs["sort"] == "throughput"
+    assert prefs["sort"] == "latency"
     assert captured_chat["body"]["response_format"] == {"type": "json_object"}
 
 
@@ -280,10 +290,10 @@ def test_embed_request_denies_deepinfra(monkeypatch):
     assert "DeepInfra" in prefs["ignore"], "embeddings could still fall back to DeepInfra"
     assert prefs["order"] == ["Nebius", "SiliconFlow"], "order preference must survive the merge"
     assert prefs["allow_fallbacks"] is True
-    # The Fork-1 rule, asserted on the real surface it protects: a throughput sort here could pick
+    # The Fork-1 rule, asserted on the real surface it protects: a speed sort here could pick
     # SiliconFlow (fp8, 4x price) over Nebius while Nebius is healthy, quietly mixing quantized
     # vectors into a full-precision index.
-    assert "sort" not in prefs, "throughput sort leaked onto the embedding surface"
+    assert "sort" not in prefs, "sort leaked onto the embedding surface"
 
 
 def test_embed_denylist_survives_a_settings_override(monkeypatch):

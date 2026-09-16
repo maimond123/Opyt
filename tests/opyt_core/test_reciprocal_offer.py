@@ -18,6 +18,7 @@ import pytest
 import mcp_server.atoms_tools as atoms_tools
 from opyt_core import kb_remote
 from pipeline.kb import peers
+from tests.conftest import reset_atoms_session
 from tests.opyt_core.conftest import PEER
 
 
@@ -30,7 +31,7 @@ def _tools(mcp_stub):
 def tools(remote, emb, monkeypatch):
     """The three atom tools, over the real served peer, with the session counters reset."""
     monkeypatch.setattr(kb_remote, "embedder_from_meta", lambda meta, **kw: emb)
-    atoms_tools._reset_session()
+    reset_atoms_session()
 
     class _Fake:
         got: dict = {}
@@ -70,7 +71,7 @@ def test_it_survives_a_new_session(tools):
     a client — R2 says once, never repeated, and "once per session" is not once."""
     assert _offers(tools.search("agent framework", kb=PEER))
 
-    atoms_tools._reset_session()
+    reset_atoms_session()
     assert _offers(tools.search("agent framework", kb=PEER)) == []
 
 

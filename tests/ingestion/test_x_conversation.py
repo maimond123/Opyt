@@ -7,7 +7,7 @@ from pipeline.ingestion import x_graphql_core as core
 
 
 def _raw(tid, author_id, screen, text):
-    """A minimal raw X tweet `result` that x_graphql._normalize can parse."""
+    """A minimal raw X tweet `result` that x_graphql_core.normalize can parse."""
     return {
         "rest_id": tid,
         "core": {"user_results": {"result": {

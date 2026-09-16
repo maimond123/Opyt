@@ -19,15 +19,13 @@ SECRET = "zzsecretphrasezz"
 
 
 def test_a_served_read_is_counted(svc):
-    before = store.usage_total(svc.owner)
-
     svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"}, headers=svc.reader_hdr)
     svc.client.post(f"/v1/kb/{svc.owner}/aggregate", json={}, headers=svc.reader_hdr)
 
     conn = store.connect()
     try:
-        rows = conn.execute("SELECT owner, reader, tool FROM usage_daily").fetchall()
-        assert store.usage_total(svc.owner) == before + 2
+        rows = conn.execute("SELECT owner, reader, tool, n FROM usage_daily").fetchall()
+        assert sum(r["n"] for r in rows) == 2
         assert {r["tool"] for r in rows} == {"search", "aggregate"}
         assert {r["owner"] for r in rows} == {svc.owner}
         assert {r["reader"] for r in rows} == {store.token_hash(svc.reader_token)}
@@ -39,12 +37,14 @@ def test_a_refused_read_spends_nobody_s_allowance(svc):
     """Counted AFTER the read runs, so the meter reflects reads that happened. A 401 or 403 is
     not a read — it returned nothing, and charging for it would let anyone exhaust a stranger's
     allowance by sending a wrong token."""
-    before = store.usage_total(svc.owner)
-
     svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"})
     svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"}, headers=svc.owner_hdr)
 
-    assert store.usage_total(svc.owner) == before
+    conn = store.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM usage_daily").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_the_query_text_is_not_in_the_audit_trail(svc, emb, capsys):

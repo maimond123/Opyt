@@ -2,6 +2,8 @@
 $OPYT_HOME sandbox with the no-API paths (bm25 search / open / aggregate), so no paid call."""
 from __future__ import annotations
 
+import pytest
+
 from opyt_core import kb as kb_entry
 from pipeline.kb import schema
 from pipeline.kb.ingest_common import store_atom
@@ -60,8 +62,10 @@ def test_aggregate_skeleton_counts_and_trust(kb_home, fake_embedder):
     assert agg["by_source_type"] == {"github": 2}
     assert agg["by_what_kind"] == {"artifact": 2}
     assert agg["trusted_atoms"] == 1                          # only the Oracle-authored atom
-    assert any(t["topic"] == "ai-agents" for t in agg["top_topics"])
     assert len(agg["recent_descriptions"]) == 2
+    # The scope FILTERED on `tags` above and the result reports no tag space of its own: an
+    # atom's declared labels stay a way IN, and stopped being an answer OUT (2026-09-16).
+    assert "top_topics" not in agg
 
     # Empty scope → whole store (all three atoms).
     assert kb_entry.kb_aggregate()["total"] == 3
@@ -158,3 +162,86 @@ def test_who_and_who_id_union_rather_than_intersect(kb_home, fake_embedder):
     hits = kb_entry.run_kb_search("framework", who="@root", who_id="github:stranger",
                                   mode="bm25", k=8)["hits"]
     assert {h["atom_id"] for h in hits} == {"github:root/agentkit", "github:stranger/x"}
+
+
+# ── open() deepens an abstract-only paper ────────────────────────────────────────
+# The gesture: a scholar Oracle's back catalogue is stored abstract-only, and OPENING one of those
+# papers is what goes and gets the PDF. Wired here rather than in the adapter because open() is the
+# only moment a reader says WHICH of several hundred papers is worth the download.
+
+def _seed_abstract_only_paper(conn, emb, monkeypatch):
+    from pipeline.kb import ingest_papers as ip
+    monkeypatch.setattr(ip, "resolve_fulltext", lambda paper: None)
+    paper = {"paperId": "arXiv:2401.99999", "title": "A Paper Nobody Has Read Yet",
+             "abstract": "Two thousand characters of abstract and no body.",
+             "authors": [{"authorId": "9", "name": "Ada Scholar"}],
+             "year": 2024, "publicationDate": "2024-03-02", "venue": "ICML",
+             "citationCount": 3, "url": "https://doi.org/10.1/xyz",
+             "externalIds": {"ArXiv": "2401.99999"}}
+    assert ip.atomize_paper(conn, emb, paper, entry_mode="oracle-footprint", fulltext=None)
+    return "paper:arXiv:2401.99999"
+
+
+def test_open_pulls_the_full_paper_for_an_abstract_only_atom(kb_home, fake_embedder, monkeypatch):
+    from pipeline.kb import ingest_papers as ip
+    conn = schema.connect()
+    atom_id = _seed_abstract_only_paper(conn, fake_embedder, monkeypatch)
+    conn.close()
+
+    body = "FULL DOCUMENT. " + ("the whole paper, section by section. " * 40)
+    monkeypatch.setattr(ip, "resolve_fulltext", lambda paper: body)
+    monkeypatch.setattr("opyt_core.kb.get_kb_embedder", lambda: fake_embedder)
+
+    after = kb_entry.kb_open(atom_id)
+    assert after["body_state"] == "complete"
+    assert "FULL DOCUMENT" in after["raw"]          # open() returned the upgraded body, SAME call
+    assert after["payload"]["has_fulltext"] is True
+    assert after["source_url"] == "https://doi.org/10.1/xyz"
+
+    # ...and the second open is a plain read: the body is already ours, so nothing re-fetches.
+    monkeypatch.setattr(ip, "resolve_fulltext",
+                        lambda paper: pytest.fail("a complete paper must not re-fetch on open"))
+    assert kb_entry.kb_open(atom_id)["body_state"] == "complete"
+
+
+def test_open_of_a_paper_with_no_reachable_pdf_still_answers(kb_home, fake_embedder, monkeypatch):
+    """Fail-safe: a paywalled paper returns its abstract, not an error."""
+    from pipeline.kb import ingest_papers as ip
+    conn = schema.connect()
+    atom_id = _seed_abstract_only_paper(conn, fake_embedder, monkeypatch)
+    conn.close()
+    monkeypatch.setattr(ip, "resolve_fulltext", lambda paper: None)
+    monkeypatch.setattr("opyt_core.kb.get_kb_embedder", lambda: fake_embedder)
+    got = kb_entry.kb_open(atom_id)
+    assert got["body_state"] == "partial"
+    assert got.get("error") is None
+    assert got["raw_available"] is True
+    assert "no body" in got["raw"] or "abstract" in got["raw"].lower()
+
+    # The attempt is stamped, so re-opening it in the same session does not re-pay the download.
+    monkeypatch.setattr(ip, "resolve_fulltext",
+                        lambda paper: pytest.fail("a stamped paper must not re-fetch on open"))
+    assert kb_entry.kb_open(atom_id)["body_state"] == "partial"
+
+
+def test_open_never_breaks_when_the_upgrade_blows_up(kb_home, fake_embedder, monkeypatch):
+    """`_deepen_paper` swallows everything — an open() must return the body we already hold."""
+    from pipeline.kb import ingest_papers as ip
+    conn = schema.connect()
+    atom_id = _seed_abstract_only_paper(conn, fake_embedder, monkeypatch)
+    conn.close()
+
+    def _explode(*a, **k):
+        raise RuntimeError("embedder has no API key on this machine")
+    monkeypatch.setattr(ip, "upgrade_to_fulltext", _explode)
+    got = kb_entry.kb_open(atom_id)
+    assert got["raw_available"] is True
+    assert got["body_state"] == "partial"
+
+
+def test_open_does_not_deepen_a_non_paper_atom(kb_home, fake_embedder, monkeypatch):
+    conn = schema.connect(); _seed(conn, fake_embedder); conn.close()
+    from pipeline.kb import ingest_papers as ip
+    monkeypatch.setattr(ip, "upgrade_to_fulltext",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("papers only")))
+    assert kb_entry.kb_open("x:1")["raw_available"] is True

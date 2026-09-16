@@ -20,8 +20,6 @@ records a `failed` run.
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
 from datetime import datetime
 from pipeline.timeparse import utc_iso, utc_now
@@ -38,18 +36,14 @@ from . import sitting_vectors as sv
 GENERATOR_PREFIX = "sitting"
 
 # No per-day read cap: this is an interactive call the user asked for, and consent lives at the
-# deposit — gate spend on money-absent/runaway, never on frequency. Runaway is guarded elsewhere:
+# deposit — gate user-initiated reads there, never on frequency. Runaway is guarded elsewhere:
 # one claim per scheduler run, a 3-failure breaker, and a loud 402 path. See companion doc for the
 # known residue (a caller that loops `read_sitting` directly is unguarded).
 
 # Ceiling on one call's input. Guards a moving limit, not the model's context: OpenRouter's
-# prompt-token cap derives from the remaining credit balance, so it shrinks as credit is spent.
-# See companion doc for a measured example of a prompt going from sendable to 402.
+# prompt-token cap is provider-controlled and can change. See companion doc for a measured
+# example of a prompt going from sendable to 402.
 MAX_INPUT_CHARS = int(os.environ.get("OPYT_SITTING_MAX_INPUT_CHARS", 800_000))
-
-# Above this share of one author, the region reads as a build log rather than a conversation; the
-# prompt is told the number so it can aim past it. See companion doc for the measured example.
-SINGLE_AUTHOR_SHARE = 0.60
 
 # Prompt rules below are tuned against measured failures on a real 295-atom window, run three
 # times each. Do not edit a rule without re-running that measurement — see companion doc for the
@@ -163,10 +157,9 @@ def record_lens_run(conn, sitting_id: str, lens: str, *, usage: dict,
     the `queries` lens alone (see `_read` step 1). Never raises.
 
     ⚠️ AMENDED 2026-08-24, and the amendment is the whole framing. This used to be a receipt with
-    no cost, because a lens called no model: it handed the host a document and the host read it
+    no usage, because a lens called no model: it handed the host a document and the host read it
     in-session. Under map-reduce the MAP is a real call per uncached part, so `usage` carries the
-    model and what it cost — a run row reporting $0 for a call that spent would make the lens rail
-    invisible in every spend report there is.
+    model and token metadata.
 
     `usage` is REQUIRED for that reason: a row is written only where a part was actually mapped,
     and `sitting_lenses._map_part` is the one place that happens. The host-side reduce and
@@ -201,7 +194,7 @@ def _notebook(conn, sitting_id: str) -> str:
 
     THE CROSS-PART MEMORY (RULED 2026-08-24). Old parts appear in later reads only as distilled
     claims, never as re-read text — which is what makes an unbounded region readable at a bounded
-    price, and what lets part 2 recognise that the audit it is reading GUTS the number part 1
+    size, and what lets part 2 recognise that the audit it is reading GUTS the number part 1
     established. Under the MMR cut those two atoms landed in different parts and neither reader
     could tell the story.
 
@@ -266,9 +259,9 @@ def read_sitting(conn=None, sitting_id: str = "", *, force: bool = False, dry_ru
                  now: datetime | None = None) -> dict:
     """Read one sitting and upsert its queries. Never raises.
 
-    `prompt_only` renders the prompt and returns without calling anything — the $0 look at exactly
+    `prompt_only` renders the prompt and returns without calling anything — a look at exactly
     what would be sent (distinct from the `sitting` tool's `preview` action, which reports scope
-    and estimated cost, not the actual prompt bytes). `dry_run` makes the call and returns the
+    and estimated tokens, not the actual prompt bytes). `dry_run` makes the call and returns the
     result but writes nothing, leaving the sitting unread and the query set untouched.
 
     `standing=False` reads the region as if for the first time, hiding queries already running for
@@ -290,8 +283,10 @@ def read_sitting(conn=None, sitting_id: str = "", *, force: bool = False, dry_ru
         try:
             fq.record_run(conn, generator=f"{GENERATOR_PREFIX}:?", sitting_id=sitting_id or None,
                           lens="queries", status="failed", reason=detail)
-        except Exception:
-            pass
+        except Exception as e2:
+            # `_fail` logs this exact failure of this exact call; staying silent here meant a store
+            # that cannot write run rows AT ALL left no trace anywhere.
+            log(f"[sitting-reader] could not record failed run: {e2}")
         return {"status": "failed", "reason": detail}
     finally:
         if own:
@@ -323,35 +318,32 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
     user_msg = render_prompt(conn, sitting_id, standing=running)
 
     if prompt_only:
-        # No call, no row, no spend. This is the mode that answers "what EXACTLY would be sent" —
-        # not "what would this cost", which is the `sitting` tool's `preview` action.
+        # No call and no row. This is the mode that answers "what EXACTLY would be sent" —
+        # distinct from the `sitting` tool's `preview` action.
         return {"status": "prompt-only", "sitting_id": sitting_id, "generator": gen,
                 "atoms": s["atoms"], "chars": len(user_msg), "est_tokens": len(user_msg) // 4,
                 "standing": len(running), "prompt": user_msg}
 
-    # 3. Preflight — DEGRADE-OPEN. No call attempted, so `cost_usd` stays NULL and the day's
-    #    allowance is untouched.
+    # 3. Preflight — DEGRADE-OPEN. No call is attempted.
     backend = core.resolve_backend()
     reason = core.preflight(backend)
     if reason:
         log(f"[sitting-reader] skipped (degrade-open): {reason}")
-        return _fail(conn, gen, sitting_id, ref, reason, spent=False)
+        return _fail(conn, gen, sitting_id, ref, reason)
 
     try:
         resp = core.call(backend, _SYSTEM, user_msg)
     except Exception as e:
         if getattr(e, "status", None) == 402:
-            # MONEY-ABSENT, not a broken call: rejected before inference, so nothing was spent and
-            # the allowance must not be charged. Fails loud because the remedy is a human action.
-            reason = (f"OUT OF CREDITS (HTTP 402) — prompt rejected, nothing spent. Add credits, "
-                      f"or lower OPYT_SITTING_MAX_INPUT_CHARS (currently {MAX_INPUT_CHARS}). "
+            reason = (f"provider rejected the prompt (HTTP 402). Lower "
+                      f"OPYT_SITTING_MAX_INPUT_CHARS (currently {MAX_INPUT_CHARS}), "
                       f"Upstream: {e}")
             log(f"[sitting-reader] {reason}")
-            return _fail(conn, gen, sitting_id, ref, reason, spent=False)
-        return _fail(conn, gen, sitting_id, ref, f"{type(e).__name__}: {e}", spent=True)
+            return _fail(conn, gen, sitting_id, ref, reason)
+        return _fail(conn, gen, sitting_id, ref, f"{type(e).__name__}: {e}")
 
     usage = {"model": resp.model, "in_tokens": resp.input_tokens,
-             "out_tokens": resp.output_tokens, "cost_usd": resp.cost_usd,
+             "out_tokens": resp.output_tokens,
              "atoms_read": s["atoms"]}
     obj = core.parse_response(resp.text)
     if obj is None:
@@ -359,7 +351,7 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
         if core.finish_reason(resp) == "length":
             reason = (f"response truncated at max_tokens ({usage['out_tokens']} out) — "
                       f"raise max_tokens for role {core.ROLE!r}")
-        return _fail(conn, gen, sitting_id, ref, reason, spent=True, usage=usage)
+        return _fail(conn, gen, sitting_id, ref, reason, usage=usage)
 
     # THE PART'S OWN ADMISSIONS, DELIBERATELY NOT THE CHAIN (RULED 2026-08-25, David: "keep it
     # narrow"). The asymmetry with `sitting_claims`, which DOES widen to `chain_atom_ids`, is the
@@ -369,7 +361,7 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
     # reader has not read an ancestor atom, only a distilled line about it in the preamble. Widening
     # here would let a query claim provenance in text nobody in this run saw.
     #
-    # Accepted cost, stated so it is not rediscovered as a bug: a query motivated purely by an
+    # Accepted tradeoff, stated so it is not rediscovered as a bug: a query motivated purely by an
     # ancestor claim, citing only that claim's atoms, is dropped. Re-emission is unaffected — a
     # standing query is carried by its VERDICT, which validates against `shown`, not against atoms.
     # The drop lands in `notes` -> `frontier_reader_runs.reason`, not in the read's result.
@@ -387,9 +379,14 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
     # mid-document skim would weight the read to the oldest/newest material with every other
     # counter still looking healthy; this is the only signal that catches a route-degraded read
     # (OpenRouter can route to a different provider per run). Note joins `notes` below.
+    #
+    # BOTH lenses are counted. A verdict's atom_ids are the evidence that a standing query's thread
+    # is still live, cited from the same document and resolved through the same `_resolve_atom_ids`
+    # repair as a query's. Counting queries alone made a settled region — full verdict coverage,
+    # no new threads — report "coverage is unknown" on a read that cited plenty.
     chrono = sre.chronological_order(conn, sitting_id)
-    cov = core.positional_coverage(chrono["order"], [a for q in queries for a in q["atom_ids"]],
-                                   undated=chrono["undated"])
+    cited = [a for q in queries for a in q["atom_ids"]] + [a for v in verdicts for a in v["atom_ids"]]
+    cov = core.positional_coverage(chrono["order"], cited, undated=chrono["undated"])
     if cov["note"]:
         notes.append(f"coverage: {cov['note']}")
     for n in notes:
@@ -398,7 +395,7 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
         # Neither a new query nor a verdict means the read understood nothing. A settled region
         # with full verdict coverage and no new threads is still a valid, queries-empty read.
         return _fail(conn, gen, sitting_id, ref, "no valid queries or verdicts after validation",
-                     spent=True, usage=usage, consensus=consensus)
+                     usage=usage, consensus=consensus)
 
     if dry_run:
         return {"status": "dry-run", "sitting_id": sitting_id, "generator": gen,
@@ -427,7 +424,7 @@ def _read(conn, sitting_id: str, *, force: bool, dry_run: bool, prompt_only: boo
                   ran_at=utc_iso(ref), consensus=consensus, emitted=len(queries), new=res["new"],
                   refreshed=res["refreshed"], kept=marks["kept"], dropped=marks["dropped"],
                   unverdicted=unverdicted, reason="; ".join(notes) or None, **usage)
-    sst.mark_read(conn, sitting_id, status="ok", at=ref)
+    sst.mark_read(conn, sitting_id, at=ref)
     return {"status": "ok", "sitting_id": sitting_id, "generator": gen, "consensus": consensus,
             "emitted": len(queries), "new": res["new"], "refreshed": res["refreshed"],
             "kept": marks["kept"], "dropped": marks["dropped"], "unverdicted": unverdicted,
@@ -485,7 +482,7 @@ def _is_machine_lane(conn, atom_ids: list[str]) -> bool:
     return not rows
 
 
-def _fail(conn, generator: str, sitting_id: str, ref: datetime, reason: str, *, spent: bool,
+def _fail(conn, generator: str, sitting_id: str, ref: datetime, reason: str, *,
           usage: dict | None = None, consensus: str | None = None) -> dict:
     """Record a failed run. Writes no queries and leaves the sitting UNREAD.
 
@@ -495,55 +492,9 @@ def _fail(conn, generator: str, sitting_id: str, ref: datetime, reason: str, *, 
     fields = dict(usage or {})
     if consensus:
         fields.setdefault("consensus", consensus)
-    if spent:
-        fields.setdefault("cost_usd", 0.0)
     try:
         fq.record_run(conn, generator=generator, sitting_id=sitting_id, lens="queries",
                       status="failed", reason=reason, ran_at=utc_iso(ref), **fields)
     except Exception as e:
         log(f"[sitting-reader] could not record failed run: {e}")
     return {"status": "failed", "reason": reason}
-
-
-def unread_sittings(conn) -> list[dict]:
-    """Built sittings nobody has read yet, biggest region first — the read queue."""
-    return [dict(r) for r in conn.execute(
-        "SELECT sitting_id, seed_ref, seed_kind, floor, atoms, tokens, stop, built_at "
-        "  FROM sittings WHERE read_at IS NULL AND atoms > 0 "
-        " ORDER BY atoms DESC, built_at DESC")]
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Read one sitting and emit its standing queries")
-    ap.add_argument("--sitting", help="sitting_id to read (omit to list what is unread)")
-    ap.add_argument("--show-prompt", action="store_true", dest="prompt_only",
-                    help="print the exact prompt and its token estimate; calls nothing, spends "
-                         "nothing. (Named apart from the `sitting` tool's `preview` action, which "
-                         "reports a region's SCOPE rather than the bytes that would be sent.)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="make the call and print the result; write nothing (this DOES spend)")
-    ap.add_argument("--force", action="store_true", help="re-read a sitting already read")
-    ap.add_argument("--no-standing", action="store_true",
-                    help="hide this region's running queries — read it as if for the first time "
-                         "(use when MEASURING what a sitting generates)")
-    args = ap.parse_args(argv)
-
-    conn = schema.connect()
-    try:
-        if not args.sitting:
-            print(json.dumps({"unread_sittings": unread_sittings(conn)}, indent=2, default=str))
-            return 0
-        res = read_sitting(conn, args.sitting, force=args.force, dry_run=args.dry_run,
-                           prompt_only=args.prompt_only, standing=not args.no_standing)
-        if res.get("status") == "prompt-only":
-            print(res.pop("prompt"))
-            print("\n" + json.dumps(res, indent=2, default=str))
-        else:
-            print(json.dumps(res, indent=2, default=str))
-        return 0 if res.get("status") in {"ok", "dry-run", "skipped", "prompt-only"} else 1
-    finally:
-        conn.close()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

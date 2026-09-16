@@ -114,7 +114,7 @@ def test_being_shown_demotes_but_never_removes(conn):
     _cand(conn, "arxiv:fresh", published="2026-08-12", summary="s" * 1500)
     before = _ids(fs.rank_candidates(conn, now=_NOW))
 
-    fs.record_shown(conn, ["arxiv:shown"], surface="frontier")
+    fs.record_shown(conn, ["arxiv:shown"])
     after = fs.rank_candidates(conn, now=_NOW)
 
     assert set(before) == set(_ids(after))                    # nothing left the list
@@ -309,13 +309,18 @@ def test_a_missing_table_degrades_to_empty(tmp_path):
 
 # ── The event log ───────────────────────────────────────────────────────────────
 def test_the_event_log_appends_rather_than_overwrites(conn):
-    _cand(conn, "arxiv:a")
-    fs.record_shown(conn, ["arxiv:a"], surface="frontier")
-    fs.record_shown(conn, ["arxiv:a"], surface="search")
+    """Showing the same candidate twice is two facts, so it is two rows and never an upsert.
 
-    rows = conn.execute("SELECT event, surface FROM frontier_candidate_events "
+    The assertion used to read back a `surface` column, which is what made it look like the two
+    rows differed by carrier. That column went on 2026-09-06: one caller wrote one constant and
+    nothing ever read it, so `event_id` was already the only thing separating the two."""
+    _cand(conn, "arxiv:a")
+    fs.record_shown(conn, ["arxiv:a"])
+    fs.record_shown(conn, ["arxiv:a"])
+
+    rows = conn.execute("SELECT event FROM frontier_candidate_events "
                         "WHERE candidate_id='arxiv:a' ORDER BY event_id").fetchall()
-    assert [r["surface"] for r in rows] == ["frontier", "search"]
+    assert [r["event"] for r in rows] == ["shown", "shown"]
     assert fs.rank_candidates(conn, now=_NOW)[0]["shown_n"] == 2
 
 

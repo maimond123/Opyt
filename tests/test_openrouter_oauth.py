@@ -10,9 +10,12 @@ and the returned payload must never contain a key value.
 
 import base64
 import hashlib
+import json
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from starlette.applications import Starlette
+from starlette.testclient import TestClient
 
 from opyt_core import openrouter_oauth as oo
 
@@ -71,6 +74,90 @@ def test_timeout_degrades_to_a_manual_url_never_a_dead_end(monkeypatch):
     assert out["status"] == "waiting"
     assert out["open_this_url"].startswith("https://openrouter.ai/auth")
     assert "key" not in out          # ⚠️ a value must never appear in a returned payload
+
+
+def test_hosted_approval_returns_a_public_link_without_a_loopback_listener(monkeypatch):
+    sent = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(request, timeout):
+        sent["body"] = json.loads(request.data)
+        sent["headers"] = dict(request.header_items())
+        return _Response()
+
+    monkeypatch.setenv("OPYT_HOSTED_OPENROUTER", "1")
+    monkeypatch.setenv("OPYT_HOSTED_INTERACTION_REGISTER_URL", "http://gateway/internal")
+    monkeypatch.setenv("OPYT_HOSTED_INTERACTION_KEY", "child-key")
+    monkeypatch.setenv("OPYT_HOSTED_INTERACTION_URL", "https://mcp.example")
+    monkeypatch.setattr(oo, "_hosted_approval", oo._HostedApproval())
+    monkeypatch.setattr(oo, "_pkce_pair", lambda: ("verifier", "challenge"))
+    monkeypatch.setattr(oo.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(oo.local_auth, "Capture", lambda **kw: pytest.fail("bound loopback"))
+
+    out = oo.acquire()
+    query = parse_qs(urlparse(out["open_this_url"]).query)
+    callback = query["callback_url"][0]
+
+    assert out["status"] == "waiting"
+    assert query["code_challenge"] == ["challenge"]
+    assert callback.startswith("https://mcp.example/login/openrouter/")
+    assert "verifier" not in out["open_this_url"]
+    assert sent["body"] == {"kind": "openrouter", "nonce": callback.rsplit("/", 1)[1]}
+    assert sent["headers"]["X-opyt-hosted-interaction-key"] == "child-key"
+
+
+def test_hosted_callback_exchanges_inside_the_child_and_stores_the_key(monkeypatch):
+    monkeypatch.setenv("OPYT_HOSTED_OPENROUTER", "1")
+    monkeypatch.setenv("OPYT_HOSTED_INTERACTION_REGISTER_URL", "http://gateway/internal")
+    monkeypatch.setenv("OPYT_HOSTED_INTERACTION_KEY", "child-key")
+    monkeypatch.setenv("OPYT_HOSTED_INTERACTION_URL", "https://mcp.example")
+    monkeypatch.setattr(oo, "_hosted_approval", oo._HostedApproval())
+    monkeypatch.setattr(oo, "_pkce_pair", lambda: ("verifier", "challenge"))
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(oo.urllib.request, "urlopen", lambda *args, **kwargs: _Response())
+    monkeypatch.setattr(oo, "env_name", lambda: "OPENROUTER_API_KEY")
+    exchange = {}
+    monkeypatch.setattr(oo, "_exchange", lambda code, verifier: exchange.update(
+        code=code, verifier=verifier) or "sk-or-secret")
+    stored = {}
+    monkeypatch.setattr(oo.keys, "set_key", lambda env, key: stored.update(env=env, key=key))
+
+    out = oo.acquire()
+    callback = parse_qs(urlparse(out["open_this_url"]).query)["callback_url"][0]
+    nonce = callback.rsplit("/", 1)[1]
+
+    assert oo._hosted_approval.complete(nonce, "authorization-code") is True
+    assert exchange == {"code": "authorization-code", "verifier": "verifier"}
+    assert stored == {"env": "OPENROUTER_API_KEY", "key": "sk-or-secret"}
+
+
+def test_hosted_child_callback_requires_the_internal_interaction_key(monkeypatch):
+    monkeypatch.setenv("OPYT_HOSTED_INTERACTION_KEY", "child-key")
+    monkeypatch.setattr(oo._hosted_approval, "complete", lambda nonce, code: True)
+    app = oo.hosted_child_app(Starlette())
+
+    with TestClient(app) as client:
+        denied = client.post("/_hosted-openrouter/callback/nonce", json={"code": "code"})
+        accepted = client.post(
+            "/_hosted-openrouter/callback/nonce",
+            headers={"X-Opyt-Hosted-Interaction-Key": "child-key"},
+            json={"code": "code"},
+        )
+
+    assert denied.status_code == 404
+    assert accepted.status_code == 200 and accepted.json() == {"status": "stored"}
 
 
 def test_env_name_comes_from_the_registry_not_a_literal():

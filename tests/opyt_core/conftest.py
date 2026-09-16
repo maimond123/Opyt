@@ -8,9 +8,11 @@ crosses the real FastAPI app in-process. Nothing about `kb_remote` is mocked; th
 substitution is the socket.
 
 `publisher` is the OWNER's half of the same wiring — the store an export is projected from, the
-settings naming the service, and `push`'s transport shimmed. Both `opyt-push` and the
-`push_catchup` rail run through it, which is the point: they share one implementation, so they
-have to share one fixture or the tests stop proving that.
+settings naming the service, and `push`'s transport shimmed. Both `tests/opyt_core/test_push.py`
+(which calls `push.publish` directly) and `test_push_catchup.py` (which reaches it through the
+rail) run through it, which is the point: there is ONE publish implementation, so they have to
+share one fixture or the tests stop proving that. Until 2026-09-05 the two halves were the
+`opyt-push` command and the rail; the command is deleted and the rail is the only caller left.
 """
 from __future__ import annotations
 

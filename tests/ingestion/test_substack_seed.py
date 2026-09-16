@@ -44,6 +44,8 @@ def _mock_get(monkeypatch, payload=_PAYLOAD, status=200):
     # Serve the profile payload ONLY on the public_profile URL; every other GET (RSS
     # feed-detection on a declared blog link, etc.) misses → the probe degrades gracefully.
     def fake(url, **kw):
+        if "ranked" in url:
+            return _Resp(200, [{"handle": "someone" if payload.get("name") == "Someone" else "gergelyorosz"}])
         if "public_profile" in url:
             return _Resp(status, payload)
         return _Resp(404, {})
@@ -66,7 +68,12 @@ def test_probe_parses_declared_links_and_root(monkeypatch):
     tset = {tid: verified for tid, verified in targets}
     assert tset[ci("https://x.com/GergelyOrosz")] is True        # connected → verified
     assert ci("https://pragmaticengineer.com") in tset          # declared site
-    assert ci("https://www.youtube.com/@ThePragmaticEngineer") in tset
+    assert set(tset) == {"x.com/gergelyorosz", "pragmaticengineer.com"}
+    assert {s.url for s in sources} == {
+        "https://pragmaticengineer.substack.com",
+        "https://x.com/GergelyOrosz",
+        "https://pragmaticengineer.com",
+    }
 
     # The root Substack itself is a source (its canonical == root_id → Rule-1 trusted →
     # routes through the Half-A footprint adapter as the person's primary channel).
@@ -76,9 +83,8 @@ def test_probe_parses_declared_links_and_root(monkeypatch):
     assert ("x", ci("https://x.com/GergelyOrosz")) in stypes
 
 
-def test_probe_root_url_falls_back_to_handle_subdomain(monkeypatch):
-    # No primaryPublication (e.g. a reader-only account) → the seed handle's subdomain, which
-    # is still a UNIQUE canonical node — never the bare "substack.com" collision.
+def test_probe_without_primary_publication_keeps_the_seed_publication(monkeypatch):
+    # The publication seed remains the root when its author has no primaryPublication field.
     _mock_get(monkeypatch, payload={"name": "Someone", "twitterAccount": {}, "userLinks": []})
     info, _sources, _targets = dp._probe_substack_profile("someone")
     assert info["root_url"] == "https://someone.substack.com"
@@ -93,11 +99,21 @@ def test_probe_failsafe_on_non_200(monkeypatch):
 
 # ── Seed → user-slug resolution (the custom-domain-minted member fix) ──────────
 
-def test_resolve_slug_bare_label_is_passthrough_no_network(monkeypatch):
-    # A bare slug (the {subdomain}.substack.com-minted case) is used as-is — NO network call.
-    monkeypatch.setattr(dp.requests, "get", lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("a bare slug must not trigger a network resolution")))
-    assert dp._resolve_substack_user_slug("pragmaticengineer") == "pragmaticengineer"
+def test_resolve_publication_slug_to_different_author(monkeypatch):
+    calls = []
+    def get(url, **kwargs):
+        calls.append(url)
+        if "ranked" in url:
+            return _Resp(200, [{"handle": "alicewriter"}])
+        return _Resp(200, {"name": "Alice", "primaryPublication": None})
+    monkeypatch.setattr(dp.requests, "get", get)
+    info, sources, _ = dp._probe_substack_profile("newsletter")
+    assert calls == [
+        "https://newsletter.substack.com/api/v1/publication/users/ranked?public=true",
+        "https://substack.com/api/v1/user/alicewriter/public_profile",
+    ]
+    assert info["root_url"] == "https://newsletter.substack.com"
+    assert [s.url for s in sources] == [info["root_url"]]
 
 
 def test_resolve_slug_from_custom_domain_host(monkeypatch):
@@ -157,7 +173,7 @@ def test_discover_substack_seed_trusts_declared_accounts(monkeypatch, tmp_path):
     # write. Purely: identity edges → Rule 5 → T1.
     result = dp.discover_profile(
         "pragmaticengineer", seed_type="substack", config=_Cfg(tmp_path),
-        skip_edge_fetch=True, skip_trust_cache_write=True, probe_scholar=False)
+        skip_edge_fetch=True, skip_trust_cache_write=True)
 
     trusted = {ci(s["url"]) for s in result["sources"] if (s.get("trust") or {}).get("trusted")}
     assert ci("https://pragmaticengineer.substack.com") in trusted    # the Substack root (Rule 1)

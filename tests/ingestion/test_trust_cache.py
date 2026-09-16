@@ -11,15 +11,15 @@ from pipeline.ingestion.trust_types import Edge
 # ── Snapshot hash / cache invalidation ───────────────────────────────────────
 
 def test_snapshot_hash_stable_and_order_independent():
-    a = dp._x_snapshot_hash("Naval", ["nav.al", "naval.substack.com"])
-    b = dp._x_snapshot_hash("Naval", ["naval.substack.com", "nav.al"])  # reordered
+    a = dp._snapshot_hash("Naval", ["nav.al", "naval.substack.com"])
+    b = dp._snapshot_hash("Naval", ["naval.substack.com", "nav.al"])  # reordered
     assert a == b
 
 
 def test_snapshot_hash_changes_on_new_bio_url_or_rename():
-    base = dp._x_snapshot_hash("Naval", ["nav.al"])
-    assert dp._x_snapshot_hash("Naval", ["nav.al", "x.com/naval"]) != base   # new link
-    assert dp._x_snapshot_hash("Naval Ravikant", ["nav.al"]) != base         # rename
+    base = dp._snapshot_hash("Naval", ["nav.al"])
+    assert dp._snapshot_hash("Naval", ["nav.al", "x.com/naval"]) != base   # new link
+    assert dp._snapshot_hash("Naval Ravikant", ["nav.al"]) != base         # rename
 
 
 class _Cfg:
@@ -53,6 +53,17 @@ def test_cache_expires_after_ttl(tmp_path, monkeypatch):
     assert dp._get_cached_trust("naval", "h", cfg) is None         # stale → miss
 
 
+def test_cache_with_excluded_source_requires_discovery(tmp_path):
+    cfg = _Cfg(tmp_path)
+    result = {"username": "alice", "sources": [
+        {"source_type": "youtube", "url": "https://youtube.com/@alice"},
+        {"source_type": "blog", "url": "https://alice.example"},
+    ]}
+    dp._save_cached_trust("alice", "same-profile", result, cfg)
+
+    assert dp._get_cached_trust("alice", "same-profile", cfg) is None
+
+
 # ── Co-routed open-web discovery: host FINDS, the graph JUDGES ────────────────
 
 def test_host_supplied_urls_become_typed_candidate_sources():
@@ -69,7 +80,7 @@ def test_host_supplied_urls_become_typed_candidate_sources():
         "https://www.youtube.com/@alice",
     ])
     by_type = {s.source_type: s for s in got}
-    assert set(by_type) == {"blog", "substack", "youtube"}
+    assert set(by_type) == {"blog", "substack"}
     # LOW confidence, deliberately: an unverified claim from a chat model is the weakest input
     # this module accepts, and it must not out-rank a deterministic probe on a dedupe collision.
     assert all(s.confidence == "low" for s in got)
@@ -99,7 +110,7 @@ def test_host_supplied_urls_are_UNTRUSTED_until_the_graph_says_otherwise(monkeyp
     all_sources = dp._sources_from_urls(["https://alice.dev"])
     verdicts = dp._compute_trust(
         "alice", dp.canonical_identity("x.com/alice"), [],       # NO declared identity links
-        {"display_name": "Alice", "bio": "", "website": ""}, [], all_sources,
+        [], all_sources,
         skip_edge_fetch=False,
     )
     assert not verdicts[dp.canonical_identity("https://alice.dev")].trusted

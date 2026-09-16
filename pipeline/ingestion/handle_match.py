@@ -52,10 +52,10 @@ def normalize_handle(h: str | None) -> str:
     return _NON_ALNUM.sub("", s)
 
 
-def is_generic(h: str | None, *, min_len: int = 5) -> bool:
+def is_generic(h: str | None) -> bool:
     """A handle too short or too generic to safely auto-trust on."""
     n = normalize_handle(h)
-    return len(n) < min_len or n in GENERIC_HANDLES
+    return len(n) < 5 or n in GENERIC_HANDLES
 
 
 def _edit_distance_le1(a: str, b: str) -> bool:

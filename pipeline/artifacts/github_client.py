@@ -1,10 +1,12 @@
 """
 pipeline/artifacts/github_client.py
 
-The networked GitHub REST transport. Only the generic transport plus the two ARTIFACT reads
-survive here: `search_repos` (topic → repos) and `readme` (a repo's README as text) — the
-person verbs (`user`, `stargazers`, `contributors`) were dropped along with the retired
-person-scoped `pipeline/github_scout` package; repo-as-unit needs neither.
+The networked GitHub REST transport. Only the generic transport plus ONE artifact read survive
+here: `search_repos` (topic → repos). The person verbs (`user`, `stargazers`, `contributors`)
+were dropped along with the retired person-scoped `pipeline/github_scout` package; the per-repo
+detail reads (`repo`, `readme`) went on 2026-09-05 with no caller left — the live per-repo
+enrichment is `pipeline.ingestion.sources.github._fetch_repo` / `_fetch_readme`, which
+`pipeline/kb/ingest_github.py` calls after discovery.
 
 Every call goes through CircuitBreaker("github.com") so an outage / rate-limit trips ONCE
 and fails fast instead of a retry storm, and results are cached to ~/.opyt so a re-run never
@@ -15,13 +17,12 @@ breaker.
   GitHubClient      — the ABC (the injectable seam).
   GitHubApiClient   — live REST impl with breaker + on-disk cache.
 
-This is the client the v1b repo-frontier adapter reuses. A `FakeGitHubClient` test double
-lived here too until 2026-08-29 — deleted because nothing, tests included, ever used it
-(the test suites build their own inline fakes against the ABC).
+The one live reuser is `pipeline/kb/frontier_sources.py`'s `GitHubAdapter` (Frontier stage 2).
+A `FakeGitHubClient` test double lived here too until 2026-08-29 — deleted because nothing,
+tests included, ever used it (the test suites build their own inline fakes against the ABC).
 """
 from __future__ import annotations
 
-import base64
 import json
 import time
 from abc import ABC, abstractmethod
@@ -34,7 +35,7 @@ from pipeline.circuit_breaker import CircuitBreaker, CircuitOpenError
 from pipeline.credentials import get_credential
 
 API_BASE = "https://api.github.com"
-_CACHE_TTL = 7 * 24 * 3600  # repos/READMEs are stable enough for a week
+_CACHE_TTL = 7 * 24 * 3600  # a topic's top repos are stable enough for a week
 
 
 # Lazy module-level breaker so a GitHub outage trips ONCE and every caller (and every
@@ -50,24 +51,7 @@ def _github_breaker() -> CircuitBreaker:
 
 
 class GitHubClient(ABC):
-    """Injectable seam. A live impl hits the REST API; the fake is fixture-backed."""
-
-    def readme(self, owner: str, repo: str) -> str | None:
-        """Repo README as text (optional; default None)."""
-        return None
-
-    def repo(self, owner: str, repo: str) -> dict | None:
-        """One repo's live state (optional; default None) — the single per-repo detail call.
-
-        Its caller used to be `save_repo`, fetching the CURRENT stars/pushed_at baseline at commit
-        time; that tool was deleted 2026-08-13. The live caller now is the v2 rail's
-        `frontier_sources.GitHubAdapter`."""
-        return None
-
-    def latest_release(self, owner: str, repo: str) -> dict | None:
-        """A repo's latest release: {tag, name, notes} or None (optional; default None). One
-        call, made ONLY for a confirmed-moved repo (D5) to thicken an update bundle."""
-        return None
+    """Injectable seam — the ONE method the discovery client owes its caller."""
 
     @abstractmethod
     def search_repos(self, query: str, limit: int = 10, sort: str = "stars") -> list[dict]:
@@ -132,21 +116,6 @@ class GitHubApiClient(GitHubClient):
             return None
 
     # ── endpoints ──────────────────────────────────────────────────────────────
-    def readme(self, owner: str, repo: str) -> str | None:
-        key = f"readme:{owner.lower()}/{repo.lower()}"
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached or None
-        data = self._get(f"/repos/{owner}/{repo}/readme")
-        text = ""
-        if data and data.get("encoding") == "base64" and data.get("content"):
-            try:
-                text = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-            except Exception:
-                text = ""
-        self._cache_put(key, text)
-        return text or None
-
     def search_repos(self, query: str, limit: int = 10, sort: str = "stars") -> list[dict]:
         key = f"search_repos:{query.lower()}:{limit}:{sort}"
         cached = self._cache_get(key)
@@ -162,7 +131,7 @@ class GitHubApiClient(GitHubClient):
 
     @staticmethod
     def _repo_row(r: dict) -> dict:
-        """Normalize a /search or /repos item to the frontier's repo dict. All fields are
+        """Normalize one /search/repositories item to the frontier's repo dict. Every field is
         already present on the search item — no extra call — so a survey carries stars/pushed_at
         (the movement baseline) and description/language/topics (the shown quality signal)."""
         return {
@@ -177,25 +146,3 @@ class GitHubApiClient(GitHubClient):
             "archived": bool(r.get("archived")),
         }
 
-    def repo(self, owner: str, repo: str) -> dict | None:
-        key = f"repo:{owner.lower()}/{repo.lower()}"
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached or None
-        data = self._get(f"/repos/{owner}/{repo}")
-        out = self._repo_row(data) if isinstance(data, dict) and data.get("full_name") else None
-        self._cache_put(key, out or "")
-        return out
-
-    def latest_release(self, owner: str, repo: str) -> dict | None:
-        key = f"release:{owner.lower()}/{repo.lower()}"
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached or None
-        data = self._get(f"/repos/{owner}/{repo}/releases/latest")
-        out = None
-        if isinstance(data, dict) and data.get("tag_name"):
-            out = {"tag": data.get("tag_name"), "name": data.get("name") or "",
-                   "notes": (data.get("body") or "")[:1000]}
-        self._cache_put(key, out or "")
-        return out

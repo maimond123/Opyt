@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+from typing import Callable
 
 from . import derive, probe_store, schema
 from .embed import assert_model
@@ -52,9 +53,20 @@ DEFAULT_PAGES = 3
 # count gives wildly uneven windows across accounts of different posting frequency.
 DEFAULT_SPAN_DAYS = 90.0
 
-# Seconds between requests: 3600 / 169 measured requests-per-hour, rounded up. CONSTANT-RATE, not
-# burst-then-back-off, because the request budget is SHARED with every other GraphQL consumer on
-# the machine — a burst here hands 429s to whichever scraper runs next.
+# Seconds between requests. CONSTANT-RATE, not burst-then-back-off, because the request budget is
+# SHARED with every other GraphQL consumer on the machine — a burst here hands 429s to whichever
+# scraper runs next, and it also compresses this rail's SQLite write-lock contention with a
+# concurrent rail into one window (see `probe_catchup.PROBE_DAILY_CANDIDATES`).
+#
+# ⚠️ The derivation this constant used to carry — "3600 / 169 measured requests-per-hour" — was
+# WRONG. `UserTweets` holds its own bucket of 50 per 15 MINUTES (measured 2026-09-02 off
+# `x-rate-limit-limit`), i.e. 200/hr, not 169. 22 s is still safe, at 41 requests per window, but
+# for a different reason than the old comment gave, and the number it named does not exist.
+#
+# This is SMOOTHING, not the budget. The hard stop is `x_graphql_core._refuse_if_spent`, which
+# reads the server's own meter per operation and refuses rather than issuing a request X would
+# 429. The two do different jobs: the meter stops an overrun, this spreads requests so a rail
+# does not exhaust its whole window in the first minute and then refuse everything after.
 _PACE_SECONDS = 22.0
 
 _ATOM_PREFIX = "xprobe"
@@ -121,11 +133,12 @@ def _render_groups(groups: list[list[dict]], *, handle: str) -> list[dict]:
         if not root_id:
             continue
         is_thread = len(group) > 1
-        # An X-Article renders as its TEASER here: fetching the real body is a paid twitterapi call,
-        # and this path is free by design. Recorded as `partial` rather than passed off as whole —
-        # a truncated body quoted as if complete is a fabricated citation.
-        is_article = any(xt._article_tweet_id(t) for t in group)
-        md = xt.tweet_to_markdown(root, thread_tweets=group if is_thread else None,
+        article = root.get("article")
+        is_article = bool(article) or any(xt._article_tweet_id(t) for t in group)
+        # The timeline response sometimes carries the full Article body and sometimes its teaser.
+        # Completeness follows the blocks actually received; no extra fetch belongs on this path.
+        has_article_body = bool(xt._article_shape(article)[1]) if isinstance(article, dict) else False
+        md = xt.tweet_to_markdown(root, article=article, thread_tweets=group if is_thread else None,
                                   source="x-probe", footer_label="Candidate probe")
         meta = derive.derive_x(root)
         out.append({
@@ -145,7 +158,8 @@ def _render_groups(groups: list[list[dict]], *, handle: str) -> list[dict]:
                 "is_article": is_article,
                 "has_media": any((t.get("extendedEntities") or {}).get("media") for t in group),
                 "source_tags": meta["source_tags"],
-                **body_fields(BODY_PARTIAL if is_article else BODY_COMPLETE, BASIS_OBSERVED),
+                **body_fields(BODY_COMPLETE if not is_article or has_article_body
+                              else BODY_PARTIAL, BASIS_OBSERVED),
             },
             "_markdown": md,
         })
@@ -207,6 +221,7 @@ def probe_candidate(conn, embedder, cookies: dict, headers: dict, cand: dict, *,
     from .ingest_x_footprint import _filter_and_stitch
 
     who_id, handle = cand["who_id"], (cand.get("handle") or "")
+    probe_store.record_attempt(conn, who_id)
     try:
         raw = core.fetch_user_tweets(
             cookies, headers, cand["user_id"], pages=pages,
@@ -240,7 +255,7 @@ def probe_candidate(conn, embedder, cookies: dict, headers: dict, cand: dict, *,
     for atom in atoms:
         md = atom.pop("_markdown")
         decided = snapshot_and_hash(_SNAPSHOT_SOURCE, atom["atom_id"], md, seen)
-        if decided is None:                     # unchanged → skip the (paid) embed
+        if decided is None:                     # unchanged → skip the embed
             skipped += 1
             continue
         atom["raw_ref"], atom["raw_hash"] = decided
@@ -252,7 +267,7 @@ def probe_candidate(conn, embedder, cookies: dict, headers: dict, cand: dict, *,
     sink.close()
 
     # `ok` REQUIRES everything submitted to have actually landed — a systemic embed failure (bad
-    # key, open credit breaker) would otherwise record `ok` on a silent shortfall and freeze that
+    # key, open breaker) would otherwise record `ok` on a silent shortfall and freeze that
     # candidate for a full TTL. `submitted == 0` is NOT a shortfall (all-replies page, or unchanged).
     if submitted and written["n"] < submitted:
         detail = f"{written['n']}/{submitted} atoms stored (embed or write failed)"
@@ -274,45 +289,45 @@ def probe_candidate(conn, embedder, cookies: dict, headers: dict, cand: dict, *,
 def probe_candidates(conn, embedder, *, min_signals: int = 1, max_candidates: int = 0,
                      ttl_days: float = DEFAULT_TTL_DAYS, pages: int = DEFAULT_PAGES,
                      span_days: float = DEFAULT_SPAN_DAYS,
-                     pace_seconds: float = _PACE_SECONDS, profile: str | None = None) -> dict:
-    """Walk the due candidates, newest-vouched first, one timeline page each.
+                     pace_seconds: float = _PACE_SECONDS,
+                     should_stop: Callable[[], bool] | None = None) -> dict:
+    """Sample due candidates, newest-vouched first.
 
-    `max_candidates` is the request budget for this run (one page = one request), which is the only
-    scarce resource on this path — 0 means the whole queue, which at 961 candidates is ~5.7 hours of
-    paced requests. Bounded runs are the normal mode: state lives in `probe_pulls`, so stopping and
+    `max_candidates` bounds candidate samples for this run. Each sample can make up to `pages` X
+    requests to characterize a thin timeline; the server's X meter remains the request hard stop.
+    Bounded runs are the normal mode: outcome state lives in `probe_pulls`, so stopping and
     resuming costs nothing and re-pulls nobody.
 
-    Returns a run summary. A dead session or a spent rate budget STOPS the run with `stopped` set —
+    Returns a run summary. A dead session or an exhausted rate budget STOPS the run with `stopped` set —
     it never marks the remaining queue failed, because nothing was observed about them."""
     from pipeline.ingestion import x_graphql_core as core
     from pipeline.ingestion.utils import log
 
-    assert_model(conn, embedder)      # guard the store's embedding identity BEFORE any work
-    # Preflight that the embedder can actually EMBED, before spending shared X request budget —
-    # `assert_model` only checks identity, not liveness. Fail loud here rather than 25 requests
-    # later as 25 skipped candidates.
-    try:
-        embedder.embed(["probe preflight"], role="document")
-    except Exception as e:
-        log(f"[probe] embedder unavailable — NOTHING pulled (no X requests spent): {e}")
-        return {"source": "candidate-probe", "stopped": "embedder",
-                "error": f"{type(e).__name__}: {e}", "requests": 0, "atoms": 0}
-    timer = StageTimer()
     queue = candidate_queue(conn, min_signals=min_signals, ttl_days=ttl_days)
     if max_candidates:
         queue = queue[:max_candidates]
     if not queue:
         return {"source": "candidate-probe", "queued": 0, "note": "no candidate is due"}
 
+    assert_model(conn, embedder)      # guard the store's embedding identity before X work
+    # Preflight that the embedder can actually EMBED, before consuming shared X request budget —
+    # `assert_model` only checks identity, not liveness. Fail loud here rather than 25 requests
+    # later as 25 skipped candidates.
     try:
-        cookies = core.read_x_cookies(profile=profile)
+        embedder.embed(["probe preflight"], role="document")
+    except Exception as e:
+        log(f"[probe] embedder unavailable — nothing pulled (no X requests made): {e}")
+        return {"source": "candidate-probe", "stopped": "embedder",
+                "error": f"{type(e).__name__}: {e}", "requests": 0, "atoms": 0}
+    timer = StageTimer()
+
+    try:
+        session = core.x_session("https://x.com/home")
     except core.SyncAuthError as e:
         # Degrade, never crash: a missing X session is a broken SOURCE, not a broken run.
         log(f"[probe] no usable X session — nothing pulled: {e}")
         return {"source": "candidate-probe", "queued": len(queue), "stopped": "auth",
                 "error": str(e)}
-    headers = core.auth_headers(cookies, referer="https://x.com/home")
-
     tally = {probe_store.STATUS_OK: 0, probe_store.STATUS_EMPTY: 0,
              probe_store.STATUS_UNAVAILABLE: 0, probe_store.STATUS_FAILED: 0}
     atoms = requests = 0
@@ -323,16 +338,22 @@ def probe_candidates(conn, embedder, *, min_signals: int = 1, max_candidates: in
         f"≈ {len(queue) * pace_seconds / 60:.0f}-{len(queue) * pages * pace_seconds / 60:.0f} min")
 
     for i, cand in enumerate(queue):
+        if should_stop and should_stop():
+            stopped = "lease_lost"
+            break
         if i and pace_seconds > 0:
             time.sleep(pace_seconds)          # constant-rate: see `_PACE_SECONDS`
+        if should_stop and should_stop():
+            stopped = "lease_lost"
+            break
         try:
             with timer.stage("probe"):
                 # `pace_seconds` is passed down so a multi-page candidate paces its OWN requests
                 # too, not just the gap between candidates.
-                res = probe_candidate(conn, embedder, cookies, headers, cand, pages=pages,
+                res = probe_candidate(conn, embedder, session, session, cand, pages=pages,
                                       span_days=span_days, pace_seconds=pace_seconds)
         except core.XRateLimited as e:
-            log(f"[probe] rate budget spent after {requests} request(s) — stopping. {e}")
+            log(f"[probe] request allowance exhausted after {requests} request(s) — stopping. {e}")
             stopped = "rate_limited"
             break
         except core.SyncAuthError as e:
@@ -363,8 +384,8 @@ def _cli(argv: list[str] | None = None) -> int:
                     help="Only candidates with at least this many DISTINCT (type, platform) "
                          "signals. 3 ≈ 29 people, 2 ≈ 196, 1 ≈ everyone (rerun10 snapshot).")
     ap.add_argument("--max-candidates", type=int, default=0,
-                    help="THE REQUEST BUDGET for this run (0 = the whole due queue). One page per "
-                         "candidate = one request; the run is resumable, so bounding it is free.")
+                    help="Candidate samples for this run (0 = the whole due queue). A sample may "
+                         "page further for a thin timeline; the run is resumable.")
     ap.add_argument("--ttl-days", type=float, default=DEFAULT_TTL_DAYS,
                     help="How stale a snapshot may be before re-pull. 0 re-pulls everyone.")
     ap.add_argument("--pages", type=int, default=DEFAULT_PAGES,
@@ -377,7 +398,6 @@ def _cli(argv: list[str] | None = None) -> int:
                          f"only bounds its cost.")
     ap.add_argument("--pace-seconds", type=float, default=_PACE_SECONDS,
                     help="Constant-rate gap between requests. 0 disables pacing (will 429).")
-    ap.add_argument("--x-profile", default=None, help="X cookie profile (else auto-pick).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the due queue and exit — no requests, no writes.")
     args = ap.parse_args(argv)
@@ -399,8 +419,8 @@ def _cli(argv: list[str] | None = None) -> int:
         print(f"[probe] embedder: model={embedder.model} provider={embedder.provider}")
         out = probe_candidates(conn, embedder, min_signals=args.min_signals,
                                max_candidates=args.max_candidates, ttl_days=args.ttl_days,
-                               pages=args.pages, span_days=args.span_days, pace_seconds=args.pace_seconds,
-                               profile=args.x_profile)
+                               pages=args.pages, span_days=args.span_days,
+                               pace_seconds=args.pace_seconds)
     finally:
         conn.close()
     print("[probe] summary:\n" + _json.dumps(out, indent=2, default=str))

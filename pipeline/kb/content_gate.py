@@ -37,7 +37,13 @@ from .chunk import strip_frontmatter
 # The gate's own concurrency budget (ARC-1): batches of one page grade independently (disjoint
 # unit indices, missing index defaults to KEEP), so fan-out changes only wall-clock, not verdicts.
 # Process-wide singleton so future across-atom parallelism shares one budget with the provider,
-# same contract as `embed._EMBED_GATE`. Sizing/measurement history:
+# same contract as `embed._EMBED_GATE`.
+#
+# MEASURED 2026-07-25: this gate is 63% of a Substack ingest's wall-clock and 97% of a blog's —
+# by far the largest stage — and it ran strictly serially, one `llm_client.call` after another.
+# SIZING: a post needs 1..8 LLM calls (p50 4, max 8 on karpathy.github.io), so start at 4 and
+# probe to 8 — the median page saturates immediately and the worst collapses from sum-of-8 to
+# max-of-8. AIMD halves on a 429, so the real ceiling is discovered rather than guessed.
 _GATE_CONCURRENCY = 8
 _GATE_SEM = AdaptiveSemaphore(4, min_permits=2, max_permits=_GATE_CONCURRENCY, increase_after=4)
 
@@ -290,25 +296,3 @@ def reapply_keep(markdown: str, keep: list[bool]) -> str | None:
     if not kept_units:
         return None
     return frontmatter + "\n\n".join(kept_units) if frontmatter else "\n\n".join(kept_units)
-
-
-def _cli(argv: list[str] | None = None) -> int:
-    """Eyeball one page: `python -m pipeline.kb.content_gate path/to/snapshot.md` prints the
-    per-unit keep/drop verdicts + a one-line summary. Manual spot-check before the gold-set run."""
-    import sys
-    args = argv if argv is not None else sys.argv[1:]
-    if not args:
-        print("usage: python -m pipeline.kb.content_gate <snapshot.md>")
-        return 2
-    md = open(args[0], encoding="utf-8").read()
-    v = classify_page(md)
-    for i, (u, k) in enumerate(zip(v.units, v.keep)):
-        tag = "KEEP" if k else "DROP"
-        print(f"[{tag}] {u[:110].replace(chr(10), ' ')}")
-    verdict = "REJECT (no atom)" if v.kept_text is None else f"{v.n_kept}/{len(v.units)} units kept"
-    print(f"\n--- {verdict}  |  calls={v.n_calls}  degraded={v.degraded} ---")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_cli())

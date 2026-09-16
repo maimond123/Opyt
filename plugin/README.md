@@ -25,7 +25,7 @@ you what it *says*, along with whether the stored copy is complete or a paywall 
 
 Registering this by hand meant editing `~/.claude.json` with **an absolute path to a specific
 venv** — which only works on the machine it was written on. The plugin removes that: the MCP
-server runs via **`uvx --from opyt==0.1.0a4 opyt-mcp`** (no pre-install — uvx fetches OPYT from
+server runs via **`uvx --from opyt@latest opyt-mcp`** (no pre-install — uvx fetches OPYT from
 PyPI into an ephemeral env).
 
 ## Install
@@ -36,11 +36,14 @@ PyPI into an ephemeral env).
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-`.mcp.json` runs `uvx --from opyt==0.1.0a4 opyt-mcp`, so `uv` fetches OPYT from PyPI into an
+`.mcp.json` runs `uvx --from opyt@latest opyt-mcp`, so `uv` fetches OPYT from PyPI into an
 ephemeral environment. Nothing to pre-install, no GitHub account, and no SSH key.
 
-The version is pinned because `0.1.0a4` is a pre-release. Drop the pin to a bare `opyt` when a
-stable release exists.
+`opyt@latest`, not a version and not a bare `opyt`. A version pin freezes you on the build you
+installed; a bare requirement freezes you too, because `uvx` reuses its cached environment
+without querying the index. Only `@latest` picks up a published fix — measured 2026-09-14 on
+uv 0.12.13 at 226 ms per launch against 36 ms for the other two. Offline it runs the cached
+build instead of failing.
 
 First launch downloads ~96 packages, which takes roughly 40 seconds. It looks like a hang. It
 isn't.
@@ -77,8 +80,16 @@ The key lands in `~/.opyt/.env`. Never paste one into the chat; `onboard` opens 
 that.
 
 **X needs no key and there is no way to supply one.** Every X read — your bookmarks, an Oracle's
-timeline, a single post, a profile — runs on your own logged-in x.com session. If no local browser
-has one, `onboard` offers to open a window for you to log in.
+timeline, a single post, a profile — runs on OPYT's persistent x.com profile. Call
+`onboard(source='x')` to open it, log in, then call `onboard` again. OPYT never scans your
+normal browser profiles for X.
+
+**X is not required.** `onboard` asks what you already read, and X is one answer of several.
+Connect X and your Lists, following and likes become people to screen; connect Substack with
+`onboard(source='substack')` and your subscriptions do the same. Neither is needed: name writers
+yourself with `oracle(action='confirm', add_handles=[...])`, which takes any http URL and not just
+an X handle, or watch research topics with `sitting(action='watchlist', add=[...])`. Answer
+`onboard(source='skip')` to set it up later; setup finishes either way.
 
 Search needs no key on an empty store. Once atoms exist, the default hybrid mode embeds your query
 through OpenRouter, so it wants that one key too; `mode="bm25"` stays keyless.
@@ -86,35 +97,40 @@ through OpenRouter, so it wants that one key too; `mode="bm25"` stays keyless.
 **(Optional) Install the package** to put the `opyt-keys` credential CLI on your PATH:
 
 ```bash
-uv tool install opyt==0.1.0a4     # adds opyt-keys to your PATH (pipx works too)
+uv tool install opyt@latest     # adds opyt-keys to your PATH (pipx works too)
 ```
 
 The MCP tools work without this — it only lights up the `opyt-keys` CLI.
 
 ## What runs in the background
 
-Opening a session starts the server, and the server forks detached catch-up rails — keeping your
-trusted sources current, running standing research queries, pulling new bookmarks. They coalesce
-(mostly hourly), so most session opens do nothing at all.
+A resident process, `opyt-worker`, runs the catch-up rails — keeping your trusted sources
+current, running standing research queries, pulling new bookmarks. Install it once with
+`opyt-install-worker` and macOS starts it at login; it runs whether or not a session is open. Each
+rail comes due hourly at most (ten minutes for the Oracle refresh) and decides for itself whether
+there is anything to do, so most passes exit immediately.
+
+A rail becomes active when something gives it work — you consent during `onboard`, you share your
+knowledge base, a sitting emits a standing question. A fresh install schedules nothing.
 
 Some of those rails spend metered credit. Others read your logged-in browser session. **Each one
 carries its own consent marker, and a fresh install has none**, so on first launch every one of
 them declines and reports what it would need. Consent is per-rail on purpose: opting into one
 loop never opts you into another with a different cost shape.
 
-`onboard` is where you grant them. The browser step — which is what triggers the macOS Keychain
-prompt, and which warns you before it does — is what opens the rail that reads your X and
-Substack sessions. Measured on a cold install: seven rails fire, all seven decline, total spend
-`$0.00`.
+`onboard` is where you grant them. Its explicit X-connect action opens OPYT's separate persistent
+profile and never scans your normal browser profiles. Measured on a cold install 2026-09-07: all
+eight rails run under the worker and every one exits on its own guard — three for want of consent,
+the rest on an empty store or a model preflight. Nothing is spent.
 
 ## Notes / known edges
 
-- **Installed from PyPI, pinned to a pre-release.** `opyt==0.1.0a4`. The pin is what makes the
+- **Installed from PyPI, pinned to a pre-release.** `opyt@latest`. The pin is what makes the
   install reproducible: `uvx` resolves the exact version and caches it, so a later release never
   changes what an existing install runs. The pin must be bumped in the same commit as
   `pyproject.toml`, or it names a version PyPI does not have and the install fails outright --
   which is exactly what happened between 2026-08-30 and 2026-08-31, when this file claimed
-  `0.1.0a4` was published and only `0.1.0a1` ever had been.
+  `0.1.0a5` was published and only `0.1.0a1` ever had been.
 
 - **A pre-release does not gate itself here.** pip and uv skip pre-releases only when a stable
   version also exists. While every published version is a pre-release, a bare `uvx --from opyt opyt-mcp`
@@ -122,5 +138,5 @@ Substack sessions. Measured on a cold install: seven rails fire, all seven decli
   a stable version you would otherwise receive.
 
 - **Client paths are macOS-only.** `opyt_core/install_client.py` knows Cursor, Claude Desktop and
-  Windsurf config locations for macOS only; Linux and Windows paths are not yet handled. The
-  browser step in `onboard` also reads cookies via the macOS Keychain.
+  Windsurf config locations for macOS only; Linux and Windows paths are not yet handled. The X
+  setup action uses a separate OPYT-managed Chromium profile.

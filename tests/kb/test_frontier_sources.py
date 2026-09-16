@@ -112,6 +112,23 @@ def test_github_windows_on_pushed_not_created(monkeypatch):
     assert c.candidate_id == "repo:o/n" and c.published == "2026-08-09"
 
 
+def test_the_discovery_client_owes_exactly_one_method():
+    """`GitHubClient` is the seam the adapter is written against, and stage 2 asks it for exactly
+    one thing. Its per-repo detail reads (`repo`, `readme`) had no caller and went 2026-09-05 —
+    a default-returning method on an ABC is invisible dead surface, since nothing fails when it
+    stops being implemented. A subclass implementing only `search_repos` must stay constructible,
+    which is what breaks the moment somebody re-adds one."""
+    from pipeline.artifacts.github_client import GitHubClient
+
+    class OnlySearch(GitHubClient):
+        def search_repos(self, q, limit=10, sort="stars"):
+            return [{"full_name": "o/n", "html_url": "https://github.com/o/n",
+                     "pushed_at": "2026-08-09", "description": "d", "stars": 5}]
+
+    (c,) = fs.GitHubAdapter(client=OnlySearch()).search("kernel", since=None)
+    assert c.candidate_id == "repo:o/n" and c.kind == "repo"
+
+
 def test_github_does_not_sort_on_the_axis_it_filtered_on():
     """`pushed:>DATE` already selects on recency, so `sort=updated` would rank the window by the
     thing the window guarantees — an ordering carrying no information about quality. Measured on
@@ -125,6 +142,24 @@ def test_github_does_not_sort_on_the_axis_it_filtered_on():
             return []
     fs.GitHubAdapter(client=C()).search("kernel", since=_NOW - timedelta(days=3))
     assert seen["sort"] == "stars"
+
+
+def test_github_is_paced_for_the_ANONYMOUS_search_budget():
+    """`/search/repositories` allows 10 requests/minute unauthenticated and 30 with a token
+    (docs.github.com/en/rest/search/search). Most installs have no token — `GITHUB_TOKEN` is set
+    only by `opyt-keys` — so the pacing has to hold at the anonymous number, which is one request
+    per 6 seconds.
+
+    This was `0.0` until 2026-09-05, justified as "token'd search is 30/min". Two things were
+    wrong with that. The token it assumed is one nothing in the product can acquire. And
+    `MAX_REQUESTS_PER_RUN` is 40, so 40 unpaced requests exceed the TOKENED limit as well — a key
+    would have raised the ceiling and left the adapter over it either way.
+
+    Asserted as a FLOOR, not as `== 6.0`: raising the interval is always safe, and pinning the
+    literal would make a more conservative value fail for no reason. What must never happen is
+    dropping back under the anonymous budget."""
+    per_minute_anonymous = 10
+    assert fs.GitHubAdapter.min_interval_s >= 60 / per_minute_anonymous
 
 
 def test_only_built_adapters_are_registered():
@@ -158,7 +193,13 @@ _OA_BODY = b"""{"results": [
   "publication_date": "2026-08-10",
   "abstract_inverted_index": {"restaking": [2], "We": [0], "study": [1]},
   "authorships": [{"author": {"id": "https://openalex.org/A5123233691",
-                              "display_name": "Zhenhang Shang"}}],
+                              "display_name": "Zhenhang Shang",
+                              "orcid": "https://orcid.org/0000-0002-4027-364X"},
+                   "author_position": "first"},
+                  {"author": {"id": "https://openalex.org/A5000000002",
+                              "display_name": "Raw Orcid Only"},
+                   "raw_orcid": "https://orcid.org/0000-0001-1111-2222"},
+                  {"author": {"display_name": "No Id Here"}}],
   "primary_location": {"landing_page_url": "https://arxiv.org/abs/2608.09055",
                        "source": {"display_name": "arXiv (Cornell University)"}},
   "type": "preprint", "cited_by_count": 0, "relevance_score": 34.2},
@@ -220,7 +261,14 @@ def test_openalex_rebuilds_the_abstract_and_carries_its_authors():
     c = fs._parse_openalex(_OA_BODY)[0]
     assert c.summary == "We study restaking"
     assert c.title == "Repeated-Game Security"          # whitespace collapsed
-    assert c.payload["authors"] == ["Zhenhang Shang"]
+    # The ORCID rides free in this same response (73% of 256 measured authorships carry one) and
+    # is the ONLY key an `openalex:` entity can safely merge to a `scholar:` one on. Stored bare.
+    assert c.payload["authors"] == [
+        {"name": "Zhenhang Shang", "openalex_id": "A5123233691",
+         "orcid": "0000-0002-4027-364X", "position": "first"},
+        {"name": "Raw Orcid Only", "openalex_id": "A5000000002",
+         "orcid": "0000-0001-1111-2222"},               # `raw_orcid` is the fallback source
+        {"name": "No Id Here"}]                         # falsy keys omitted, never stored as null
     assert c.published == "2026-08-10"
     # The score rides the payload for `frontier_execute._relevance_cut`; a work the API returns
     # without one carries None, which the cut reads as NOT COMPARABLE rather than zero.

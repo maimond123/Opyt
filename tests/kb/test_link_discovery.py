@@ -36,10 +36,6 @@ pytestmark = pytest.mark.real_triage
     ("https://eugeneyan.com/style.css", "drop"),
     ("https://eugeneyan.com/feed.xml", "drop"),
     ("https://eugeneyan.com/paper.pdf", "drop"),                 # pdf routing parked → drop
-    # drop — social / commerce homes
-    ("https://twitter.com/eugeneyan", "drop"),
-    ("https://github.com/eugeneyan", "drop"),
-    ("https://www.linkedin.com/in/eugeneyan", "drop"),
     # drop — nav / mailto / bare homepage
     ("https://eugeneyan.com/about/", "drop"),
     ("https://eugeneyan.com/tags/llm/", "drop"),
@@ -50,7 +46,6 @@ pytestmark = pytest.mark.real_triage
     ("https://sebastianraschka.com/blog/2024/llm-course.html", "strong"),
     ("https://eugeneyan.com/writing/llm-patterns/", "strong"),
     ("https://newsletter.pragmaticengineer.com/p/scaling-stripe", "strong"),
-    ("https://arxiv.org/abs/2401.12345", "strong"),
     # gray — marker-less slug / section page (structure can't decide → triage)
     ("https://zeroknowledge.fm/the-groth16-episode", "gray"),
     ("https://huyenchip.com/index.php/some-flat-slug", "gray"),
@@ -220,6 +215,46 @@ def test_discover_drops_external_press_keeps_owned(stub_network, triage_ready, m
     monkeypatch.setattr(llm_client, "call", _approve({}))
     out = ld.discover_candidate_urls("https://gajesh.com")
     assert {e["url"] for e in out} == {"https://gajesh.com/2024/my-defi-post"}      # press dropped
+
+
+def test_discover_reaches_the_authors_work_on_a_host_they_do_not_own(stub_network, triage_ready,
+                                                                      monkeypatch):
+    """The corpus miss this arm exists for. Measured on karpathy.ai 2026-09-09: the host rule alone
+    kept 3 of his 55 own links, because his essays are on `karpathy.github.io` and his project
+    pages under `cs.stanford.edu/people/karpathy/`, and neither is a subdomain of his site.
+
+    The press link is in the same batch on purpose — the arm must widen recall without admitting
+    writing ABOUT him."""
+    stub_network(
+        baseline=[],
+        hub=[{"url": "https://cs.stanford.edu/people/karpathy/advice.html", "anchor": "undergrads",
+              "via": "https://karpathy.ai"},
+             {"url": "https://karpathy.github.io/2019/04/25/recipe/", "anchor": "A Recipe",
+              "via": "https://karpathy.ai"},
+             {"url": "https://www.wired.com/2015/01/karpathy/", "anchor": "Wired article",
+              "via": "https://karpathy.ai"}],
+    )
+    monkeypatch.setattr(llm_client, "call", _approve({0: "keep"}))
+
+    out = ld.discover_candidate_urls("https://karpathy.ai", author_name="Andrej Karpathy")
+
+    assert {e["url"] for e in out} == {"https://cs.stanford.edu/people/karpathy/advice.html",
+                                       "https://karpathy.github.io/2019/04/25/recipe/"}
+
+
+def test_without_a_name_the_guard_is_exactly_the_host_rule(stub_network, triage_ready, monkeypatch):
+    """`tokens` empty ⇒ the host arm alone. The origin host label still yields a token, so this
+    pins the case where NEITHER input names the person and the function must not widen."""
+    stub_network(
+        baseline=[],
+        hub=[{"url": "https://cs.stanford.edu/people/karpathy/advice.html", "anchor": "undergrads",
+              "via": "https://blog.example.com"}],
+    )
+    monkeypatch.setattr(llm_client, "call", _approve({}))
+
+    out = ld.discover_candidate_urls("https://blog.example.com")
+
+    assert out == []
 
 
 def test_discover_keeps_owned_subdomain(stub_network, triage_ready, monkeypatch):

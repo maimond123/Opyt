@@ -3,8 +3,7 @@ pipeline/kb/sitting_store.py — persist a built sitting, its read stamps, and t
 
 Owns the SQL for a sitting's lifecycle after `build_sitting` decides membership: the INSERT, the
 read stamps (`mark_read`/`mark_lens_read` — a build covers nothing, only a read does), and the
-coverage ledger. `ensure_seed_vector` imports `sitting_builder.SeedError` lazily, inside the
-function, to avoid a cycle with `sitting_builder`'s eager import of this module.
+coverage ledger.
 """
 from __future__ import annotations
 
@@ -14,6 +13,7 @@ from pipeline.timeparse import utc_iso, utc_now
 
 import numpy as np
 
+from . import sitting_builder as sb
 from . import schema
 from . import sitting_vectors as sv
 
@@ -38,14 +38,14 @@ def record_sitting(conn, rec: dict) -> str:
     `skipped` stores the ceiling-skip list the builder produced, not just its count: the ruling
     that KEPT the near-duplicate skip rests on those skips being auditable atom by atom.
     """
-    prior = conn.execute("SELECT read_at, read_status FROM sittings WHERE sitting_id = ?",
+    prior = conn.execute("SELECT read_at FROM sittings WHERE sitting_id = ?",
                          (rec["sitting_id"],)).fetchone()
     conn.execute(
         "INSERT OR REPLACE INTO sittings (sitting_id, built_at, seed_kind, seed_ref, "
         " seed_atom_ids, floor, calibrated_floor, ceiling, budget_tokens, region_atoms, "
         " region_tokens, atoms, tokens, stop, skipped_dupes, skipped, continues, prior_atoms, "
-        " parent_sitting_id, region_key, seed_vector, read_at, read_status) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " parent_sitting_id, region_key, seed_vector, read_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rec["sitting_id"], rec["built_at"], rec["seed_kind"], rec["seed_ref"],
          json.dumps(rec["seed_atom_ids"]), rec["floor"], rec["calibrated_floor"],
          rec["ceiling"], rec["budget_tokens"], rec["region_atoms"], rec["region_tokens"],
@@ -55,7 +55,7 @@ def record_sitting(conn, rec: dict) -> str:
          schema.region_key(rec["seed_kind"], rec["seed_ref"], rec["floor"],
                            rec["ceiling"], rec["budget_tokens"]),
          _encode_vector(conn, rec.get("seed_vector")),
-         prior["read_at"] if prior else None, prior["read_status"] if prior else None))
+         prior["read_at"] if prior else None))
     conn.execute("DELETE FROM sitting_atoms WHERE sitting_id = ?", (rec["sitting_id"],))
     conn.executemany(
         "INSERT INTO sitting_atoms (sitting_id, atom_id, rank, is_seed, rel, red, tokens) "
@@ -96,46 +96,59 @@ def ancestors(conn, sitting_id: str) -> list[str]:
     return out
 
 
-def mark_read(conn, sitting_id: str, *, status: str = "ok", at: datetime | None = None) -> None:
+def mark_read(conn, sitting_id: str, *, at: datetime | None = None) -> None:
     """Stamp a sitting as read — the only thing that moves an atom out of never-read mass.
-    Called by the reader, never by the builder: a built-but-unread region stays unread."""
-    conn.execute("UPDATE sittings SET read_at = ?, read_status = ? WHERE sitting_id = ?",
-                 (utc_iso(at or utc_now()), status, sitting_id))
+    Called by the reader, never by the builder: a built-but-unread region stays unread.
+
+    There is NO failure outcome to record here, and that is the design, not a gap. A failed read
+    must leave the sitting UNREAD so the ledger keeps asking for it — see `sitting_reader._fail`,
+    which writes no stamp and records the failure in the run table via
+    `frontier_queries.record_run(status="failed")` instead. A `status=` parameter accepted a second
+    value until 2026-09-04, no producer ever passed one, and `mark_read(status="failed")` reported
+    the region as 100% covered because the coverage UNION's `sittings` half ignores the column.
+    The column it wrote to went on 2026-09-06 — see `_drop_read_status`."""
+    conn.execute("UPDATE sittings SET read_at = ? WHERE sitting_id = ?",
+                 (utc_iso(at or utc_now()), sitting_id))
     conn.commit()
 
 
-def mark_lens_read(conn, sitting_id: str, lens: str, *, status: str = "ok",
-                   at: datetime | None = None) -> None:
+def mark_lens_read(conn, sitting_id: str, lens: str, *, at: datetime | None = None) -> None:
     """Stamp `sitting_id` as read under `lens` — the same re-read guard `mark_read` gives `queries`,
     given independently to every other API lens (`claims` today).
 
     Writes to `sitting_reads(sitting_id, lens, ...)`, a separate child table from
     `sittings.read_at`, so one lens's read state never blocks or satisfies another's.
     `sitting_scheduler` stays scoped to `sittings.read_at` alone.
+
+    No failure outcome, for the reason on `mark_read`: a lens that failed must leave no row, so
+    its own re-read guard lets it try again.
     """
     ts = utc_iso(at or utc_now())
     conn.execute(
-        "INSERT INTO sitting_reads (sitting_id, lens, read_at, read_status) VALUES (?,?,?,?) "
-        "ON CONFLICT(sitting_id, lens) DO UPDATE SET read_at=excluded.read_at, "
-        "read_status=excluded.read_status",
-        (sitting_id, lens, ts, status))
+        "INSERT INTO sitting_reads (sitting_id, lens, read_at) VALUES (?,?,?) "
+        "ON CONFLICT(sitting_id, lens) DO UPDATE SET read_at=excluded.read_at",
+        (sitting_id, lens, ts))
     conn.commit()
 
 
 def lens_read_state(conn, sitting_id: str, lens: str) -> dict | None:
-    """`{read_at, read_status}` for `sitting_id` under `lens`, or `None` if that lens has never read
-    it. The idempotency check every non-`queries` API lens's reader guards its own re-read with."""
+    """`{read_at}` for `sitting_id` under `lens`, or `None` if that lens has never read it. The
+    idempotency check every non-`queries` API lens's reader guards its own re-read with.
+
+    PRESENCE is the answer, not any field in it — both callers test the row. A `read_status`
+    column rode along until 2026-09-06 holding the literal 'ok'; see `schema._drop_read_status`
+    for why a second value must not replace it."""
     row = conn.execute(
-        "SELECT read_at, read_status FROM sitting_reads WHERE sitting_id = ? AND lens = ?",
+        "SELECT read_at FROM sitting_reads WHERE sitting_id = ? AND lens = ?",
         (sitting_id, lens)).fetchone()
     return dict(row) if row else None
 
 
 def get_lens_output(conn, sitting_id: str, lens: str) -> dict | None:
-    """One part's cached map output under `lens`, or None. See the `sitting_lens_outputs` DDL for
-    why this cache needs no invalidation rule."""
+    """One part's cached map output under `lens`, or None. Atom removal invalidates affected
+    parts; see the `sitting_lens_outputs` DDL for the cache lifetime."""
     row = conn.execute(
-        "SELECT output, model, in_tokens, out_tokens, cost_usd, created_at "
+        "SELECT output, model, in_tokens, out_tokens, created_at "
         "  FROM sitting_lens_outputs WHERE sitting_id = ? AND lens = ?",
         (sitting_id, lens)).fetchone()
     return dict(row) if row else None
@@ -148,13 +161,13 @@ def record_lens_output(conn, sitting_id: str, lens: str, output: str, *, usage: 
     u = usage or {}
     conn.execute(
         "INSERT INTO sitting_lens_outputs "
-        "  (sitting_id, lens, output, model, in_tokens, out_tokens, cost_usd, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?) "
+        "  (sitting_id, lens, output, model, in_tokens, out_tokens, created_at) "
+        "VALUES (?,?,?,?,?,?,?) "
         "ON CONFLICT(sitting_id, lens) DO UPDATE SET output=excluded.output, "
         "  model=excluded.model, in_tokens=excluded.in_tokens, out_tokens=excluded.out_tokens, "
-        "  cost_usd=excluded.cost_usd, created_at=excluded.created_at",
+        "  created_at=excluded.created_at",
         (sitting_id, lens, output, u.get("model"), u.get("in_tokens"), u.get("out_tokens"),
-         u.get("cost_usd"), utc_iso(at or utc_now())))
+         utc_iso(at or utc_now())))
     conn.commit()
 
 
@@ -207,9 +220,6 @@ def ensure_seed_vector(conn, sitting_id: str) -> np.ndarray:
     whose `seed_atom_ids` is empty by construction and whose centroid was never stored — there is
     nothing to rebuild from, so the caller must build a fresh region instead.
     """
-    # LAZY: sitting_builder imports sitting_store eagerly (for record_sitting), so a
-    # module-level import here the other way would cycle. Resolved at call time only.
-    from . import sitting_builder as sb
     s = get_sitting(conn, sitting_id)
     if s is None:
         raise KeyError(f"no sitting {sitting_id!r}")
@@ -233,9 +243,14 @@ def ensure_seed_vector(conn, sitting_id: str) -> np.ndarray:
 
 # A sitting counts as read if any API lens read it: `queries` via `sittings.read_at`, or another
 # lens via a `sitting_reads` row. UNION (not UNION ALL) dedupes a sitting read by both.
+#
+# Both halves test only for PRESENCE, and that symmetry is load-bearing. The `sitting_reads` half
+# carried `WHERE read_status = 'ok'` while the `sittings` half ignored the column, so the two
+# disagreed about what a non-`ok` row meant. The column itself went on 2026-09-06, which is what
+# makes the symmetry structural instead of a convention the next writer could break.
 _READ_SITTING_IDS = (
     "SELECT sitting_id FROM sittings WHERE read_at IS NOT NULL "
-    "UNION SELECT sitting_id FROM sitting_reads WHERE read_status = 'ok'")
+    "UNION SELECT sitting_id FROM sitting_reads")
 
 
 # ── The coverage ledger ─────────────────────────────────────────────────────────

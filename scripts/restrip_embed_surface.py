@@ -3,6 +3,11 @@
 scripts/restrip_embed_surface.py — recompute `chunks.embed_text` and RE-EMBED every chunk whose
 stored vector was built from a different surface than this build produces.
 
+RECURRING, not a one-time repair. It fires again on EVERY future `STRIP_VERSION` bump, and
+`ensure_kb_meta`'s refusal is what forces it — the store cannot be written until this has run.
+That detector is why it survived the 2026-09-08 hand-run audit while the two entry points beside
+it did not: a maintenance pass nothing can trigger is a pass nobody runs.
+
 Why it exists: `embed_surface.STRIP_VERSION` is an input that produced every vector in the store,
 exactly as the model is. Change a pattern and every existing vector is stale — built from text this
 build would no longer feed the embedder. `embed.ensure_kb_meta` REFUSES to write a second

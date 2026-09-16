@@ -32,12 +32,14 @@ import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 # Chrome writes the port it actually bound here once it is ready to accept CDP. Reading it
 # (rather than passing a fixed port) is what lets two OPYT processes run at once without
-# colliding — we always launch with --remote-debugging-port=0.
+# colliding — every DEBUGGED launch passes --remote-debugging-port=0. `launch` below is the
+# exception: a sign-in window carries no debugger at all.
 _PORT_FILE = "DevToolsActivePort"
 
 _LAUNCH_TIMEOUT = 30.0      # subprocess: can hang forever, so it gets a timeout
@@ -50,16 +52,48 @@ class CDPError(RuntimeError):
 
 # ── browser process ──────────────────────────────────────────────────────────────
 
+# Chrome writes ~130 MB of ML models and component payloads into EVERY profile it is handed, and
+# hosted that is per USER, for the same bytes every time. Measured 2026-09-12 on the box against a
+# throwaway profile that had visited ONE sign-in page: 46 MB `optimization_guide_model_store`,
+# 38 MB `component_crx_cache`, 23 MB `WasmTtsEngine`, 7.6 MB `OnDeviceHeadSuggestModel` -- against
+# 8 MB of actual profile. The same run with these flags leaves 5.5 MB total, a 96% cut, and it is
+# the difference between roughly 4,000 and 30,000 users fitting on one disk.
+#
+# Cookies are the one part of a profile OPYT ever reads, and they are untouched: the two profiles
+# were compared directly and both held the same 15 cookies for the same hosts.
+#
+# ⚠️ `--disable-background-networking` also stops variations and Safe Browsing list fetches.
+# Neither is load-bearing for signing in, but it is the first flag to drop if a browser launched
+# here ever starts behaving oddly.
+LEAN_PROFILE_FLAGS = (
+    "--disable-component-update",
+    "--disable-background-networking",
+    "--disable-features=OptimizationGuideModelDownloading,OptimizationHints,"
+    "OptimizationHintsFetching,OptimizationTargetPrediction,TextSafetyClassifier,"
+    "WasmTtsComponentUpdaterEnabled",
+)
+
+
+def chrome_argv(app_path: Path | str, user_data_dir: Path | str) -> list[str]:
+    """The opening argv every Chrome OPYT launches shares: its profile, and no bloat in it.
+
+    A builder rather than a constant because the profile is half of it, and a builder rather
+    than three copies because a launch site that forgets `LEAN_PROFILE_FLAGS` costs 130 MB per
+    user and nothing visible -- the failure is silent, which is exactly the kind that survives.
+    Callers append their own flags and put the URL last.
+    """
+    return [str(app_path), f"--user-data-dir={user_data_dir}",
+            "--no-first-run", "--no-default-browser-check", *LEAN_PROFILE_FLAGS]
+
+
 def _launch(app_path: Path, user_data_dir: Path, *, headless: bool,
             url: str | None) -> subprocess.Popen:
     """Start `app_path` on `user_data_dir` with CDP enabled on an OS-assigned port."""
-    argv = [
-        str(app_path),
-        f"--user-data-dir={user_data_dir}",
-        "--remote-debugging-port=0",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
+    # Chrome leaves this marker behind when its process is terminated during a gateway restart.
+    # It is metadata for the previous browser, not a lock: reading it before Chrome writes a
+    # fresh one connects to a dead port and makes the next owned session look unavailable.
+    (user_data_dir / _PORT_FILE).unlink(missing_ok=True)
+    argv = chrome_argv(app_path, user_data_dir) + ["--remote-debugging-port=0"]
     if headless:
         argv.append("--headless=new")
     if url:
@@ -108,6 +142,7 @@ class _Socket:
             raise CDPError(f"DevTools refused the upgrade: {head.splitlines()[0]!r}")
         self._buf = rest
         self._next_id = 0
+        self._events: list[dict] = []
 
     def _need(self, n: int) -> None:
         while len(self._buf) < n:
@@ -152,19 +187,55 @@ class _Socket:
             if fin:
                 return out
 
-    def call(self, method: str, params: dict | None = None) -> dict:
+    def call(self, method: str, params: dict | None = None, *,
+             session_id: str | None = None) -> dict:
         """Issue one CDP command and return its `result`, skipping interleaved events."""
         self._next_id += 1
         call_id = self._next_id
-        self._send_frame(json.dumps(
-            {"id": call_id, "method": method, "params": params or {}}).encode())
+        message = {"id": call_id, "method": method, "params": params or {}}
+        if session_id is not None:
+            message["sessionId"] = session_id
+        self._send_frame(json.dumps(message).encode())
         while True:
             msg = json.loads(self._recv_message())
             if msg.get("id") != call_id:
+                if "method" in msg:
+                    self._events.append(msg)
                 continue                 # a protocol event, or an earlier call's reply
             if "error" in msg:
                 raise CDPError(f"{method} failed: {json.dumps(msg['error'])}")
             return msg.get("result", {})
+
+    def wait_for_event(self, method: str, *, session_id: str | None = None,
+                       timeout: float = _CALL_TIMEOUT) -> dict | None:
+        """Return the next matching CDP event, or None when the wait expires.
+
+        Screencast frames are asynchronous CDP events. Keeping them here, beside command
+        replies, lets a hosted login use the same small protocol client as the local reader
+        without teaching either caller to parse WebSocket frames.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            for i, event in enumerate(self._events):
+                if event.get("method") == method and (
+                        session_id is None or event.get("sessionId") == session_id):
+                    return self._events.pop(i)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            old_timeout = self._sock.gettimeout()
+            self._sock.settimeout(remaining)
+            try:
+                event = json.loads(self._recv_message())
+            except socket.timeout:
+                return None
+            finally:
+                self._sock.settimeout(old_timeout)
+            if event.get("method") == method and (
+                    session_id is None or event.get("sessionId") == session_id):
+                return event
+            if "method" in event:
+                self._events.append(event)
 
     def close(self) -> None:
         try:
@@ -203,6 +274,10 @@ def controlled_browser(app_path: Path, *, user_data_dir: Path | None = None,
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            # `kill` ends the process, but only `wait` reaps it. This context manager owns
+            # the browser's whole lifecycle, so leaving collection to its parent would strand
+            # a zombie for every forced teardown.
+            proc.wait()
         if ephemeral:
             shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -217,9 +292,20 @@ def launch(app_path: Path, user_data_dir: Path, *, url: str | None = None) -> su
     Terminating it here would kill a login mid-flow.
 
     `user_data_dir` is always persistent — the session the user creates in that window exists
-    nowhere else, so an ephemeral profile would discard the thing it was opened for."""
+    nowhere else, so an ephemeral profile would discard the thing it was opened for.
+
+    No `--remote-debugging-port`, deliberately. Google refuses to sign in to a debugged
+    browser ("This browser or app may not be secure"), and the port is the signal it reads:
+    headed Chrome WITH the port reports `navigator.webdriver: true`, measured 2026-09-07
+    (docs/plans/2026-09-07-hosted-x-google-sso-block-context.md). The hosted login desktop
+    already obeys this boundary; this is the same rule at the local window. Nothing is lost —
+    no caller ever attached to this window, and the session is read back later by the
+    transplant, which relaunches separately WITH CDP."""
     user_data_dir.mkdir(parents=True, exist_ok=True)
-    return _launch(app_path, user_data_dir, headless=False, url=url)
+    argv = chrome_argv(app_path, user_data_dir)
+    if url:
+        argv.append(url)
+    return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def get_cookies(session: _Socket) -> list[dict]:
@@ -228,3 +314,24 @@ def get_cookies(session: _Socket) -> list[dict]:
     `Storage.getCookies` is browser-scoped; `Network.getAllCookies` is page-scoped and errors
     on the browser target. Nothing needs to be navigated to for this to work."""
     return session.call("Storage.getCookies")["cookies"]
+
+
+@dataclass(frozen=True)
+class Page:
+    """One attached browser page, limited to its own CDP target session."""
+
+    _browser: _Socket
+    session_id: str
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        return self._browser.call(method, params, session_id=self.session_id)
+
+    def wait_for_event(self, method: str, *, timeout: float = _CALL_TIMEOUT) -> dict | None:
+        return self._browser.wait_for_event(method, session_id=self.session_id, timeout=timeout)
+
+
+def new_page(browser: _Socket, url: str) -> Page:
+    """Create and attach to one Chrome page through the browser-level CDP endpoint."""
+    target_id = browser.call("Target.createTarget", {"url": url})["targetId"]
+    attached = browser.call("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+    return Page(browser, attached["sessionId"])

@@ -98,7 +98,7 @@ def _q(text, *, atom_ids=("a:seed",)):
 class _Resp:
     def __init__(self, text):
         self.text, self.model = text, "fake-model"
-        self.input_tokens, self.output_tokens, self.cost_usd = 100, 20, 0.01
+        self.input_tokens, self.output_tokens = 100, 20
         self.raw = {}
 
 
@@ -204,16 +204,14 @@ def test_a_preflight_failure_writes_no_queries_and_leaves_it_unread(conn, sittin
     assert sst.get_sitting(conn, sitting)["read_at"] is None
 
 
-def test_out_of_credits_is_named_rather_than_reported_as_a_broken_call(conn, sitting, ready,
-                                                                       monkeypatch):
-    """MONEY-ABSENT is the one spend condition that still gates, and it fails LOUD because the
-    remedy is a human action. Rejected before inference, so nothing was spent."""
+def test_a_provider_rejection_is_named_rather_than_reported_as_a_broken_call(conn, sitting, ready,
+                                                                               monkeypatch):
     class _402(RuntimeError):
         status = 402
     monkeypatch.setattr(llm_client, "call",
                         lambda role, **kw: (_ for _ in ()).throw(_402("no credit")))
     res = sr.read_sitting(conn, sitting, now=_NOW)
-    assert "OUT OF CREDITS" in res["reason"]
+    assert "provider rejected the prompt" in res["reason"]
     assert sst.get_sitting(conn, sitting)["read_at"] is None
 
 
@@ -389,14 +387,6 @@ def test_dry_run_writes_nothing_but_reports_the_queries(conn, sitting, ready, mo
     assert sst.get_sitting(conn, sitting)["read_at"] is None
 
 
-def test_unread_sittings_lists_the_queue_biggest_first(conn, sitting, ready, monkeypatch):
-    queue = sr.unread_sittings(conn)
-    assert [q["sitting_id"] for q in queue] == [sitting]
-    _answer(monkeypatch, _body([_q("x")]))
-    sr.read_sitting(conn, sitting, now=_NOW)
-    assert sr.unread_sittings(conn) == []
-
-
 def test_no_standing_reads_the_region_as_if_for_the_first_time(conn, sitting, ready, monkeypatch):
     """A measurement mode. "Did THIS sitting generate these queries?" cannot be answered while the
     model is shown the answer — measured on the real corpus, a region that shrank to 873 tokens
@@ -463,6 +453,20 @@ def test_a_read_that_only_renders_verdicts_is_a_good_read(conn, sitting, ready, 
     assert sst.get_sitting(conn, sitting)["read_at"] is not None
 
 
+def test_a_verdict_only_read_still_reports_its_citations(conn, sitting, ready, monkeypatch):
+    """Coverage is the only signal that catches a route-degraded read, so it must not go blind on
+    the shape this rail is heading for. Counting query citations alone made the settled-region read
+    above — full verdict coverage, no new threads — report "coverage is unknown, not uniform" while
+    the verdict cited a real dated atom."""
+    fq.upsert_queries(conn, [_q("mlx kernel autotune")], generator="sitting:mlx")
+    _answer(monkeypatch, _body([], [_v("mlx kernel autotune", "keep", atom_ids=("a:seed",))]))
+    res = sr.read_sitting(conn, sitting, now=_NOW)
+
+    assert res["emitted"] == 0                     # nothing but the verdict to count
+    assert res["coverage"]["cited"] == 1
+    assert "coverage is unknown" not in (res["coverage"]["note"] or "")
+
+
 def test_unverdicted_is_shown_minus_decided(conn, sitting, ready, monkeypatch):
     """Watched rather than merely recorded: a rising `unverdicted` means the survival signal is
     degrading while `kept` and `dropped` sit still and look healthy."""
@@ -512,11 +516,11 @@ def test_the_prompt_asks_for_a_verdict_on_every_running_query(conn, sitting, rea
 
 
 # ── record_lens_run — the Option C Part 2 receipt (Job L) ──────────────────────────────────────
-_USAGE = {"model": "test/model", "in_tokens": 900, "out_tokens": 300, "cost_usd": 0.0021}
+_USAGE = {"model": "test/model", "in_tokens": 900, "out_tokens": 300}
 
 
-def test_a_lens_receipt_carries_its_cost_and_stamps_no_read_at(conn, sitting):
-    """The whole contract: a run row with `lens` set and the map call's cost on it, `read_at` left
+def test_a_lens_receipt_carries_its_usage_and_stamps_no_read_at(conn, sitting):
+    """The whole contract: a run row with `lens` set and its token usage, `read_at` left
     untouched. Stamping `read_at` here would mean the `queries` lens could never run this region
     again — the opposite of the intent (docs/plans/2026-08-16-lens-reads-subscribe-a-region.md,
     Part 2). `consensus` stays NULL: that column is what separates a receipt from a queries read."""
@@ -524,7 +528,7 @@ def test_a_lens_receipt_carries_its_cost_and_stamps_no_read_at(conn, sitting):
     row = conn.execute("SELECT * FROM frontier_reader_runs WHERE sitting_id = ?",
                        (sitting,)).fetchone()
     assert row["lens"] == "briefing" and row["status"] == "ok"
-    assert row["consensus"] is None and row["cost_usd"] == _USAGE["cost_usd"]
+    assert row["consensus"] is None and row["in_tokens"] == _USAGE["in_tokens"]
     assert sst.get_sitting(conn, sitting)["read_at"] is None
 
 

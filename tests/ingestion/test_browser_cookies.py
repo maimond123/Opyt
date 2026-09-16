@@ -18,6 +18,7 @@ Two things this module exists to pin:
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,6 @@ def isolated_opyt_home(tmp_path, monkeypatch):
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("OPYT_HOME", str(home))
     monkeypatch.delenv("OPYT_BROWSER", raising=False)
-    monkeypatch.delenv("X_CHROME_PROFILE", raising=False)
 
 
 def _backend(key):
@@ -337,18 +337,6 @@ def test_classify_prefers_backend_consent():
                                 Exception("keychain error")) == "other"
 
 
-# ── consent_prewarn copy per backend ─────────────────────────────────────────────
-
-def test_consent_prewarn_copy():
-    """Chromium reads raise no dialog any more, so there is nothing to pre-warn about."""
-    assert bc.consent_prewarn(_backend("chrome")) is None
-    assert bc.consent_prewarn(_backend("brave")) is None
-    assert "Keychain" in bc.consent_prewarn(_backend("arc"))
-    assert "Full Disk Access" in bc.consent_prewarn(_backend("safari"))
-    assert bc.consent_prewarn(_backend("firefox")) is None
-    assert bc.consent_prewarn(None) is None
-
-
 # ── settings.yaml cookies.browser knob resolves ──────────────────────────────────
 
 def test_settings_browser_knob(monkeypatch, tmp_path):
@@ -366,32 +354,53 @@ def test_settings_browser_knob(monkeypatch, tmp_path):
     assert cookie_browser() is None
 
 
-# ── consent pre-warn copy (backend-derived — see guard `hardcoded-consent-prewarn`) ──
-
-def test_fda_prewarn_carries_the_local_only_reassurance():
-    """The 'nothing leaves your machine' sentence is doing real work in the one flow where a
-    user decides whether to let an agent read their browser — BOTH consent branches carry it."""
-    msg = bc.consent_prewarn(bc.backend_for("safari"))
-    assert "Full Disk Access" in msg and "Nothing leaves your machine" in msg
-    assert "machine" in bc.consent_prewarn(bc.backend_for("arc"))
-
-
-def test_prewarn_installed_names_the_installed_browser(monkeypatch):
-    """An Arc-only machine must be warned about Arc — never about a Chrome it doesn't have."""
-    monkeypatch.setattr(bc, "installed_backends", lambda: [bc.backend_for("arc")])
-    msg = bc.prewarn_installed()
-    assert "Arc" in msg and "Chrome" not in msg
-
-
-def test_a_chromium_only_machine_gets_no_prewarn(monkeypatch):
-    """The user-visible half of the change: on the common machine there is no native
-    dialog left to warn about, so onboarding must not promise one."""
-    monkeypatch.setattr(bc, "installed_backends",
-                        lambda: [bc.backend_for("chrome"), bc.backend_for("brave")])
-    assert bc.prewarn_installed() is None
-
-
 # ── OPYT's own login profiles (created by guided_login) ──────────────────────────
+
+def _managed_session(backend: str) -> None:
+    profile = bc.opyt_session_root() / backend / "Default"
+    profile.mkdir(parents=True)
+    (profile / "Cookies").touch()
+
+
+def test_read_opyt_cookies_uses_only_an_opyt_session(monkeypatch, tmp_path):
+    """A normal Chrome login must never substitute for OPYT's dedicated X session."""
+    normal = replace(bc.backend_for("chrome"), base=tmp_path / "normal-chrome")
+    normal_profile = normal.base / "Default"
+    normal_profile.mkdir(parents=True)
+    (normal_profile / "Cookies").touch()
+    _managed_session("chrome")
+    managed = bc.opyt_session_backends()
+    monkeypatch.setattr(bc, "installed_backends",
+                        lambda: [normal, *managed])
+    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda *args: True)
+    monkeypatch.setattr(
+        bc, "_read_one",
+        lambda backend, domains, *, cookie_file=None: (
+            {"auth_token": "managed" if backend.key.endswith("@opyt") else "normal"}, None
+        ),
+    )
+
+    assert bc.read_opyt_cookies(["x.com", "twitter.com"], "auth_token", source="X") == {
+        "auth_token": "managed"
+    }
+
+
+def test_read_opyt_cookies_tells_the_user_to_connect_when_absent(monkeypatch):
+    monkeypatch.setattr(bc, "installed_backends", lambda: [])
+
+    with pytest.raises(SyncAuthError, match=r"onboard\(source="):
+        bc.read_opyt_cookies(["x.com", "twitter.com"], "auth_token", source="X")
+
+
+def test_read_opyt_cookies_rejects_multiple_managed_sessions(monkeypatch):
+    _managed_session("chrome")
+    _managed_session("brave")
+    managed = bc.opyt_session_backends()
+    monkeypatch.setattr(bc, "installed_backends", lambda: managed)
+    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda *args: True)
+
+    with pytest.raises(SyncAuthError, match="Multiple OPYT-managed X sessions"):
+        bc.read_opyt_cookies(["x.com", "twitter.com"], "auth_token", source="X")
 
 def test_opyt_session_profiles_are_read_like_any_other(monkeypatch, tmp_path):
     """A guided login leaves a normal Chromium user-data-dir, so it is picked up by the

@@ -1,17 +1,18 @@
 """
 pipeline/ingestion/browser_cookies.py
 
-Shared local-session cookie reader for the browser-scrapes (X bookmarks, Claude chats,
-Substack): one place owns browser/profile enumeration and cookie reads instead of each
-source duplicating `browser_cookie3` glue.
+Shared local-session cookie reader. Generic readers (currently Substack) enumerate the user's
+installed browser profiles here; X uses the dedicated OPYT-managed reader below. One place owns
+browser/profile enumeration and cookie reads instead of each source duplicating
+`browser_cookie3` glue.
 
 Resolves two dimensions: browser (Chrome/Brave/Edge/Vivaldi/Opera read by OPYT itself,
 plus Arc/Firefox/Safari delegated to browser_cookie3) and profile (each Chromium profile
-is its own cookie sandbox, so only the Chromium family gets a profile picker). Scans
-installed browsers priority-first and stops at the first one holding a session;
+is its own cookie sandbox, so only the Chromium family supports generic profile selection). A
+generic scan stops at the first installed browser holding a session;
 `$OPYT_BROWSER` / explicit args override auto-pick, and a blocked read raises an
-actionable `SyncAuthError` rather than reading as "not logged in." This layer never
-prompts or guesses silently — the interactive picker lives in the CLI/onboarding layer.
+actionable `SyncAuthError` rather than reading as "not logged in." X never scans those profiles:
+it reads exactly one OPYT-managed session or reports setup is needed.
 
 **How a Chromium session is read, and why no Keychain dialog appears.** Asking macOS for a
 browser's `<Browser> Safe Storage` key from Python is what raises the native dialog, so this
@@ -61,7 +62,7 @@ OPYT_KEY_SUFFIX = "@opyt"
 class BrowserBackend:
     """One browser OPYT knows how to read a local session from.
 
-    `base` is the macOS Chromium profile root OPYT enumerates for the profile picker and
+    `base` is the macOS Chromium profile root OPYT enumerates for generic profile selection and
     reads by transplant; None means "delegate to browser_cookie3" (Firefox's profiles.ini,
     Safari's Cookies.binarycookies, Arc's non-standard layout — bc3 handles multi-profile
     merge + paths itself).
@@ -457,6 +458,23 @@ def list_logged_in(domains, auth_cookie: str, *, browsers=None):
     return candidates, failures
 
 
+def list_opyt_logged_in(domains, auth_cookie: str):
+    """Find sessions only in OPYT-created browser profiles.
+
+    `list_logged_in` stops after the first browser with a session, which is right for the
+    generic browser choice. A managed X read instead needs to detect every OPYT profile so
+    it can reject ambiguity rather than choose one. Each delegated scan is therefore pinned
+    to one key produced by `opyt_session_backends`; normal browser keys never enter it.
+    """
+    candidates: list[dict] = []
+    failures: list[dict] = []
+    for backend in opyt_session_backends():
+        found, blocked = list_logged_in(domains, auth_cookie, browsers=[backend.key])
+        candidates.extend(found)
+        failures.extend(blocked)
+    return candidates, failures
+
+
 def _fmt_candidate(c: dict) -> str:
     """'chrome/Profile 3 (Work — a@b.com)' or 'safari (Safari)' — one option line."""
     who = f"{c['browser']}/{c['profile']}" if c.get("profile") else c["browser"]
@@ -477,7 +495,7 @@ def _resolved_browser_override(explicit: str | None) -> str | None:
 
 
 def _resolved_profile_override(env_var: str | None) -> str | None:
-    """The profile to pin: $env_var (X_CHROME_PROFILE) → settings.yaml cookies.profile.
+    """The profile to pin: $env_var → settings.yaml cookies.profile.
     Mirrors _resolved_browser_override so both halves of the choice resolve the same way.
     Never raises (config is best-effort)."""
     if env_var and (val := os.getenv(env_var)):
@@ -542,6 +560,24 @@ def _worst_failure(failures: list[dict]) -> dict:
     return sorted(failures, key=lambda f: order.get(f["kind"], 4))[0]
 
 
+def _read_selected_candidate(domains, chosen: dict, source: str) -> dict:
+    """Read one detected session and turn a failed read into the typed user-facing error."""
+    who = (f"{chosen['browser']}/{chosen['profile']}"
+           if chosen.get("profile") else chosen["browser"])
+    backend = chosen["backend"]
+    cookies, err = _read_one(backend, domains, cookie_file=chosen["cookie_file"])
+    if err is not None:
+        raise SyncAuthError(remediation(_classify_failure(backend, err), backend, source))
+    if not cookies:
+        # The row was there and the read came back empty: reporting "not logged in" would
+        # be wrong, and returning {} would send an empty Cookie header and 401 far from here.
+        raise SyncAuthError(
+            f"Found a {source} session in {who}, but reading it back returned nothing. Open "
+            f"{backend.label}, confirm you are still signed in to {source}, then re-run.")
+    log(f"[cookies] using {source} session from {who} ({chosen['label']})")
+    return cookies
+
+
 def read_cookies(domains, auth_cookie: str, *, browser: str | None = None,
                  profile: str | None = None, env_var: str | None = None,
                  source: str = "site") -> dict:
@@ -558,54 +594,27 @@ def read_cookies(domains, auth_cookie: str, *, browser: str | None = None,
                                           browsers=[scan] if scan else None)
     chosen = pick(candidates, failures, browser=browser, profile=profile,
                   env_var=env_var, source=source)
-    who = f"{chosen['browser']}/{chosen['profile']}" if chosen.get("profile") else chosen["browser"]
-    backend = chosen["backend"]
-    cookies, err = _read_one(backend, domains, cookie_file=chosen["cookie_file"])
-    if err is not None:
-        raise SyncAuthError(remediation(_classify_failure(backend, err), backend, source))
-    if not cookies:
-        # The row was there and the read came back empty: reporting "not logged in" would
-        # be wrong, and returning {} would send an empty Cookie header and 401 far from here.
+    return _read_selected_candidate(domains, chosen, source)
+
+
+def read_opyt_cookies(domains, auth_cookie: str, *, source: str) -> dict:
+    """Read one managed `source` session from exactly one OPYT-created browser profile."""
+    if isinstance(domains, str):
+        domains = [domains]
+    candidates, failures = list_opyt_logged_in(domains, auth_cookie)
+    if len(candidates) == 1:
+        return _read_selected_candidate(domains, candidates[0], source)
+    if not candidates:
+        if failures:
+            failure = _worst_failure(failures)
+            raise SyncAuthError(remediation(failure["kind"],
+                                            backend_for(failure["browser"]), source))
         raise SyncAuthError(
-            f"Found a {source} session in {who}, but reading it back returned nothing. Open "
-            f"{backend.label}, confirm you are still signed in to {source}, then re-run.")
-    log(f"[cookies] using {source} session from {who} ({chosen['label']})")
-    return cookies
-
-
-# ── Consent copy (shown by the CLI / relayed by MCP results) ─────────────────────
-
-def consent_prewarn(backend: BrowserBackend | None) -> str | None:
-    """Copy to show BEFORE the first read of `backend`, when a native consent prompt is
-    coming. Returned (not printed) so the caller decides the channel. None = no prompt,
-    which is now the Chromium answer: a transplant read decrypts inside the browser and
-    never asks macOS for anything."""
-    if backend is None:
-        return None
-    if backend.consent == "keychain":
-        return (f"macOS will ask for Keychain access so Opyt can read your {backend.label} "
-                f"session locally — this stays on your machine. Click Allow (or Always Allow "
-                f"to skip this next time).")
-    if backend.consent == "fda":
-        # The local-only reassurance rides BOTH branches: it is true of every backend, and this
-        # copy runs exactly where a user is deciding whether to let an agent read their browser.
-        return (f"{backend.label}'s cookies need Full Disk Access. If the read fails, grant it "
-                f"in System Settings → Privacy & Security → Full Disk Access for your terminal "
-                f"(or the Opyt app), then retry. Nothing leaves your machine.")
-    return None
-
-
-def prewarn_installed() -> str | None:
-    """Pre-read consent copy for onboarding, where a native prompt CAN be pre-warned but
-    the resolved backend isn't known until the scan. Returns the message for the
-    highest-priority installed backend that trips a gate — Arc's Keychain or Safari's Full
-    Disk Access. None when nothing installed needs consent, which is the common case now
-    that Chrome/Brave/Edge/Vivaldi/Opera read without a dialog."""
-    for b in installed_backends():
-        msg = consent_prewarn(b)
-        if msg:
-            return msg
-    return None
+            f"No OPYT-managed {source} session found. Call onboard(source='{source.lower()}') "
+            f"to connect {source}, then re-run.")
+    raise SyncAuthError(
+        f"Multiple OPYT-managed {source} sessions are active. Keep one session connected "
+        f"and remove the others, then re-run.")
 
 
 def remediation(kind: str, backend: BrowserBackend | None, source: str) -> str:

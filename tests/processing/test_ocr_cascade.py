@@ -75,6 +75,23 @@ def test_chart_triggers_second_model(monkeypatch):
     assert "Revenue by year" in mr.text                       # the chart read replaced the OCR text
 
 
+def test_chart_context_keeps_a_long_form_title(monkeypatch):
+    """A blog title has no tweet-sized bound, so its chart context keeps the full suffix."""
+    title = "A" * 401
+    chart_prompts = []
+
+    def fake(role, **kw):
+        if kw["model"] == ocr_cascade.OCR_MODEL:
+            return _Resp("2024 2025\nTYPE: CHART")
+        chart_prompts.append(kw["user"])
+        return _Resp("Title: Revenue by year.")
+
+    monkeypatch.setattr(ocr_cascade.llm_client, "call", fake)
+    ocr_cascade.read_image("http://img", context=title)
+
+    assert chart_prompts and title in chart_prompts[0]
+
+
 def test_photo_is_decorative(monkeypatch):
     monkeypatch.setattr(ocr_cascade.llm_client, "call", lambda role, **kw: _Resp("TYPE: PHOTO"))
     mr = ocr_cascade.read_image("http://img")
@@ -196,7 +213,5 @@ def test_every_candidate_dead_disables_before_any_call(monkeypatch):
 
 
 def test_this_module_holds_no_price_table():
-    """The OCR spend is recorded by `llm_client.call` from the charge OpenRouter REPORTS, keyed on
-    the model override — so a table here would be a second, less accurate copy of it, and one that
-    goes stale silently (see `llm_spend._PRICING`'s 5.5x-low llama row). Deleted 2026-08-28."""
+    """OCR model selection belongs to routing, not a local table in this module."""
     assert not hasattr(ocr_cascade, "cost") and not hasattr(ocr_cascade, "_PRICE")
