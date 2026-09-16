@@ -1,7 +1,7 @@
 # OPYT — Claude Code plugin
 
 Bundles the OPYT Claude Code integration into one installable unit: the `Opyt` MCP server and its
-nine knowledge tools.
+thirteen knowledge tools.
 
 | | tool | what it does |
 |---|---|---|
@@ -13,7 +13,11 @@ nine knowledge tools.
 | | `frontier` | queue of recent papers/repos your standing queries pulled in |
 | | `oracle` | choose who to trust, from people you already curate |
 | | `add_oracle` | add one person as a trusted source |
+| **share** | `share` | publish your store and mint an invite link |
+| | `accept` | register a knowledge base somebody shared with you |
+| | `unshare` | cut off one reader, or everyone plus the served copy |
 | **setup** | `onboard` | set up OPYT on this machine — call this first on a fresh install |
+| | `forget` | remove one atom, or end an Oracle subscription |
 
 Tools appear as `mcp__Opyt__*`.
 
@@ -125,12 +129,14 @@ the rest on an empty store or a model preflight. Nothing is spent.
 
 ## Notes / known edges
 
-- **Installed from PyPI, pinned to a pre-release.** `opyt@latest`. The pin is what makes the
-  install reproducible: `uvx` resolves the exact version and caches it, so a later release never
-  changes what an existing install runs. The pin must be bumped in the same commit as
-  `pyproject.toml`, or it names a version PyPI does not have and the install fails outright --
-  which is exactly what happened between 2026-08-30 and 2026-08-31, when this file claimed
-  `0.1.0a5` was published and only `0.1.0a1` ever had been.
+- **Installed from PyPI, tracking the newest build.** `opyt@latest` is deliberately NOT a pin:
+  `uvx` re-resolves it against the index on every server start, so a published fix reaches an
+  existing install on its next launch with nothing to re-run. (A bare `opyt` would not do this —
+  uvx reuses its cached environment for a bare requirement and never checks for newer builds.
+  Offline, `@latest` falls back to the cached copy rather than failing to start.) This file
+  carried an exact pin until 2026-09-14, which meant a published fix reached nobody — and once
+  drifted from `pyproject.toml`, named a version PyPI did not have, failing the install
+  outright, which is exactly what happened between 2026-08-30 and 2026-08-31.
 
 - **A pre-release does not gate itself here.** pip and uv skip pre-releases only when a stable
   version also exists. While every published version is a pre-release, a bare `uvx --from opyt opyt-mcp`
