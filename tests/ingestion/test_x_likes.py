@@ -16,11 +16,12 @@ state and regardless of a not-yet-done live capture:
 
 from __future__ import annotations
 
-from unittest.mock import Mock
+from pipeline.curation import x_collectors
+from pipeline.platforms.x import collections as xlk
+from tests.ingestion.page_walk import walk
+from tests.ingestion.x_client_fake import FakeXClient
 
-from pipeline.ingestion import x_likes as xlk
-
-VIEWER = "1861260702494957568"   # David's rest_id
+VIEWER = "1861260702494957568"   # the viewer's rest_id
 
 
 # ── Fixtures: standard tweet-timeline shape ──────────────────────────────────
@@ -77,18 +78,17 @@ def _likes_timeline() -> dict:
         ]}]}}}}}}
 
 
-# ── parse: tweets + cursor out of the Likes root ─────────────────────────────
+# ── parse: tweets out of the Likes root ─────────────────────────────────────
 
-def test_parse_timeline_extracts_tweets_and_bottom_cursor():
-    tweets, cursor = xlk._parse_timeline(_likes_timeline())
+def _root(data: dict) -> dict:
+    """The timeline `likes_page` validates and hands the parser. An absent root is refused
+    there (test_collection_pages' missing-timeline cases), never parsed as empty."""
+    return data["data"]["user"]["result"]["timeline"]["timeline"]
+
+
+def test_parse_timeline_extracts_tweets():
+    tweets = xlk._parse_timeline(_root(_likes_timeline()))
     assert [xlk._tweet_id(t) for t in tweets] == ["t1", "t2", "t3", "t4"]
-    assert cursor == "0|123"                     # bottom cursor, not the top one
-
-
-def test_parse_timeline_empty_root_is_safe():
-    # A malformed/absent root → empty result, not a KeyError (fail-safe).
-    tweets, cursor = xlk._parse_timeline({"data": {}})
-    assert tweets == [] and cursor is None
 
 
 # ── author extraction incl. visibility unwrap + attestation site ─────────────
@@ -123,7 +123,7 @@ def test_aggregate_authors_counts_liked_and_excludes_self():
     # NousResearch liked twice, karpathy once, the viewer once (must drop)
     authors = [a("nous", "NousResearch"), a("kp", "karpathy"),
                a("nous", "NousResearch"), a(VIEWER, "me")]
-    out = xlk.aggregate_authors(authors, VIEWER)
+    out = x_collectors.aggregate_authors(authors, VIEWER)
     assert VIEWER not in [c["user_id"] for c in out]        # self excluded
     assert [c["handle"] for c in out] == ["NousResearch", "karpathy"]  # 2 likes ranks first
     assert out[0]["liked_count"] == 2
@@ -134,16 +134,16 @@ def test_aggregate_authors_sorts_ties_by_handle():
     def a(uid, handle):
         return {"user_id": uid, "handle": handle, "display_name": handle, "bio": "",
                 "site": "", "followers_count": 1, "verified": False, "i_follow": False}
-    out = xlk.aggregate_authors([a("z", "Zebra"), a("a", "Apple")], VIEWER)
+    out = x_collectors.aggregate_authors([a("z", "Zebra"), a("a", "Apple")], VIEWER)
     assert [c["handle"] for c in out] == ["Apple", "Zebra"]  # equal count → handle asc
 
 
 # ── end-to-end parse→aggregate over the fixture ──────────────────────────────
 
 def test_fixture_end_to_end_author_counts():
-    tweets, _ = xlk._parse_timeline(_likes_timeline())
+    tweets = xlk._parse_timeline(_root(_likes_timeline()))
     authors = [xlk._tweet_author(t) for t in tweets]
-    out = xlk.aggregate_authors([a for a in authors if a], VIEWER)
+    out = x_collectors.aggregate_authors([a for a in authors if a], VIEWER)
     by_handle = {c["handle"]: c for c in out}
     assert set(by_handle) == {"NousResearch", "karpathy"}   # viewer's own like excluded
     assert by_handle["NousResearch"]["liked_count"] == 2    # two liked tweets by them
@@ -161,21 +161,20 @@ def _likes_response(cursor_value: str, tweet_ids: list[str]) -> dict:
         "instructions": [{"type": "TimelineAddEntries", "entries": entries}]}}}}}}
 
 
-def test_fetch_liked_authors_terminates_and_dedups_tweets(monkeypatch):
+def test_likes_pages_terminate_and_dedup_tweets(monkeypatch):
     calls = {"n": 0}
-    def fake_get(op, qid, variables, features, headers, **kw):
+    def fake_get(op, qid, variables, features, **kw):
         calls["n"] += 1
         # X repeats the SAME liked tweets with an ever-advancing cursor → dedup + stop
         return _likes_response(f"cursor-{calls['n']}", ["t1", "t2", "t3"])
-    monkeypatch.setattr(xlk.core, "resolve_query_id", lambda *a, **k: "qid")
-    monkeypatch.setattr(xlk.core, "graphql_get", fake_get)
+    client = FakeXClient(fake_get)
 
-    authors = xlk.fetch_liked_authors(VIEWER, {}, {})
+    authors = walk(lambda cursor: xlk.likes_page(VIEWER, client, cursor))
     assert len(authors) == 3         # deduped by tweet id across pages, not 3×N
     assert calls["n"] <= 2           # page1: 3 new → page2: 0 new → stop (never a 429)
 
 
-def test_fetch_liked_authors_counts_repeat_authors_across_distinct_tweets(monkeypatch):
+def test_likes_pages_count_repeat_authors_across_distinct_tweets(monkeypatch):
     # Same author on DIFFERENT tweet ids must NOT be deduped away — that IS the like count.
     shared = _user_result("shared", "sharedauthor", "Shared", "", "", False, False)
     def _resp(cursor_value, tweet_ids):
@@ -185,29 +184,15 @@ def test_fetch_liked_authors_counts_repeat_authors_across_distinct_tweets(monkey
         return {"data": {"user": {"result": {"timeline": {"timeline": {
             "instructions": [{"type": "TimelineAddEntries", "entries": entries}]}}}}}}
     calls = {"n": 0}
-    def fake_get(op, qid, variables, features, headers, **kw):
+    def fake_get(op, qid, variables, features, **kw):
         calls["n"] += 1
         # page1: two distinct tweets by the SAME author; page2 repeats → 0 new → stop
         return _resp(f"c{calls['n']}", ["ta", "tb"])
-    monkeypatch.setattr(xlk.core, "resolve_query_id", lambda *a, **k: "qid")
-    monkeypatch.setattr(xlk.core, "graphql_get", fake_get)
+    client = FakeXClient(fake_get)
 
-    authors = xlk.fetch_liked_authors(VIEWER, {}, {})
+    authors = walk(lambda cursor: xlk.likes_page(VIEWER, client, cursor))
     assert len(authors) == 2         # ta + tb → two author contributions, both counted
     assert all(a["handle"] == "sharedauthor" for a in authors)
     # and aggregation folds them into one candidate liked twice
-    agg = xlk.aggregate_authors(authors, VIEWER)
+    agg = x_collectors.aggregate_authors(authors, VIEWER)
     assert len(agg) == 1 and agg[0]["liked_count"] == 2
-
-
-# ── fail-safe: no viewer id → skip, no crash, no write ───────────────────────
-
-def test_sync_likes_skips_without_viewer_id(monkeypatch):
-    from pipeline.kb.ingest_curation import sync_likes_signals
-
-    monkeypatch.setattr(xlk.core, "read_x_cookies", lambda: {"auth_token": "x"})
-    monkeypatch.setattr(xlk.core, "viewer_id", lambda c: None)
-    conn = Mock()
-    out = sync_likes_signals(conn)
-    assert out["skipped"] == "no_viewer_id"
-    assert conn.mock_calls == []

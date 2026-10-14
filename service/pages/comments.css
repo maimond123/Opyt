@@ -1,0 +1,141 @@
+/* service/pages/comments.css — comments on a page of sources, drawn by `comments.js` in the page's
+   own look (`page.css`). A passage with a comment is highlighted. On a wide screen its comments
+   sit in the right margin, level with it; on a narrow one they open from the bottom. */
+:root { --hl: #fbeebf; --hl-on: #f7d774; }
+:root[data-theme="dark"] { --hl: #4a3d10; --hl-on: #7d6614; }
+
+mark.cm-hl { background: var(--hl); color: inherit; padding: 2px 0; cursor: pointer; }
+mark.cm-hl.cm-a { border-radius: 3px 0 0 3px; }
+mark.cm-hl.cm-z { border-radius: 0 3px 3px 0; }
+mark.cm-hl.cm-a.cm-z { border-radius: 3px; }
+mark.cm-hl.on, mark.cm-hl.cm-pending { background: var(--hl-on); }
+
+/* ---------- what both layouts share: an entry, a form ---------- */
+.cm-card, .cm-sheet { font-size: 15px; line-height: 1.5; color: var(--body); }
+.cm-label {
+  margin: 0 0 10px; font: 500 11px var(--mono); letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted);
+}
+.cm-quote { margin: 0 0 14px; font-size: 15px; line-height: 1.6; }
+.cm-quote span {
+  background: var(--hl); border-radius: 3px; padding: 2px 3px;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+}
+.cm-entry + .cm-entry { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.cm-who { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; }
+.cm-av {
+  width: 26px; height: 26px; border-radius: 50%; flex: none; display: grid; place-items: center;
+  background: var(--surface); color: var(--text); font: 600 10.5px var(--mono);
+}
+.cm-name { font-weight: 600; color: var(--text); min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.cm-when { margin-left: auto; font: 11.5px var(--mono); color: var(--muted); white-space: nowrap; }
+.cm-text { margin: 0; white-space: pre-wrap; }
+.cm-link {
+  font: inherit; font-size: 13px; color: var(--muted); background: none; border: 0; padding: 0;
+  cursor: pointer; text-decoration: underline; text-underline-offset: 3px;
+}
+.cm-link:hover { color: var(--text); }
+.cm-del { display: block; margin-top: 6px; }
+.cm-form { margin-top: 12px; }
+.cm-card.cm-new .cm-form { margin-top: 0; }
+.cm-as { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
+.cm-as .cm-link { margin-left: auto; }
+.cm-field {
+  display: block; width: 100%; font: inherit; font-size: 15px; line-height: 1.5; color: var(--text);
+  padding: 8px 12px; border: 0; border-radius: 8px; background: var(--panel);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 16%, transparent); resize: none;
+}
+.cm-field:focus { outline: none; box-shadow: inset 0 0 0 1.5px var(--text); }
+.cm-field + .cm-field, .cm-note + .cm-field { margin-top: 8px; }
+.cm-note { margin: 8px 0 0; font-size: 13px; line-height: 1.45; color: var(--muted); }
+.cm-error { margin: 8px 0 0; font-size: 13.5px; color: var(--accent); }
+.cm-error:empty { display: none; }
+.cm-acts { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 12px; }
+.cm-go {
+  cursor: pointer; padding: 8px 18px; border: 0; border-radius: 999px;
+  background: var(--text); color: var(--bg); font: 500 14px var(--read);
+}
+.cm-go:hover { opacity: 0.88; }
+.cm-go:disabled { opacity: 0.5; cursor: default; }
+.cm-quiet { font: inherit; font-size: 14px; color: var(--muted); background: none; border: 0; padding: 8px 0; cursor: pointer; }
+.cm-quiet:hover { color: var(--text); }
+.cm-hint { margin: 0; color: var(--muted); }
+
+/* ---------- on every source: comment on the whole of it ---------- */
+.cm-src {
+  display: inline-flex; align-items: center; gap: 7px; font: inherit; color: var(--muted);
+  background: none; border: 0; padding: 4px 0; cursor: pointer;
+}
+.cm-src:hover { color: var(--text); }
+.cm-src svg, .cm-count svg, .cm-toggle svg { width: 14px; height: 14px; display: block; }
+/* on a narrow screen, where a source's own comments have no margin to sit in */
+.cm-count {
+  display: flex; align-items: center; gap: 8px; min-height: 44px; margin: -14px 0 8px; padding: 0;
+  font: inherit; font-size: 14.5px; color: var(--muted); background: none; border: 0; cursor: pointer;
+}
+.cm-count span { text-decoration: underline; text-underline-offset: 3px; }
+
+/* ---------- the button that appears on a selection ---------- */
+.cm-pill {
+  position: absolute; z-index: 48; display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 15px; border: 0; border-radius: 999px; cursor: pointer; white-space: nowrap;
+  background: var(--text); color: var(--bg); font: 500 14px var(--read);
+  box-shadow: 0 0 0 1px #0000000f, 0 4px 6px -1px #0000001f, 0 14px 32px #00000033;
+}
+.cm-pill svg { width: 15px; height: 15px; display: block; }
+.cm-pill.docked {
+  /* above the row the contents and comments buttons sit in */
+  position: fixed; left: 50%; bottom: calc(76px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+  height: 48px; padding: 0 22px; font-size: 15.5px;
+}
+.cm-pill[hidden], .cm-fab[hidden], .cm-count[hidden] { display: none; }
+
+/* ---------- wide: the margin ---------- */
+.cm-toggle, .cm-margin { display: none; }
+@media (min-width: 1180px) {
+  .cm-toggle { display: flex; }
+  .cm-toggle[aria-pressed="true"] { color: var(--text); }
+  .cm-fab, .cm-count, .cm-scrim, .cm-sheet { display: none !important; }
+  /* the cards move left to make room, and the bar keeps their edges */
+  .cm-on main { position: relative; max-width: 1432px; padding-left: 64px; padding-right: 356px; }
+  .cm-on .bar { width: calc(100% - 88px); max-width: 1344px; left: 20px; }
+  .cm-on .cm-margin { display: block; position: absolute; top: 0; right: 24px; width: 304px; }
+  .cm-card {
+    position: absolute; left: 0; right: 0; padding: 14px 16px; border-radius: 12px; cursor: pointer;
+    background: var(--card); box-shadow: var(--shadow-sm); transition: top 0.18s, left 0.18s;
+  }
+  .cm-card.on { left: -10px; right: 10px; padding: 16px; box-shadow: var(--shadow-win); cursor: auto; z-index: 1; }
+}
+
+/* ---------- narrow: a button in the corner, and comments from the bottom ---------- */
+.cm-fab {
+  position: fixed; bottom: 16px; z-index: 44; display: inline-flex; align-items: center; gap: 8px;
+  min-height: 44px; padding: 10px 16px; border: 0; border-radius: 999px; cursor: pointer;
+  background: var(--card); color: var(--text); box-shadow: var(--shadow-win);
+  font: 500 14.5px var(--read);
+}
+.cm-fab svg { width: 15px; height: 15px; display: block; }
+.cm-scrim { position: fixed; inset: 0; z-index: 46; background: #00000047; }
+.cm-sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 47; max-width: 560px; margin: 0 auto;
+  max-height: 76vh; overflow-y: auto; overscroll-behavior: contain;
+  padding: 10px 20px calc(20px + env(safe-area-inset-bottom));
+  background: var(--card); border-radius: 16px 16px 0 0;
+  box-shadow: 0 0 0 1px #0000000f, 0 -10px 32px #0000001f; font-size: 15.5px;
+}
+.cm-grab { width: 36px; height: 4px; border-radius: 2px; background: var(--tick); margin: 0 auto 6px; }
+.cm-bar { display: flex; align-items: center; gap: 4px; margin: 0 -10px 8px 0; }
+.cm-bar .cm-label { margin: 0 auto 0 0; }
+.cm-ico {
+  width: 44px; height: 44px; display: grid; place-items: center; background: none; border: 0;
+  padding: 0; color: var(--text); cursor: pointer;
+}
+.cm-ico:disabled { color: var(--faint); cursor: default; }
+.cm-ico svg { width: 16px; height: 16px; display: block; }
+.cm-sheet .cm-av { width: 28px; height: 28px; font-size: 11px; }
+.cm-sheet .cm-when { margin-left: 0; }
+.cm-sheet .cm-del { display: inline; margin: 0 0 0 auto; min-height: 44px; font-size: 13.5px; }
+.cm-sheet .cm-field { font-size: 16px; padding: 10px 14px; border-radius: 10px; }
+.cm-sheet .cm-note { font-size: 13.5px; }
+.cm-sheet .cm-go { height: 48px; padding: 0 22px; font-size: 16px; }
+.cm-sheet .cm-acts .cm-go:only-child { flex: 1; }

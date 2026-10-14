@@ -11,11 +11,10 @@ from pathlib import Path
 from pipeline.config import ConfigNotFoundError
 
 def load_yaml_config() -> dict:
-    """Load the ACTIVE settings.yaml as a raw dict.
+    """Load the active settings.yaml as a raw dict.
 
-    Resolves through opyt_core.config.config_path() ($OPYT_CONFIG → ~/.opyt → repo default), so a
-    distributed install reads the user's config, not the committed template. Raises
-    ConfigNotFoundError rather than exiting. Prefer opyt_core.config.settings() for new code.
+    Resolves through opyt_core.config.config_path() ($OPYT_CONFIG → ~/.opyt → repo default).
+    Raises ConfigNotFoundError rather than exiting. Prefer opyt_core.config.settings() for new code.
     """
     from opyt_core.config import config_path
 
@@ -40,20 +39,18 @@ def log(msg: str) -> None:
 class SyncAuthError(Exception):
     """A source's credential is dead/expired (e.g. X OAuth refresh token revoked).
 
-    Fatal to the whole source: must never be reported as "caught up / 0 new". A per-item guard
-    that swallows this reports a dead credential as an empty inbox, which is the failure the
-    class exists to name.
+    Fatal to the whole source: never report it as "caught up / 0 new", so per-item guards must
+    not swallow it.
     """
 
 
 # ── State tracking ────────────────────────────────────────────────────────────
 
 def load_state(state_file: Path):
-    """Return the dedup set for ``state_file``'s namespace.
+    """Return the dedup set for ``state_file``'s namespace (the path's stem).
 
-    Dedup state lives in the ``sync_dedup`` SQLite table (path's stem = namespace), not the
-    JSON blob; the JSON file is read at most once to seed the table, then ignored. See
-    pipeline/dedup_store.py for why. The returned ``SyncSet`` quacks like the old ``set``.
+    State lives in the ``sync_dedup`` SQLite table; the JSON file is read at most once to seed it.
+    The returned ``SyncSet`` behaves like a ``set``.
     """
     from pipeline.dedup_store import SyncSet
 
@@ -61,9 +58,8 @@ def load_state(state_file: Path):
 
 
 def save_state(state_file: Path, ids) -> None:
-    """Persist a plain set/iterable of dedup IDs — bulk-upserted, add-only. Dedup sets never
-    shrink, to avoid re-pulling or re-billing an item. (A ``SyncSet`` needs no saving — each
-    ``.add()`` is already durable — and no caller passes one.)
+    """Persist a plain set/iterable of dedup IDs, add-only: dedup sets never shrink, so an
+    item is never re-pulled or re-billed.
     """
     from pipeline.dedup_store import SyncSet
 

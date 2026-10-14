@@ -1,5 +1,5 @@
 """
-pipeline/concurrency.py — process-wide adaptive concurrency gates (ARC-1 Phase 2).
+pipeline/concurrency.py — process-wide adaptive concurrency gates.
 
 A resizable semaphore with an AIMD (additive-increase / multiplicative-decrease) policy. It caps
 how many threads may be inside a provider's network call at once, climbing one step per success
@@ -23,10 +23,9 @@ class AdaptiveSemaphore:
         # ... or, on a rate-limit:
         GATE.decrease()
 
-    `__enter__` blocks while `in_use >= limit`; the permit is released on `__exit__` regardless of
-    success/failure (the SLOT frees either way — only the LIMIT is policy). Acquiring the internal
-    condition is brief (increment a counter, then release), so `record_success`/`decrease` — called
-    by the same thread while it holds a permit but NOT the condition lock — never deadlock."""
+    `__enter__` blocks while `in_use >= limit`; `__exit__` frees the slot whether the call
+    succeeded or not. `record_success`/`decrease` run outside the condition lock, so they never
+    deadlock against a held permit."""
 
     def __init__(self, start: int, *, min_permits: int = 2,
                  max_permits: int | None = None, increase_after: int | None = None):
@@ -35,7 +34,7 @@ class AdaptiveSemaphore:
         self._cond = threading.Condition()
         self._limit = start
         self._in_use = 0
-        # min can never exceed start, else decrease() would paradoxically RAISE the limit.
+        # min can never exceed start, else decrease() would raise the limit.
         self._min = max(1, min(min_permits, start))
         self._max = max(start, max_permits if max_permits is not None else start * 2)
         # Climb only after a full "wave" of clean calls, so one lucky success doesn't ratchet up.
@@ -65,7 +64,7 @@ class AdaptiveSemaphore:
                 self._cond.notify()      # the raised ceiling may admit one more waiter
     def decrease(self) -> None:
         """A rate-limit (429). Multiplicative-decrease: halve the limit (floored at min), reset the
-        success run. No notify — LOWERING the limit never opens a slot for a waiter."""
+        success run. No notify: lowering the limit never opens a slot."""
         with self._cond:
             self._success_run = 0
             self._limit = max(self._min, self._limit // 2)

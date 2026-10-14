@@ -1,154 +1,126 @@
-"""The probe store — candidate content held OUTSIDE the trusted KB.
+"""The probe store — candidate content held outside the trusted KB.
 
-The first three tests ARE the trust boundary. They are not documentation of it and they are not a
-convention: writing candidate content into `atoms` would make an unvetted stranger's posts
+The first tests are the trust boundary: writing candidate content into `atoms`/`bodies` would make an unvetted stranger's posts
 indistinguishable from Oracle knowledge in every existing search, and the only thing that can
 prevent that regression is an assertion that fails when someone reintroduces it.
 
-The rest pin the mechanics the pull depends on: hash-skip idempotency, per-candidate scoping, and
-the promotion drop.
+The rest pin the mechanics the pull and the search depend on: hash-skip idempotency, per-candidate
+scoping, a body rewritten in place under the same docid, and an index the triggers keep in step.
 """
 from __future__ import annotations
 
+import re
+import sqlite3
+
 import pytest
 
-from pipeline.kb import probe_store, retrieve, schema
-from pipeline.kb.ingest_common import AtomSink
+from pipeline.kb import schema, writes
+from pipeline.kb.ingest_common import store_atom
+from pipeline.oracles import probe_store
+from pipeline.retrieval import engine, excerpt
+from pipeline.retrieval.rank import fts_query
 
 
 def _probe_atom(tid: str, who: str = "x:user:11", url: str = "https://x.com/a/status/1") -> dict:
     return {"atom_id": f"xprobe:{tid}", "source_type": "x", "who_id": who,
             "when_ts": "2026-08-01", "when_precision": "day", "source_url": url,
-            "raw_ref": f"kb_raw/probe/{tid}.md", "raw_hash": f"h{tid}",
+            "raw_hash": f"h{tid}",
             "description": f"post {tid}", "payload": {"like_count": 3}}
 
 
-def _sink(conn, embedder) -> AtomSink:
-    """A sink pointed at the PROBE store — one keyword, no table name anywhere."""
-    return AtomSink(conn, embedder, writer=probe_store.write_probe_atom)
+def _integrity_check(conn) -> None:
+    """FTS5's own check that the external-content index agrees with `probe_bodies`. Raises
+    `sqlite3.DatabaseError` ("database disk image is malformed") when a write went unindexed or a
+    stale entry was left behind."""
+    conn.execute("INSERT INTO probe_bodies_fts(probe_bodies_fts, rank) VALUES ('integrity-check', 1)")
+
+
+def _body_id(conn, atom_id: str) -> int:
+    return conn.execute("SELECT body_id FROM probe_bodies WHERE atom_id=?", (atom_id,)).fetchone()[0]
+
+
+def _matching(conn, query: str) -> list[str]:
+    return [r["atom_id"] for r in probe_store.probe_fts_rows(conn, fts_query(query), limit=10)]
 
 
 # ── the trust boundary ────────────────────────────────────────────────────────
 
-def test_probe_content_never_lands_in_atoms(kb_home, fake_embedder):
+def test_probe_content_never_lands_in_atoms(kb_home):
     conn = schema.connect()
-    sink = _sink(conn, fake_embedder)
-    sink.submit(_probe_atom("1"), "an agent framework for autonomous tools")
-    sink.close()
+    probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework for autonomous tools")
 
     assert probe_store.count_probe_atoms(conn) == 1
     assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM bodies").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM bodies_fts").fetchone()[0] == 0
     conn.close()
 
 
-def test_existing_search_cannot_see_probe_rows(kb_home, fake_embedder):
-    """The regression that matters: a probe post about agents must not answer an agent query on the
-    trusted rail. Both arms are exercised — BM25 (literal tokens) and semantic."""
-    conn = schema.connect()
-    sink = _sink(conn, fake_embedder)
-    sink.submit(_probe_atom("1"), "an agent framework for autonomous tools")
-    sink.close()
-
-    for mode in ("hybrid", "bm25", "semantic"):
-        run = retrieve.search_atoms(conn, "agent framework", fake_embedder, mode=mode)
-        assert run.hits == [], f"probe row leaked into search_atoms(mode={mode})"
-    conn.close()
-
-
-def test_probe_writer_signature_matches_the_trusted_writer(kb_home, fake_embedder):
-    """The seam IS the signature match: `AtomSink` takes a `writer=` function, so the two writers
-    must stay call-compatible or a probe write silently routes to the wrong store. This replaced an
-    edges-refusal test when the `edges` table was deleted (2026-08-23)."""
-    import inspect
-
-    from pipeline.kb import ingest_common
-    assert (list(inspect.signature(probe_store.write_probe_atom).parameters)
-            == list(inspect.signature(ingest_common._write_atom).parameters))
-
-
-# ── the trusted rail still works with the sink seam in place ──────────────────
-
-def test_default_sink_still_writes_trusted_atoms(kb_home, fake_embedder):
-    """`writer=` defaults to the trusted writer, so every existing adapter is untouched."""
-    conn = schema.connect()
-    sink = AtomSink(conn, fake_embedder)
-    sink.submit({"atom_id": "x:1", "source_type": "x", "who_id": "x:user:11",
-                 "description": "d", "raw_hash": "h"}, "an agent framework")
-    sink.close()
-    assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 1
-    assert probe_store.count_probe_atoms(conn) == 0
-    conn.close()
-
-
-def test_both_stores_coexist_in_one_db(kb_home, fake_embedder):
-    conn = schema.connect()
-    trusted = AtomSink(conn, fake_embedder)
-    trusted.submit({"atom_id": "x:1", "source_type": "x", "who_id": "x:user:99",
-                    "description": "d", "raw_hash": "h"}, "a crypto rollup proof")
-    trusted.close()
-    probe = _sink(conn, fake_embedder)
-    probe.submit(_probe_atom("2"), "a crypto rollup proof")
-    probe.close()
-
-    run = retrieve.search_atoms(conn, "crypto rollup", fake_embedder)
-    assert [h.atom_id for h in run.hits] == ["x:1"]     # the trusted one, and ONLY it
-    assert probe_store.count_probe_atoms(conn) == 1
-    conn.close()
-
-
-# ── the embed surface reaches the probe path ──────────────────────────────────
-
-def test_probe_chunks_are_embedded_from_the_stripped_surface(kb_home, fake_embedder):
-    """The probe renderer is the most scaffolding-heavy surface in the store — measured on the
-    25-account live run, a short probe atom is 61% chrome and the strip removes 71% of a one-line
-    post. So `embed_text` must be STORED, not just used in flight: it is the only record of what a
-    vector was actually built from, and the probe store gets no benefit from the trusted side's
-    column."""
-    conn = schema.connect()
-    md = ("# Dougie — 2026-06-23\n\nnew article soon\n\n---\n"
-          "*Candidate probe · [Original post](https://x.com/DougieDeLuca/status/2069426566430445755)*\n")
-    sink = _sink(conn, fake_embedder)
-    sink.submit(_probe_atom("1"), md)
-    sink.close()
-
-    row = conn.execute("SELECT text, embed_text FROM probe_chunks WHERE atom_id='xprobe:1'"
-                       ).fetchone()
-    assert row["embed_text"] is not None
-    assert len(row["embed_text"]) < len(row["text"])          # scaffolding actually came off
-    assert "new article soon" in row["embed_text"]            # the author's words survive
-    assert "Candidate probe" not in row["embed_text"]         # the footer LABEL goes
-    assert "@DougieDeLuca" in row["embed_text"]               # ...but its handle is recovered
-    assert "Candidate probe" in row["text"]                   # the STORED text is untouched
-    conn.close()
-
-
-def test_an_existing_probe_store_gains_the_column(kb_home, fake_embedder):
-    """`CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a column added to
-    `_DDL` never reaches a store written before it. The additive path is what covers the 340 atoms
-    already on disk from the first live run."""
+def test_store_probe_atom_issues_no_write_to_a_trusted_table(kb_home):
+    """Structural, not a row count: every statement the probe writer executes is captured, and
+    none may write `atoms`, `bodies` or `bodies_fts`. A count would miss a write that a later
+    statement in the same call undid; this cannot."""
     conn = schema.connect()
     probe_store.init_probe_schema(conn)
-    conn.execute("DROP TABLE probe_chunks")
-    conn.execute("CREATE TABLE probe_chunks (chunk_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                 "atom_id TEXT NOT NULL, seq INTEGER NOT NULL, char_start INTEGER, "
-                 "char_end INTEGER, text TEXT NOT NULL, vector BLOB, UNIQUE(atom_id, seq))")
-    conn.commit()
-    probe_store.init_probe_schema(conn)                       # must ADD the column, not fail
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(probe_chunks)")}
-    assert "embed_text" in cols
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+    probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework")
+    probe_store.store_probe_atom(conn, {**_probe_atom("1"), "raw_hash": "h1-v2"}, "a rewrite")
+    conn.set_trace_callback(None)
+
+    assert seen, "no SQL captured — the trace callback did not attach, so this proves nothing"
+    trusted_write = re.compile(
+        r"\b(insert\s+(or\s+\w+\s+)?into|update|delete\s+from)\s+(atoms|bodies|bodies_fts)\b")
+    for sql in seen:
+        flat = " ".join(sql.split()).lower()
+        assert not trusted_write.search(flat), f"the probe writer wrote a TRUSTED table:\n  {sql}"
+    conn.close()
+
+
+def test_existing_search_cannot_see_probe_rows(kb_home):
+    """The regression that matters: a probe post about agents must not answer an agent query on the
+    trusted rail."""
+    conn = schema.connect()
+    probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework for autonomous tools")
+
+    run = engine.search_atoms(conn, "agent framework")
+    assert run.hits == [], "probe row leaked into search_atoms"
+    conn.close()
+
+
+# ── the trusted rail is untouched by the probe store ──────────────────────────
+
+def test_the_trusted_writer_never_creates_the_probe_store(kb_home):
+    """`store_atom` is the trusted writer and the probe store is not its business: a store that
+    has only ever saved trusted content has no probe tables at all."""
+    conn = schema.connect()
+    store_atom(conn, {"atom_id": "x:1", "source_type": "x", "who_id": "x:user:11",
+                      "description": "d", "raw_hash": "h", "payload": {}}, "an agent framework")
+    assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 1
+    assert probe_store.count_probe_atoms(conn) == 0
+    assert not probe_store.probe_tables_exist(conn)
+    conn.close()
+
+
+def test_both_stores_coexist_in_one_db(kb_home):
+    conn = schema.connect()
+    store_atom(conn, {"atom_id": "x:1", "source_type": "x", "who_id": "x:user:99",
+                      "description": "d", "raw_hash": "h", "payload": {}}, "a crypto rollup proof")
+    probe_store.store_probe_atom(conn, _probe_atom("2"), "a crypto rollup proof")
+
+    run = engine.search_atoms(conn, "crypto rollup")
+    assert [h.atom_id for h in run.hits] == ["x:1"]     # the trusted one, and only it
+    assert _matching(conn, "crypto rollup") == ["xprobe:2"]   # …and the probe one only here
+    assert probe_store.count_probe_atoms(conn) == 1
     conn.close()
 
 
 # ── mechanics the pull depends on ─────────────────────────────────────────────
 
-def test_hash_ledger_scopes_to_one_candidate(kb_home, fake_embedder):
+def test_hash_ledger_scopes_to_one_candidate(kb_home):
     conn = schema.connect()
-    sink = _sink(conn, fake_embedder)
-    sink.submit(_probe_atom("1", who="x:user:11"), "alpha")
-    sink.submit(_probe_atom("2", who="x:user:22"), "beta")
-    sink.close()
+    probe_store.store_probe_atom(conn, _probe_atom("1", who="x:user:11"), "alpha")
+    probe_store.store_probe_atom(conn, _probe_atom("2", who="x:user:22"), "beta")
 
     assert probe_store.load_probe_hashes(conn) == {"xprobe:1": "h1", "xprobe:2": "h2"}
     assert probe_store.load_probe_hashes(conn, "x:user:11") == {"xprobe:1": "h1"}
@@ -164,123 +136,137 @@ def test_hash_ledger_is_empty_before_the_first_pull(kb_home):
     conn.close()
 
 
-def test_rewriting_an_atom_replaces_its_chunks_and_bumps_version(kb_home, fake_embedder):
+def test_rewriting_an_atom_replaces_its_body_in_place_and_bumps_version(kb_home):
+    """A rewrite is an update of the one body row, never a second row and never a delete+insert:
+    the body keeps its `body_id`, which is the index's docid, and the old text stops matching."""
     conn = schema.connect()
-    sink = _sink(conn, fake_embedder)
-    sink.submit(_probe_atom("1"), "an agent framework")
-    sink.close()
-    first = conn.execute("SELECT COUNT(*) FROM probe_chunks").fetchone()[0]
+    probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework")
+    first_id = _body_id(conn, "xprobe:1")
 
     grown = {**_probe_atom("1"), "raw_hash": "h1-v2"}
-    sink = _sink(conn, fake_embedder)
-    sink.submit(grown, "an agent framework, now with a much longer body about crypto rollups")
-    sink.close()
+    probe_store.store_probe_atom(conn, grown, "now a much longer body about crypto rollups")
 
     row = conn.execute("SELECT version, raw_hash FROM probe_atoms WHERE atom_id='xprobe:1'"
                        ).fetchone()
     assert row["version"] == 2 and row["raw_hash"] == "h1-v2"
     assert probe_store.count_probe_atoms(conn) == 1          # replaced in place, not duplicated
-    # Boundaries shift on a rewrite, so the OLD chunks must be gone rather than merged.
-    n_fts = conn.execute("SELECT COUNT(*) FROM probe_chunks_fts WHERE atom_id='xprobe:1'"
-                         ).fetchone()[0]
-    assert n_fts == conn.execute("SELECT COUNT(*) FROM probe_chunks").fetchone()[0] >= first
+    assert conn.execute("SELECT COUNT(*) FROM probe_bodies").fetchone()[0] == 1
+    assert _body_id(conn, "xprobe:1") == first_id, "the rewrite gave the body a new docid"
+    assert _matching(conn, "crypto rollups") == ["xprobe:1"]
+    assert _matching(conn, "agent framework") == [], "the old text is still indexed"
     conn.close()
 
 
-# ── the probe TTL is jittered per candidate ─────────────────────────────────────
-#
-# All 188 live candidates carry near-identical `pulled_at` stamps from one backfill burst, so a
-# flat cutoff makes them all fall due on the same day. Worse, the cluster does not decay: a batch
-# re-probed together is re-stamped together, so the burst re-forms every cycle. Each probe is a
-# PACED X request against a shared budget, which is what makes a burst expensive rather than untidy.
-
-def test_the_flat_cutoff_became_a_per_candidate_one(kb_home):
-    """The behavioural proof. Two hundred candidates stamped in one burst, aged to exactly the flat
-    TTL: under one cutoff this set is all-or-nothing. Under per-candidate TTLs it splits."""
+def test_the_index_stays_consistent_through_insert_update_and_delete(kb_home):
+    """The triggers are the only thing keeping `probe_bodies_fts` in step with `probe_bodies`
+    (external content stores no text of its own). FTS5's integrity-check compares the two, so a
+    missing or wrong trigger fails here rather than as a silently stale search."""
     conn = schema.connect()
-    try:
-        for i in range(200):
-            probe_store.record_pull(conn, f"x:user:{i}", probe_store.STATUS_OK)
-        conn.execute("UPDATE probe_pulls SET pulled_at = datetime('now', '-30 days')")
-        conn.commit()
+    probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework")
+    probe_store.store_probe_atom(conn, _probe_atom("2"), "a crypto rollup proof")
+    _integrity_check(conn)
 
-        fresh = probe_store.fresh_who_ids(conn, ttl_days=30)
+    probe_store.store_probe_atom(conn, {**_probe_atom("1"), "raw_hash": "h1-v2"},
+                                 "a protein folding model")
+    _integrity_check(conn)
 
-        assert 0 < len(fresh) < 200                 # a flat cutoff gives exactly 0 or exactly 200
-        assert 0.3 < len(fresh) / 200 < 0.7         # ...and the split sits mid-band
-    finally:
-        conn.close()
-
-
-def test_two_hundred_candidates_fan_out_across_a_measurable_window(kb_home):
-    from collections import Counter
-
-    ttls = sorted(probe_store.candidate_ttl_days(f"x:user:{i}", 30.0) for i in range(200))
-
-    assert ttls[0] >= 30.0 * (1 - probe_store.PROBE_TTL_JITTER)     # 22.5d, the eager end
-    assert ttls[-1] <= 30.0 * (1 + probe_store.PROBE_TTL_JITTER)    # 37.5d, the patient end
-    assert ttls[-1] - ttls[0] > 13                                  # a window, not a point
-    # Spread, not merely widened: no single day of the window holds a big share of the roster.
-    assert max(Counter(int(t) for t in ttls).values()) <= 40
+    with writes.write_tx(conn):
+        conn.execute("DELETE FROM probe_bodies WHERE atom_id='xprobe:2'")
+    _integrity_check(conn)
+    assert _matching(conn, "crypto rollup") == []
+    assert _matching(conn, "protein folding") == ["xprobe:1"]
+    conn.close()
 
 
-def test_the_ttl_is_stable_across_calls_and_across_processes(kb_home):
-    """⚠️ NEVER `random()`, and never Python's built-in `hash()` — which is salted per process, so
-    a TTL built on it would change on every restart. Staleness has to stay a pure function of
-    stored state, which is the property the repeat-run harness checks."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    mine = probe_store.candidate_ttl_days("x:user:33836629", 30.0)
-    assert all(probe_store.candidate_ttl_days("x:user:33836629", 30.0) == mine for _ in range(5))
-
-    out = subprocess.run(
-        [sys.executable, "-c",
-         "from pipeline.kb import probe_store as p; "
-         "print(repr(p.candidate_ttl_days('x:user:33836629', 30.0)))"],
-        capture_output=True, text=True,
-        cwd=str(Path(__file__).resolve().parents[2]))
-    assert out.returncode == 0, out.stderr
-    assert float(out.stdout.strip()) == mine
-
-
-def test_two_candidates_get_different_ttls(kb_home):
-    assert (probe_store.candidate_ttl_days("x:user:1", 30.0)
-            != probe_store.candidate_ttl_days("x:user:2", 30.0))
-
-
-def test_a_fresh_pull_is_still_fresh_and_a_zero_ttl_still_re_pulls_everyone(kb_home):
-    """The jitter must not move the two ends. A pull made seconds ago is inside even the eagerest
-    TTL, and `ttl_days=0` still means a full re-pull."""
+def test_a_failed_body_write_takes_the_probe_atom_row_back_with_it(kb_home, monkeypatch):
+    """The probe atom row carries the `raw_hash` the pull's hash-skip reads as done, so it must
+    not commit before the text is written; otherwise a body write that fails leaves a candidate's
+    post that is never retried, holding its old text."""
     conn = schema.connect()
-    try:
-        probe_store.record_pull(conn, "x:user:1", probe_store.STATUS_OK)
-        assert probe_store.fresh_who_ids(conn, ttl_days=30) == {"x:user:1"}
-        assert probe_store.fresh_who_ids(conn, ttl_days=0) == set()
-    finally:
-        conn.close()
+    probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework")
+
+    def locked(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(probe_store, "put_probe_body", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        probe_store.store_probe_atom(conn, {**_probe_atom("1"), "raw_hash": "h1-v2"},
+                                     "a different body about rollups")
+    monkeypatch.undo()
+
+    assert probe_store.load_probe_hashes(conn) == {"xprobe:1": "h1"}
+    assert conn.execute("SELECT text FROM probe_bodies WHERE atom_id='xprobe:1'"
+                        ).fetchone()[0] == "an agent framework"
+    assert not conn.in_transaction
+    conn.close()
 
 
-def test_a_failed_row_is_never_fresh_however_recent(kb_home):
-    """Unchanged by the jitter, and pinned again because it now runs through Python rather than a
-    SQL `status IN (...)` — a `failed` row is an observation about US, not about the candidate."""
+def test_a_probe_atom_joins_the_callers_transaction(kb_home):
+    """A page of a candidate's posts commits with its progress, so the writer must not commit."""
     conn = schema.connect()
-    try:
-        probe_store.record_pull(conn, "x:user:1", probe_store.STATUS_FAILED, detail="boom")
-        assert probe_store.fresh_who_ids(conn, ttl_days=30) == set()
-    finally:
-        conn.close()
+    probe_store.init_probe_schema(conn)
+
+    with pytest.raises(RuntimeError, match="page refused"), writes.write_tx(conn):
+        probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework")
+        raise RuntimeError("page refused")
+
+    assert probe_store.count_probe_atoms(conn) == 0
+    assert conn.execute("SELECT COUNT(*) FROM probe_bodies").fetchone()[0] == 0
+    with writes.write_tx(conn):
+        probe_store.store_probe_atom(conn, _probe_atom("1"), "an agent framework")
+    assert probe_store.count_probe_atoms(conn) == 1
+    _integrity_check(conn)
+    conn.close()
 
 
-def test_an_undateable_row_reads_as_due_not_as_permanently_fresh(kb_home):
-    """Fail-safe direction: a candidate whose stamp we cannot parse gets re-observed. The opposite
-    default would freeze them out of every future run, silently."""
+# ── the reads candidate search and the people map stand on ────────────────────
+
+def test_fts_rows_are_one_per_atom_with_every_match_marked(kb_home):
+    """Whole-item: an atom whose body matches many times is one row, and its `marked` text carries
+    each match wrapped in `excerpt`'s markers, so the caller can cut its excerpt where they are."""
     conn = schema.connect()
-    try:
-        probe_store.record_pull(conn, "x:user:1", probe_store.STATUS_OK)
-        conn.execute("UPDATE probe_pulls SET pulled_at='not-a-timestamp'")
-        conn.commit()
-        assert probe_store.fresh_who_ids(conn, ttl_days=30) == set()
-    finally:
-        conn.close()
+    body = "rollup one. " + "filler words here. " * 30 + "rollup two. " + "more filler. " * 30
+    probe_store.store_probe_atom(conn, _probe_atom("1"), body)
+    probe_store.store_probe_atom(conn, _probe_atom("2", who="x:user:22"), "nothing relevant")
+
+    rows = probe_store.probe_fts_rows(conn, fts_query("rollup"), limit=10)
+    assert [r["atom_id"] for r in rows] == ["xprobe:1"]
+    marked = rows[0]["marked"]
+    assert marked.count(chr(excerpt.OPEN)) == 2 == marked.count(chr(excerpt.CLOSE))
+    assert marked.replace(chr(excerpt.OPEN), "").replace(chr(excerpt.CLOSE), "") == body
+    assert (rows[0]["who_id"], rows[0]["source_url"]) == ("x:user:11", "https://x.com/a/status/1")
+    conn.close()
+
+
+def test_fts_rows_scope_to_the_given_people(kb_home):
+    conn = schema.connect()
+    probe_store.store_probe_atom(conn, _probe_atom("1", who="x:user:11"), "a crypto rollup")
+    probe_store.store_probe_atom(conn, _probe_atom("2", who="x:user:22"), "a crypto rollup")
+    q = fts_query("crypto rollup")
+    assert [r["who_id"] for r in probe_store.probe_fts_rows(conn, q, limit=10,
+                                                             who_ids={"x:user:22"})] == ["x:user:22"]
+    assert probe_store.probe_fts_rows(conn, q, limit=10, who_ids=set()) == []
+    conn.close()
+
+
+def test_texts_by_person_returns_whole_bodies(kb_home):
+    """The people map reads each person's items whole: a long post is one text, never pieces."""
+    conn = schema.connect()
+    long_body = " ".join(f"word{i}" for i in range(2000))
+    probe_store.store_probe_atom(conn, _probe_atom("1"), long_body)
+    probe_store.store_probe_atom(conn, _probe_atom("2"), "a short one")
+    probe_store.store_probe_atom(conn, _probe_atom("3", who="x:user:22"), "someone else")
+
+    texts = probe_store.texts_by_person(conn)
+    assert sorted(texts["x:user:11"]) == sorted([long_body, "a short one"])
+    assert texts["x:user:22"] == ["someone else"]
+    conn.close()
+
+
+def test_the_author_rollup_counts_atoms(kb_home):
+    conn = schema.connect()
+    probe_store.store_probe_atom(conn, {**_probe_atom("1"), "when_ts": "2026-07-01"}, "a")
+    probe_store.store_probe_atom(conn, {**_probe_atom("2"), "when_ts": "2026-08-01"}, "b " * 900)
+    assert probe_store.probe_author_rollup(conn) == {
+        "x:user:11": {"atoms": 2, "first_ts": "2026-07-01", "last_ts": "2026-08-01"}}
+    conn.close()

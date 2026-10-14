@@ -1,14 +1,9 @@
 """
-pipeline/kb/expand.py — the shared Stage-5 footprint helpers: root an Oracle for discovery,
-route ONE discovered source into its atom-KB adapter, and hold the lookback presets.
+pipeline/kb/expand.py — root an Oracle for footprint discovery, and list the profile pages of
+theirs it reads.
 
-Two consumers, both of which own their own orchestration: `oracles._ingest_oracle` (the live
-per-Oracle ingest engine, reached from `add_oracle` and `oracle(action='ingest')`) and
-`oracle_refresh._dispatch` (the background top-up loop). This module owns no loop of its own.
-
-Trust is per-source, not per-person: confirming the person verifies their X identity, but a
-discovered URL (e.g. `elonmusk.substack.com`) still needs its own attested-link trust check.
-The trust decision itself belongs to the caller; `_route_source` routes what it is handed.
+Shared helpers with no loop of their own; the callers (background discovery, the Oracle review
+flow) own orchestration.
 """
 
 from __future__ import annotations
@@ -16,51 +11,29 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from datetime import datetime, timedelta
-from pipeline.timeparse import utc_now
 
-from . import ingest_common, ingest_github, schema, source_adapters
+from pipeline.platforms.url_canon import canonical_identity
 
-# Lookback presets surfaced at onboarding. X is an ephemeral stream: short default, hard 2-year
-# ceiling (enforced in sync_x_footprint). ⚠️ It was a PAID stream until the 2026-08-30 cutover, and
-# that is no longer why the window is short — every X read now runs free on the user's own session.
-# What still bounds it is wall-clock and one session's rate limits. Substack/blog are a durable
-# corpus: default to the whole archive. A preset maps to days-before-now; None = 'all' (no lower
-# bound), resolved to a `since` datetime once, at the entry point. Substack presets govern blog too.
-X_LOOKBACK_PRESETS: dict[str, int] = {"6mo": 183, "1yr": 365, "2yr": 730}
-WEB_LOOKBACK_PRESETS: dict[str, int | None] = {"1yr": 365, "2yr": 730, "5yr": 1825, "all": None}
-# Papers follow the WEB shape, not the X one: a published corpus is durable, so a short default
-# would truncate a body of work rather than trim a stream. No ceiling either — what bounds this
-# pull is embed spend per work, and the abstract-only path makes that the only per-work cost.
-# 10yr is the extra rung the web presets do not need: a researcher's career is longer than a
-# blog's archive, and "the last decade" is a real answer where "the last 5 years" is a shrug.
-SCHOLAR_LOOKBACK_PRESETS: dict[str, int | None] = {"2yr": 730, "5yr": 1825, "10yr": 3653,
-                                                   "all": None}
+from . import schema
 
 _X_HANDLE = re.compile(r"(?:x|twitter)\.com/([^/?#]+)", re.I)
 
 
-def _since_from_days(days: int | None) -> datetime | None:
-    """A `since` datetime `days` before now, or None for 'all' (no lower bound)."""
-    if not days:
-        return None
-    return utc_now() - timedelta(days=days)
+def _x_handles(conn: sqlite3.Connection, canonical_id: str) -> list[str]:
+    """Every X member's @handle, from its `profile.handle` (entities are keyed by numeric id).
+    Resolves a stale canonical_id to the current head first."""
+    head = schema.current_canonical(conn, canonical_id)
+    rows = conn.execute(
+        "SELECT profile FROM entities WHERE COALESCE(canonical_id, entity_id)=? "
+        "AND entity_id LIKE 'x:user:%' AND profile IS NOT NULL",
+        (head,),
+    ).fetchall()
+    return [h for h in ((json.loads(r[0]) or {}).get("handle") for r in rows if r[0]) if h]
 
 
 def _x_handle(conn: sqlite3.Connection, canonical_id: str) -> str | None:
-    """The Oracle's X @handle — discovery is handle-rooted, and the atom-KB stores people by
-    numeric `x:user:{id}`, not handle. The handle lives in the x member's `profile.handle`
-    (both `ingest_x` and `ingest_curation._stamp_x_person` persist it there). Resolves a stale
-    canonical_id to the current head first (post-resolve head-drift)."""
-    head = schema.current_canonical(conn, canonical_id)
-    row = conn.execute(
-        "SELECT profile FROM entities WHERE COALESCE(canonical_id, entity_id)=? "
-        "AND entity_id LIKE 'x:user:%' AND profile IS NOT NULL LIMIT 1",
-        (head,),
-    ).fetchone()
-    if not row or not row[0]:
-        return None
-    return (json.loads(row[0]) or {}).get("handle")
+    """The Oracle's X @handle: the first X member's."""
+    return next(iter(_x_handles(conn, canonical_id)), None)
 
 
 def _x_handle_from_url(url: str | None) -> str | None:
@@ -69,9 +42,7 @@ def _x_handle_from_url(url: str | None) -> str | None:
 
 
 def _substack_handle(oracle: dict) -> str | None:
-    """A Substack member's handle for the public_profile probe — extracted from its
-    `substack:{handle}` entity_id (`derive.substack_entity_id` keys on the author handle,
-    falling back to the subdomain). None when there's no usable Substack member."""
+    """A Substack member's handle (or subdomain) from its `substack:` entity id, or None."""
     for m in oracle.get("members", []):
         eid = m.get("entity_id", "")
         if eid.startswith("substack:"):
@@ -82,8 +53,7 @@ def _substack_handle(oracle: dict) -> str | None:
 
 
 def _first_url(links) -> str | None:
-    """The first http… URL in an entity's `identity_links` (a JSON string or a list). None when
-    there's no usable link — the caller reconstructs a home from the `blog:{host}` id instead."""
+    """The first http URL in an entity's `identity_links` (a JSON string or a list), or None."""
     if not links:
         return None
     if isinstance(links, str):
@@ -99,8 +69,7 @@ def _first_url(links) -> str | None:
 
 
 def _blog_home(oracle: dict) -> str | None:
-    """A blog member's home URL for the blog root probe — the stored home from its `identity_links`,
-    else reconstructed from the `blog:{host}` entity id. None when there's no usable blog member."""
+    """A blog member's home URL: its stored link, else rebuilt from the `blog:{host}` id."""
     for m in oracle.get("members", []):
         eid = m.get("entity_id", "")
         if eid.startswith("blog:"):
@@ -113,13 +82,38 @@ def _blog_home(oracle: dict) -> str | None:
     return None
 
 
-def _root_profile(conn: sqlite3.Connection, oracle: dict) -> dict | None:
-    """The Oracle's best CONFIRMED root profile for discovery, as {seed, seed_type}.
+def _orcid(member: dict) -> str | None:
+    """The ORCID iD a member's `identity_links` carries, or None."""
+    links = member.get("identity_links")
+    if isinstance(links, str):
+        try:
+            links = json.loads(links)
+        except (ValueError, TypeError):
+            links = []
+    return next((u.rstrip("/").rsplit("/", 1)[-1] for u in links or []
+                 if isinstance(u, str) and "orcid.org/" in u), None)
 
-    Preference order: X (richest probe + zero-regression for every existing X-rooted Oracle),
-    then a Substack member, then a blog member. Returns None only for a github-only Oracle (no
-    root probe). De-X-rooting: a Substack/blog-only person roots on that home, with no X anywhere
-    — `discover_profile` fans out from there to find their other accounts."""
+
+def _researcher(oracle: dict) -> dict | None:
+    """A researcher member's root: its ORCID iD when the `openalex:A…` entity carries one, else
+    the OpenAlex author id, whose record the probe reads for it. A venue (`openalex:S…`) is not a
+    person and roots nothing."""
+    for m in oracle.get("members", []):
+        eid = m.get("entity_id", "")
+        if not eid.startswith("openalex:A"):
+            continue
+        orcid = _orcid(m)
+        return ({"seed": orcid, "seed_type": "orcid"} if orcid else
+                {"seed": eid.split(":", 1)[1], "seed_type": "openalex"})
+    return None
+
+
+def _root_profile(conn: sqlite3.Connection, oracle: dict) -> dict | None:
+    """The Oracle's best confirmed root profile for discovery, as {seed, seed_type}.
+
+    Preference: X (richest probe), then Substack, then blog, then a researcher's ORCID. None for
+    a GitHub-only Oracle or a venue.
+    """
     x = _x_handle(conn, oracle["canonical_id"])
     if x:
         return {"seed": x, "seed_type": "x"}
@@ -129,71 +123,57 @@ def _root_profile(conn: sqlite3.Connection, oracle: dict) -> dict | None:
     blog = _blog_home(oracle)
     if blog:
         return {"seed": blog, "seed_type": "blog"}
+    return _researcher(oracle)
+
+
+def profile_url(page: dict) -> str:
+    """The URL of one profile page, `{seed, seed_type}` as `_root_profile` gives it."""
+    seed, kind = page["seed"], page["seed_type"]
+    if kind == "x":
+        return f"https://x.com/{seed}"
+    if kind == "substack":
+        return seed if "." in seed or "/" in seed else f"https://{seed}.substack.com"
+    if kind == "github":
+        return f"https://github.com/{seed}"
+    if kind == "orcid":
+        return f"https://orcid.org/{seed}"
+    if kind == "openalex":
+        return f"https://openalex.org/{seed}"
+    return seed
+
+
+def _profile_page(member: dict) -> dict | None:
+    """A non-X member's profile page, the one that declares accounts as theirs, or None.
+
+    A Substack is read by the publication it is: an id can be its author's handle
+    (`substack:mraginsky`), which names no publication. A blog's home page is no profile: it links
+    employers, friends and blogrolls, and a declaration counts as theirs with no link back. An
+    OpenAlex author with no ORCID has no page of its own."""
+    eid = member.get("entity_id", "")
+    kind, _, rest = eid.partition(":")
+    if kind == "substack" and rest and rest != "unknown":
+        return {"seed": _first_url(member.get("identity_links")) or rest, "seed_type": "substack"}
+    if kind == "github" and rest and "/" not in rest:
+        return {"seed": rest, "seed_type": "github"}
+    if eid.startswith("openalex:A") and (orcid := _orcid(member)):
+        return {"seed": orcid, "seed_type": "orcid"}
     return None
 
 
-def _x_handle_to_pull(root: dict, profile: dict) -> str | None:
-    """The Oracle's X @handle to pull the timeline for — the ROOT handle when X-rooted, else
-    the handle of a DISCOVERED, trust-verified X account (a Substack-rooted Oracle whose X was
-    found + graduated via Rule 5). None when there is no findable/trusted X. This helper only
-    identifies the handle; the ingest owner decides whether X is connected before it pulls or
-    schedules that timeline (`_classify_url` now tags a discovered X link `"x"`)."""
-    if root["seed_type"] == "x":
-        return root["seed"]
-    for s in profile.get("sources") or []:
-        if s.get("source_type") == "x" and (s.get("trust") or {}).get("trusted"):
-            h = _x_handle_from_url(s.get("url") or "")
-            if h:
-                return h
-    return None
-
-
-def _route_source(conn, embedder, source: dict, *, author_name: str | None,
-                  limit: int, github_min_stars: int = 0, web_since: datetime | None = None,
-                  github_since: datetime | None = None,
-                  github_before: datetime | None = None) -> dict:
-    """Route ONE discovered source (a `discover_profile` source dict) to its atom-KB adapter.
-    Unadapted types are SKIPPED (recorded), never errors.
-
-    WEBSITE sources (substack/blog) pass a single-author eligibility gate first: the adapters
-    stamp `who_id`=the Oracle by inference, so an ungated multi-author site would launder other
-    authors onto one trusted person. This is the single gated door for both auto-discovery and
-    Pick #2 confirm; no `force` here — confirming a source's identity is orthogonal to its
-    eligibility. GitHub is ungated: `sync_github` attributes to the attested repo owner, never
-    the Oracle, so there's no inference to launder. `sync_github_source` splits the two url
-    shapes: a repository link mints that one repo, an account link sweeps its archive.
-
-    `limit` caps posts per Substack/blog; GitHub has no post concept, so `github_min_stars`
-    bounds it instead (its analog of the post cap). Two `since` knobs are NOT interchangeable:
-    `web_since` bounds which posts to consider, `github_since` skips repos untouched since then.
-    A shared `since` would mean different things on each adapter. `github_before` is the other
-    end of the same window — the coverage frontier a resume walks back from, which only GitHub
-    can honor.
-
-    `limit` is dispatch-bounded, not atom-bounded — it caps posts handed to the pool, so a
-    paywalled or gate-rejected post still spends one of the N and `limit=20` can yield fewer
-    atoms."""
-    stype, url = source.get("source_type"), source.get("url")
-    if stype in source_adapters.WEBSITE_ADAPTERS:
-        decision, summ = source_adapters.gate_and_sync_website(
-            conn, embedder, stype, url, author_name=author_name, since=web_since, limit=limit)
-        if summ is None:
-            return {"source_type": stype, "url": url,
-                    "skipped": f"eligibility:{decision.decision}", "reason": decision.reason}
-    elif stype == "github":
-        summ = ingest_github.sync_github_source(conn, embedder, url, min_stars=github_min_stars,
-                                                since=github_since, before=github_before)
-        if summ is None:
-            return {"source_type": stype, "url": url, "skipped": "no_owner_in_url"}
-    else:
-        return {"source_type": stype, "url": url, "skipped": "no_adapter"}
-    # Adapters report a hard stop by RETURNING an `error` summary, not raising, so a caller's
-    # try/except never sees it. Without this branch a blocked archive walk (zero atoms, nothing
-    # marked seen) would reach the user labelled `ingested`. See ingest_common.classify_run.
-    outcome = ingest_common.classify_run(summ)
-    if outcome == ingest_common.RUN_BLOCKED:
-        return {"source_type": stype, "url": url, "blocked": summ,
-                "reason": str(summ.get("error"))}
-    if outcome == ingest_common.RUN_ERROR:
-        return {"source_type": stype, "url": url, "error": str(summ.get("error"))}
-    return {"source_type": stype, "url": url, "ingested": summ}
+def member_profiles(conn: sqlite3.Connection, oracle: dict) -> list[dict]:
+    """Every profile page of theirs discovery reads, as `{seed, seed_type}`: the root
+    (`_root_profile`) first, then each other X account, Substack, GitHub account and ORCID record
+    of the Oracle's cluster, each page once. Empty when nothing roots
+    discovery: a GitHub-only Oracle or a venue."""
+    root = _root_profile(conn, oracle)
+    if root is None:
+        return []
+    others = [*({"seed": h, "seed_type": "x"} for h in _x_handles(conn, oracle["canonical_id"])),
+              *filter(None, map(_profile_page, oracle.get("members", [])))]
+    pages, seen = [root], {canonical_identity(profile_url(root))}
+    for page in others:
+        key = canonical_identity(profile_url(page))
+        if key not in seen:
+            seen.add(key)
+            pages.append(page)
+    return pages

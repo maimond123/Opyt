@@ -1,28 +1,20 @@
 """
-pipeline/ingestion/x_render.py — the X tweet RENDERER. No network, no provider.
+pipeline/ingestion/x_render.py — the X tweet renderer. No network.
 
 One normalized tweet (or a stitched thread) → the markdown an atom's body is made of: URL
-expansion, quoted tweets, link cards, media, and X-Article bodies. Every function here is PURE —
-give it a tweet dict, get a string back.
+expansion, quoted tweets, link cards, media, and X-Article bodies. Every function here is pure.
 
-It was `x_twitterapi.py` until 2026-08-30, when twitterapi.io was removed
-(docs/plans/2026-08-30-cut-x-ingestion-over-to-internal-graphql.md). Every X read now runs on the
-user's own browser session through x.com's internal GraphQL API, at $0, with no third party seeing
-which accounts are read. What survived the deletion is the ~450 lines of rendering that were never
-provider-specific — so the module was renamed for what it does, because a module named after a
-provider it no longer contains reads to the next person as though that vendor is still live.
-
-⚠️ Do not add a fetch here. The transport lives in `pipeline/ingestion/x_graphql_core.py`; pulling
-an Oracle's timeline INTO the store is `pipeline/kb/ingest_x_footprint.py`'s job. A renderer that
-can also fetch is how this module grew a network layer the first time.
+Do not add a fetch here: the transport lives in `pipeline/platforms/x/`, and pulling an Oracle's
+timeline into the store is `pipeline/kb/ingest_x_footprint.py`'s job.
 """
 
+import re
 from datetime import datetime, timezone
 
 from pipeline.ingestion.utils import log
 
 
-def _parse_twitter_date(created_at: str) -> datetime | None:
+def parse_twitter_date(created_at: str) -> datetime | None:
     """Parse Twitter date string: 'Tue Dec 10 07:00:30 +0000 2024'"""
     try:
         return datetime.strptime(
@@ -34,8 +26,33 @@ def _parse_twitter_date(created_at: str) -> datetime | None:
 
 # ── URL expansion ─────────────────────────────────────────────────────────────
 
-def _expand_urls(text: str, entities: dict | None) -> str:
-    """Replace t.co short URLs in text with their expanded equivalents."""
+# A `t.co` closing a quote post that no entity declares: the post url the author pasted, which X
+# turned into the quote attachment and left in the text. It is not the `quoted_status_permalink`
+# and appears in no `entities.urls`, so nothing can expand it; the quote renders on its own beneath.
+_TRAILING_TCO_RE = re.compile(r"\s*https://t\.co/\w+\s*$")
+
+
+def is_quote(t: dict) -> bool:
+    """A quote post, recognized by the object too: the profile walk nulls `isQuote` on real quote
+    posts."""
+    return bool(t.get("isQuote") or t.get("quoted_tweet"))
+
+
+def expand_urls(text: str, entities: dict | None, *, quoting: bool = False) -> str:
+    """Replace t.co short URLs in text with their expanded equivalents, and drop each image's or
+    video's own short link.
+
+    X appends one `t.co` link per post that carries media; it is the media's address, not a link
+    the author wrote, and the media is rendered on its own below.
+
+    `quoting` — this post quotes another, so an undeclared `t.co` closing its text is the quote's
+    own link and comes off too (`_TRAILING_TCO_RE`). A declared one was expanded above by then."""
+    if not entities:
+        entities = {}
+    if quoting and _TRAILING_TCO_RE.search(text) and not any(
+            u.get("url") and text.rstrip().endswith(u["url"])
+            for u in (entities.get("urls") or []) + (entities.get("media") or [])):
+        text = _TRAILING_TCO_RE.sub("", text)
     if not entities:
         return text
     for url_obj in entities.get("urls", []):
@@ -43,17 +60,21 @@ def _expand_urls(text: str, entities: dict | None) -> str:
         expanded = url_obj.get("expanded_url", "") or url_obj.get("display_url", "")
         if short and expanded and short in text:
             text = text.replace(short, expanded)
-    return text
+    stripped = False
+    for m in entities.get("media", []) or []:
+        short = m.get("url", "")
+        if short and short in text:
+            text = text.replace(short, "")
+            stripped = True
+    # Trimmed only when a media link came off, so a post without one keeps its snapshot hash.
+    return text.rstrip() if stripped else text
 
 
 # ── Article detection and rendering ──────────────────────────────────────────
 
 def _article_tweet_id(tweet: dict) -> str | None:
-    """
-    Return the tweet ID to use for article fetching, or None if this tweet
-    doesn't contain an X Article.
+    """The tweet ID to fetch an X Article by, or None if the tweet links no article.
 
-    Detection: look for x.com/i/article or /articles/ in entities.urls.
     The article endpoint uses the outer tweet's ID, not the article URL itself.
     """
     for url_obj in (tweet.get("entities") or {}).get("urls", []):
@@ -72,27 +93,17 @@ def _article_shape(article: dict) -> tuple[str, list]:
     """The raw `article` node → (title, Draft.js blocks). Unknown shape → ("", []), which renders
     nothing rather than crashing.
 
-    ⚠️ AN EMPTY BLOCK LIST IS THE TEASER, AND IT LOOKS LIKE A NORMAL RESPONSE. X ships this node
-    two ways: with `content_state.blocks` when the request asked for `withArticleRichContentState`,
-    and without it otherwise — cover image, title and `preview_text` only, about 1.1 KB. The
-    request still returns 200 and the node is still truthy, so `bool(article)` cannot tell them
-    apart. Callers that need to know whether a body arrived must ask THIS function and check the
-    blocks; `ingest_x_footprint` does, and reports `article_incomplete` when they are empty.
-
-    `cover_media` and `preview_text` are on the node and deliberately not returned. Neither has
-    ever been rendered — the shape that carried them was twitterapi.io's `/twitter/article`
-    response, deleted with the provider on 2026-08-30 — and adding them now would change every
-    article atom's snapshot hash and re-embed the lot for a cover image."""
+    An empty block list is the teaser (sent when the request lacked `withArticleRichContentState`)
+    and the node is still truthy, so callers that need to know whether a body arrived must check
+    the blocks this returns. `cover_media` and `preview_text` are deliberately not returned:
+    adding them would change every article atom's snapshot hash."""
     res = ((article.get("article_results") or {}).get("result") or {})
     cs = res.get("content_state") or {}
     return res.get("title", ""), (cs.get("blocks") or [])
 
 
 def _render_article(article: dict) -> str:
-    """Render an X-Article's content blocks to markdown.
-
-    The full body is the point — it becomes the atom's chunked, searchable surface — so we render all
-    of it, bounded only by the runaway guard."""
+    """Render all of an X-Article's content blocks to markdown, bounded only by the runaway guard."""
     title, blocks = _article_shape(article)
     parts = []
     if title:
@@ -147,9 +158,7 @@ def _render_article(article: dict) -> str:
 
 def _render_quoted_tweet(qt: dict) -> str:
     """Render a nested quoted_tweet: author + text, plus its own link card, media, and X-Article
-    body — a quote's meaning often lives in what it quotes, so a text-only render would drop that
-    payload. Reuses the same three helpers as the root tweet. One level only (no quote-of-quote
-    recursion)."""
+    body. One level only (no quote-of-quote recursion)."""
     author   = qt.get("author", {})
     username = author.get("userName", "unknown")
     name     = author.get("name", "Unknown")
@@ -157,7 +166,7 @@ def _render_quoted_tweet(qt: dict) -> str:
         qt.get("url") or
         f"https://x.com/{username}/status/{qt.get('id', '')}"
     )
-    qt_text  = _expand_urls(qt.get("text", ""), qt.get("entities"))
+    qt_text  = expand_urls(qt.get("text", ""), qt.get("entities"), quoting=is_quote(qt))
     lines    = qt_text.strip().split("\n")
     quoted   = "\n".join(f"> {line}" for line in lines)
 
@@ -167,8 +176,7 @@ def _render_quoted_tweet(qt: dict) -> str:
         f">\n"
         f"{quoted}\n"
     )
-    # The quoted tweet's own card / media / article. Each helper returns "" when its payload is
-    # absent (fail-safe), so a plain quoted text-post adds nothing and this stays a no-op.
+    # Each helper returns "" when its payload is absent.
     card_md = _render_link_cards(qt)
     if card_md:
         out += "\n" + card_md
@@ -181,14 +189,8 @@ def _render_quoted_tweet(qt: dict) -> str:
 
 
 def _parse_card(card: dict | None, entities: dict | None) -> tuple[str, str, str]:
-    """
-    Extract (title, description, url) from a twitterapi.io card object.
-
-    twitterapi.io puts card data in card.binding_values — a list of
-    {key: str, value: {string_value|image_value|...}} objects.
-    The relevant keys are 'title', 'description', and 'vanity_url'.
-    The URL comes from entities.urls[0].expanded_url.
-    """
+    """Extract (title, description, url) from a card's `binding_values`; the URL is the first
+    external expanded URL in entities.urls."""
     if not card or not isinstance(card, dict):
         return "", "", ""
 
@@ -202,7 +204,6 @@ def _parse_card(card: dict | None, entities: dict | None) -> tuple[str, str, str
     title = bv.get("title", "")
     desc  = bv.get("description", "")
 
-    # Get expanded URL from entities.urls (the t.co maps here)
     url = ""
     for u in (entities or {}).get("urls", []):
         expanded = u.get("expanded_url", "")
@@ -213,23 +214,34 @@ def _parse_card(card: dict | None, entities: dict | None) -> tuple[str, str, str
     return title, desc, url
 
 
+def card_block(title: str, description: str, url: str) -> str:
+    """A link card as a post shows it, in X's own format: the title linked, then the blurb."""
+    block = f"> **[{title}]({url})**"
+    if description:
+        block += f"\n> {description}"
+    return block
+
+
+def has_link_card(tweet: dict) -> bool:
+    """Did X attach a card to this tweet's link? The render shows it in place of the bare links."""
+    title, _desc, url = _parse_card(tweet.get("card"), tweet.get("entities"))
+    return bool(title and url)
+
+
 def _render_link_cards(tweet: dict) -> str:
-    """
-    Render external link card from card.binding_values.
-    Falls back to bare expanded URLs from entities.urls if no card data.
-    """
+    """Render the external link card, falling back to bare expanded URLs if there is no card.
+    A bare link with a filled card (`link_cards`, attached by `kb.link_cards.attach`) renders as
+    that card."""
     entities = tweet.get("entities")
     card     = tweet.get("card")
 
     title, desc, url = _parse_card(card, entities)
 
     if title and url:
-        block = f"> **[{title}]({url})**"
-        if desc:
-            block += f"\n> {desc}"
-        return "## Links\n\n" + block + "\n\n"
+        return "## Links\n\n" + card_block(title, desc, url) + "\n\n"
 
     # Fallback: bare external URLs (no card metadata available)
+    fills = tweet.get("link_cards") or {}
     bare_links = []
     for u in (entities or {}).get("urls", []):
         expanded = u.get("expanded_url", "")
@@ -238,7 +250,9 @@ def _render_link_cards(tweet: dict) -> str:
             continue
         if "x.com" in expanded or "twitter.com" in expanded:
             continue
-        bare_links.append(f"- [{display}]({expanded})")
+        fill = fills.get(expanded)
+        bare_links.append(card_block(fill["title"], fill["description"], expanded) if fill
+                          else f"- [{display}]({expanded})")
     if bare_links:
         return "## Links\n\n" + "\n".join(bare_links) + "\n\n"
 
@@ -246,24 +260,16 @@ def _render_link_cards(tweet: dict) -> str:
 
 
 def _render_media(tweet: dict) -> str:
-    """
-    Render media attachments.
+    """Render extendedEntities.media (as `x.records.normalize_tweet` supplies it).
 
-    `x_graphql_core.normalize` supplies extendedEntities.media, each item carrying
-    type (photo/video/animated_gif), media_url_https, and video_info.variants.
-
-    Never silently drops: if media is present but unrenderable — hiding under a key we
-    don't read (snake_case drift), an unknown type, or a missing url/variant — it emits a
-    [media-drop] log line instead of an empty string that's indistinguishable from "no
-    media". That distinction is the whole point; a bare "" is how the last drop hid.
+    Media present but unrenderable (under an unread key, unknown type, missing url/variant) logs
+    a [media-drop] line, so a drop is distinguishable from no media.
     """
     ext = tweet.get("extendedEntities") or {}
     media_list = ext.get("media") or []
 
     if not media_list:
-        # Empty under the keys we render from. Before declaring "no media", check whether
-        # the tweet carries media under a key we DIDN'T read — the historic snake_case
-        # mismatch, or a future producer/shape drift. That's a drop, not an absence.
+        # Media under a key we don't read is a drop, not an absence.
         shadow = ((tweet.get("extended_entities") or {}).get("media")
                   or (tweet.get("entities") or {}).get("media"))
         if shadow:
@@ -281,14 +287,12 @@ def _render_media(tweet: dict) -> str:
             url = m.get("media_url_https") or m.get("url", "")
             if url:
                 parts.append(f"![photo]({url})\n")
-                # A VLM description (attached upstream by the ingest layer) is what makes an
-                # image-borne post searchable — a bare CDN URL carries no meaning into the chunk.
+                # The ingest layer's VLM description is what makes an image-borne post searchable.
                 desc = m.get("description")
                 if desc:
                     parts.append(f"*Image:* {desc}\n")
                 rendered += 1
         elif mtype in ("video", "animated_gif"):
-            # Use highest-bitrate mp4 variant if available
             video_info = m.get("video_info") or {}
             variants = [
                 v for v in video_info.get("variants", [])
@@ -304,14 +308,11 @@ def _render_media(tweet: dict) -> str:
                     parts.append(f"[Video]({vid_url})\n")
                 rendered += 1
             else:
-                # Fallback to thumbnail
                 thumb = m.get("media_url_https", "")
                 if thumb:
                     parts.append(f"![{mtype}]({thumb})\n")
                     rendered += 1
 
-    # We were handed N items but rendered fewer — an unknown type or a missing
-    # url/variant swallowed the difference. Surface it rather than drop it silently.
     if rendered < len(media_list):
         log(f"  [media-drop] {tweet.get('id', '?')}: rendered {rendered}/{len(media_list)} "
             f"media item(s) — {len(media_list) - rendered} unrenderable "
@@ -329,19 +330,18 @@ def tweet_to_markdown(
     source:        str = "x-profile",
     footer_label:  str = "Profile extract",
 ) -> str:
-    """
-    Render a tweet (or thread) to the pipeline markdown format.
+    """Render a tweet (or thread) to the pipeline markdown format.
 
     root_tweet:    The canonical tweet for this note (earliest in thread, or solo).
     article:       Normalized tweet's article field, if applicable.
     thread_tweets: Full ordered list of tweets in the thread (root → last reply).
                    Only supplied when len > 1 (i.e., this is actually a thread).
-    source:        Provenance stamped into frontmatter `source:` — "x-profile" (the default,
-                   a credible-people crawl), "x-bookmark", or "x-probe". Frontmatter is
-                   stripped before chunking (`chunk.strip_frontmatter`), so this is never
-                   indexed: it is provenance for a human opening the archived snapshot.
+    source:        Provenance stamped into frontmatter `source:` — "x-profile" (default),
+                   "x-bookmark", "x-watch" (a topic's watch found it) or "x-probe".
+                   Frontmatter is part of the stored snapshot, so this is indexed too.
     footer_label:  Leading word of the footer line ("Profile extract" / "Bookmarked" /
-                   "Candidate probe"), matching whichever `source` the caller passed.
+                   "Found by a watch" / "Candidate probe"), matching whichever `source` the
+                   caller passed.
     """
     author   = root_tweet.get("author", {})
     username = author.get("userName", "unknown")
@@ -351,18 +351,18 @@ def tweet_to_markdown(
         root_tweet.get("url") or
         f"https://x.com/{username}/status/{tweet_id}"
     )
-    created_at = _parse_twitter_date(root_tweet.get("createdAt", ""))
+    created_at = parse_twitter_date(root_tweet.get("createdAt", ""))
     date_str   = created_at.strftime("%Y-%m-%d") if created_at else "unknown"
-    is_quote   = root_tweet.get("isQuote", False)
+    flagged_quote = root_tweet.get("isQuote", False)
     quoted_obj = root_tweet.get("quoted_tweet")
 
-    # Post type precedence: article > thread > quote > post. Recognize a quote by the OBJECT too —
-    # the profile fetch nulls isQuote (same reason the quote render gates on quoted_obj below).
+    # Precedence: article > thread > quote > post. A quote is recognized by the object too, since
+    # the profile fetch can null isQuote.
     if article:
         post_type = "article"
     elif thread_tweets and len(thread_tweets) > 1:
         post_type = "thread"
-    elif is_quote or (quoted_obj and isinstance(quoted_obj, dict)):
+    elif flagged_quote or (quoted_obj and isinstance(quoted_obj, dict)):
         post_type = "quote"
     else:
         post_type = "post"
@@ -382,41 +382,36 @@ def tweet_to_markdown(
 
     body = f"# {name} — {date_str}\n\n"
 
-    # Gate on the PRESENCE of the quoted object, not the isQuote flag: the profile-fetch endpoint
-    # can leave isQuote=None on genuine quote tweets while still populating quoted_tweet.
+    # Gate on the presence of the quoted object, not the isQuote flag.
     if quoted_obj and isinstance(quoted_obj, dict):
         body += _render_quoted_tweet(quoted_obj) + "\n"
-    elif is_quote:
-        # Flag says quote but no object — the genuine rare gap. Mark it visibly (never a silent drop).
+    elif flagged_quote:
+        # Flag says quote but no object: mark it visibly rather than drop it.
         log(f"  [warn] isQuote set but no quoted_tweet object on {tweet_id}")
         body += f"*[quoted tweet unavailable]*\n\n"
 
-    # Thread body
     if thread_tweets and len(thread_tweets) > 1:
         body += f"> **Thread** · [{len(thread_tweets)} posts]({url})\n\n"
         for i, t in enumerate(thread_tweets, 1):
-            t_text = _expand_urls(t.get("text", ""), t.get("entities"))
+            t_text = expand_urls(t.get("text", ""), t.get("entities"), quoting=is_quote(t))
             body  += f"**[{i}/{len(thread_tweets)}]** {t_text}\n\n"
-            # Per-tweet card (each thread post can have its own link card)
             t_card = _render_link_cards(t)
             if t_card:
                 body += t_card
-            # Per-tweet media
             t_media = _render_media(t)
             if t_media:
                 body += t_media
             if i < len(thread_tweets):
                 body += "---\n\n"
     else:
-        text  = _expand_urls(root_tweet.get("text", ""), root_tweet.get("entities"))
+        text  = expand_urls(root_tweet.get("text", ""), root_tweet.get("entities"),
+                            quoting=is_quote(root_tweet))
         body += f"{text}\n\n"
 
-    # X Article content
     if article:
         body += _render_article(article) + "\n"
 
-    # Link cards and media — only for standalone posts/quotes.
-    # Threads render these inline per-post in the loop above.
+    # Threads render cards and media per post in the loop above.
     if not (thread_tweets and len(thread_tweets) > 1):
         link_md = _render_link_cards(root_tweet)
         if link_md:
@@ -432,9 +427,7 @@ def tweet_to_markdown(
 
 
 def _dedupe_tweets(tweets: list[dict]) -> list[dict]:
-    """Unique by id, newest first. Centralized here since advanced_search repeats tweets across
-    pages and the probe page overlaps the newest shard by construction. Snowflake ids sort by
-    time, so an id sort gives a deterministic 'Latest' ordering."""
+    """Unique by id, newest first (snowflake ids sort by time)."""
     seen: set[str] = set()
     out: list[dict] = []
     for t in tweets:
@@ -449,18 +442,14 @@ def _dedupe_tweets(tweets: list[dict]) -> list[dict]:
 # ── Thread stitching ──────────────────────────────────────────────────────────
 
 def _stitch_threads(tweets: list[dict]) -> dict[str, list[dict]]:
-    """
-    Group tweets by conversationId → sorted list (chronological).
-    Single-tweet conversations stay as single-item lists.
-    """
+    """Group tweets by conversationId → chronological list."""
     groups: dict[str, list[dict]] = {}
     for t in tweets:
-        # conversationId "may be empty" per docs — fall back to tweet's own id
+        # conversationId may be empty; fall back to the tweet's own id.
         conv_id = str(t.get("conversationId") or t.get("id", ""))
         groups.setdefault(conv_id, []).append(t)
 
-    # Sort by tweet ID — snowflake IDs are ms-precise and monotonically increasing,
-    # more reliable than createdAt which is only second-precision
+    # Snowflake ids are ms-precise; createdAt is only second-precision.
     for conv_id in groups:
         groups[conv_id].sort(key=lambda t: int(t.get("id", 0) or 0))
 

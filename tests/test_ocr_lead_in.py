@@ -1,14 +1,14 @@
 """The chart read's "Here's a ...:" lead-in is removed wherever a MediaRead is built.
 
 Scope note, so nobody later reads these tests as a retrieval fix: this is HYGIENE. Measured over
-all 105 affected chunks on 2026-08-10, removing the lead-in moved their cross-atom cosine p50 from
+all 105 affected chunks, removing the lead-in moved their cross-atom cosine p50 from
 0.433 to 0.420. It does not break false region binding, and nothing here claims it does.
 """
 from __future__ import annotations
 
 import pytest
 
-from pipeline import ocr_cascade as oc
+from pipeline import chart_read as oc
 
 LEAD_INS = [
     "Here's a detailed extraction of information from the provided chart:",
@@ -61,7 +61,7 @@ def test_strip_is_idempotent_and_empty_safe():
 
 def test_a_media_read_normalizes_on_construction():
     """Direct construction — the `read_image` path."""
-    m = oc.MediaRead("Here's an analysis of the provided chart:\n\n**Title:** Q3", "chart", True)
+    m = oc.MediaRead("Here's an analysis of the provided chart:\n\n**Title:** Q3", "chart")
     assert m.text == "**Title:** Q3"
 
 
@@ -83,7 +83,7 @@ def test_a_cached_entry_written_before_this_existed_is_normalized_on_rehydration
 
 def test_to_cache_round_trips_the_normalized_form():
     """A normalized read written back to the cache stays normalized — the cache upgrades in place."""
-    m = oc.MediaRead("Here's a breakdown of the chart:\n\n**Title:** X", "chart", True)
+    m = oc.MediaRead("Here's a breakdown of the chart:\n\n**Title:** X", "chart")
     assert oc.from_cache(m.to_cache()).text == "**Title:** X"
 
 

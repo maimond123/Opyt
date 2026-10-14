@@ -1,4 +1,4 @@
-"""paper_authors — the authors of user-saved papers, as screenable people.
+"""curation.papers — the authors of user-saved papers, as screenable people.
 
 Fully offline by nature, not by monkeypatch: this module reads atom rows and writes entities and
 signals. There is no network, no LLM and no embed to stub.
@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import pytest
 
-from pipeline.kb import paper_authors as pa
+from pipeline.curation import papers as pa
 from pipeline.kb import schema
+from pipeline.oracles import roster
 
 
 @pytest.fixture()
@@ -22,7 +23,7 @@ def _paper(conn, atom_id, authors, *, entry_mode="user-saved"):
     schema.upsert_atom(conn, {
         "atom_id": atom_id, "source_type": "paper", "what_kind": "artifact",
         "who_id": "paper-authors:" + atom_id, "when_ts": "2026-01-01", "when_precision": "day",
-        "about_entities": [], "source_url": "", "raw_ref": "", "raw_hash": atom_id,
+        "about_entities": [], "source_url": "", "raw_hash": atom_id,
         "description": "", "entry_mode": entry_mode, "payload": {"authors": authors}})
     conn.commit()
 
@@ -37,7 +38,7 @@ def _sig(conn, entity_id, platform):
 
 def test_an_author_across_two_saved_papers_outcounts_a_one_off_coauthor(conn):
     """The count is the whole ranking signal. OpenAlex has no follow primitive, so authorship of
-    a paper the user chose to save is the only evidence there is, and how OFTEN is what separates
+    a paper the user chose to save is the only evidence there is, and how often is what separates
     a person the user follows the work of from someone who happened to share a byline once."""
     _paper(conn, "paper:arXiv:1", [{"name": "Repeat Author", "scholar_id": "111"},
                                    {"name": "One Off", "scholar_id": "222"}])
@@ -51,9 +52,8 @@ def test_an_author_across_two_saved_papers_outcounts_a_one_off_coauthor(conn):
 
 
 def test_a_second_run_leaves_the_counts_unchanged(conn):
-    """The regression this feature is most likely to reintroduce. `add_signal` SUMS, and summing
-    a re-read TOTAL into a total is what inflated the live store's `follow/x` from 468 to 886 in
-    one pass. This producer re-walks the whole saved set every run, so it must `set_signal`."""
+    """The regression this feature is most likely to reintroduce: summing a re-read total into a
+    total inflates the count on every run. This producer re-walks the whole saved set every run, so it must `set_signal`."""
     _paper(conn, "paper:arXiv:1", [{"name": "A", "scholar_id": "111"}])
     _paper(conn, "paper:arXiv:2", [{"name": "A", "scholar_id": "111"}])
 
@@ -65,7 +65,7 @@ def test_a_second_run_leaves_the_counts_unchanged(conn):
 
 
 def test_only_the_papers_the_user_chose_produce_signals(conn):
-    """An admitted frontier artifact is something OPYT FOUND, not something the user chose, and
+    """An admitted frontier artifact is something OPYT found, not something the user chose, and
     only a choice is a vouch. `entry_mode` is allow-listed, never deny-listed, so a mode added
     later cannot leak in by default."""
     _paper(conn, "paper:arXiv:1", [{"name": "Chosen", "scholar_id": "111"}])
@@ -106,9 +106,9 @@ def test_an_openalex_only_author_gets_an_openalex_entity(conn):
 
 
 def test_an_author_with_no_registry_id_is_skipped_and_counted(conn):
-    """A name is not an identity — "Frances Arnold" matched 16 distinct OpenAlex people on
-    2026-09-08. And a candidate minted from a name could not be acted on: confirming a scholar
-    Oracle pulls their back catalogue BY AUTHOR ID, so there would be nothing to pull.
+    """A name is not an identity — "Frances Arnold" matches 16 distinct OpenAlex people. And a
+    candidate minted from a name could not be acted on: confirming a scholar
+    Oracle pulls their back catalogue by author id, so there would be nothing to pull.
 
     Reported, never silent. The drop is a decision, and a decision the user cannot see is
     indistinguishable from a bug."""
@@ -167,9 +167,9 @@ def _oracle_paper(conn, atom_id, authors):
 
 
 def test_a_repeat_collaborator_is_signalled_and_a_one_off_is_not(conn):
-    """`min_papers=2` is the bound on the ONE producer that scales with the Oracle roster rather
+    """`min_papers=2` is the bound on the one producer that scales with the Oracle roster rather
     than with what the user did. It is a different decision from refusing to cap saved-paper
-    authors: there every author is backed by a user ACTION, here none is — the evidence is
+    authors: there every author is backed by a user action, here none is — the evidence is
     entirely inferred from a byline. One shared byline is noise; two is a working relationship."""
     _oracle_paper(conn, "paper:arXiv:1", [{"name": "Regular", "openalex_id": "A1"},
                                           {"name": "One Off", "openalex_id": "A2"}])
@@ -187,7 +187,7 @@ def test_a_repeat_collaborator_is_signalled_and_a_one_off_is_not(conn):
 def test_a_confirmed_oracle_is_not_their_own_candidate(conn):
     _oracle_paper(conn, "paper:arXiv:1", [{"name": "The Oracle", "openalex_id": "A1"}])
     _oracle_paper(conn, "paper:arXiv:2", [{"name": "The Oracle", "openalex_id": "A1"}])
-    schema.upsert_oracle(conn, "openalex:A1", name="The Oracle")
+    roster.upsert_oracle(conn, "openalex:A1", name="The Oracle")
     conn.commit()
 
     out = pa.sync_coauthor_signals(conn)
@@ -223,30 +223,28 @@ def test_a_second_coauthor_run_leaves_the_counts_unchanged(conn):
                         ).fetchone()[0] == 2
 
 
-def test_a_coauthor_only_candidate_lands_in_the_scholar_tier_unticked(conn):
+def test_a_coauthor_only_candidate_lands_in_the_papers_group_unselected(conn):
     """Signals only, never auto-Oracles — the same discipline that disabled the second-degree
     follow scout. The user promotes them or nobody does."""
-    from pipeline.kb import screen
+    from pipeline.oracles import screen
 
     for i in (1, 2):
         _oracle_paper(conn, f"paper:arXiv:{i}", [{"name": "Collaborator", "openalex_id": "A1"}])
     pa.sync_coauthor_signals(conn)
 
-    card = next(c for c in screen.build_screen(conn)["candidates"]
-                if c["canonical_id"] == "openalex:A1")
+    papers = next(g for g in screen.build_screen(conn)["groups"] if g.get("source") == "papers")
+    card = next(c for c in papers["candidates"] if c["canonical_id"] == "openalex:A1")
 
-    assert card["pre_ticked"] is False
-    assert card["reflected"] == "co-wrote 2 paper(s) with one of your Oracles"
-    assert schema.is_oracle(conn, "openalex:A1") is False
+    assert card["reason"] == "co-wrote 2 papers with one of your Oracles"
+    assert roster.on_roster(conn, "openalex:A1") is False
 
 
 def test_the_report_names_the_backfill_when_atoms_predate_the_author_list(conn):
-    """The DETECTOR, and the bar the 2026-09-08 hand-run-entry-point audit set for a hand-run pass
-    that survives: `rechunk.py` was deleted for lacking one — "a maintenance pass whose trigger
-    nothing can detect is a pass nobody runs". Papers are immutable under Policy B, so an atom
+    """The detector for a hand-run backfill: a maintenance pass whose trigger nothing can detect is a
+    pass nobody runs. Papers are immutable under Policy B, so an atom
     written before the author list landed is never revisited and its authors reach nothing."""
     _paper(conn, "paper:arXiv:1", [{"name": "Has One", "openalex_id": "A1"}])
-    _paper(conn, "paper:arXiv:2", [])                        # pre-2026-09-08 shape
+    _paper(conn, "paper:arXiv:2", [])                        # predates the author list
 
     out = pa.sync_paper_author_signals(conn)
 
@@ -260,3 +258,22 @@ def test_a_fully_backfilled_store_says_nothing_about_it(conn):
     _paper(conn, "paper:arXiv:1", [{"name": "Has One", "openalex_id": "A1"}])
 
     assert "needs_backfill" not in pa.sync_paper_author_signals(conn)
+
+
+def test_a_coauthor_signal_names_the_oracle_they_wrote_with(conn):
+    for n in (1, 2):
+        _oracle_paper(conn, f"paper:arXiv:{n}", [{"name": "The Oracle", "openalex_id": "A1"},
+                                                 {"name": "Colleague", "openalex_id": "A2"}])
+    _oracle_paper(conn, "paper:arXiv:3", [{"name": "Other", "openalex_id": "A3"},
+                                          {"name": "Colleague", "openalex_id": "A2"}])
+    roster.upsert_oracle(conn, "openalex:A1", name="The Oracle")
+    conn.commit()
+
+    pa.sync_coauthor_signals(conn)
+
+    extra = conn.execute("SELECT extra FROM curation_signals WHERE entity_id='openalex:A2'"
+                         ).fetchone()[0]
+    assert '"with": ["openalex:A1"]' in extra
+    assert pa.coauthors_of(conn, "openalex:A1") == [
+        {"name": "Colleague", "canonical_id": "openalex:A2", "papers": 3}]
+    assert pa.coauthors_of(conn, "openalex:A9") == []

@@ -1,26 +1,10 @@
 """
-pipeline/llm_client.py
+pipeline/llm_client.py — the one entry for every LLM call.
 
-Single facade for every LLM call in the codebase. Each caller asks for a
-**role** (`note_classify`, `vision`, ...) and the client
-looks up the configured provider + model in settings.yaml. This keeps backend
-choice out of the call sites and in one place.
-
-Only one backend exists (OpenRouter), but the provider indirection (`_BACKENDS`,
-`_PROVIDER_ENV`, `_get_backend`) stays so adding the next provider is a registration,
-not a rewrite. Do not collapse it into a hardcoded OpenRouter call.
-
-`call` is synchronous, and that is the whole surface. An `acall` async wrapper existed
-until 2026-08-28 on the stated grounds that "the existing pipeline uses both"; it never
-had a caller. Concurrency here is per-caller (a thread pool plus its own semaphore), not
-an event loop, so a coroutine had nothing to attach to.
-
-Cloudflare on Groq/OpenRouter blocks Python's default UA, so we always send a
-browser-shaped UA to avoid 1010 errors.
-
-Latency telemetry (`pipeline/llm_telemetry.py`) and provider discovery
-(`pipeline/llm_providers.py`) live in separate modules. Local provider-charge estimates were
-deliberately removed: Opyt retains response and token metadata.
+Each caller asks for a role (`vision`, ...) and the client looks up the configured provider and
+model in settings.yaml, keeping backend choice out of the call sites. Only OpenRouter exists, but
+the provider indirection (`_BACKENDS`, `_PROVIDER_ENV`, `_get_backend`) is kept so the next
+provider is a registration, not a rewrite. `call` is synchronous.
 """
 
 from __future__ import annotations
@@ -39,15 +23,12 @@ from opyt_core.config import merge_provider_routing
 from pipeline import llm_telemetry
 from pipeline.ingestion.utils import load_yaml_config
 
-# Cloudflare 1010 fix — both Groq + some OpenRouter routes need this.
+# Cloudflare blocks Python's default UA on some OpenRouter routes (error 1010).
 _BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
-# Network endpoints
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Provider → env var holding its API key, so preflight (presence) and validate_provider
-# (liveness) agree on where a provider's key lives. Derived from `opyt_core.credentials_registry`
-# (keyed on each row's `provider` field) — register a provider there, not here.
+# Provider → env var holding its API key. Register a provider in `opyt_core.credentials_registry`.
 _PROVIDER_ENV: dict[str, str] = credentials_registry.PROVIDER_ENV
 
 
@@ -86,10 +67,8 @@ def _load_role_config(role: str) -> dict:
 
 
 class _BackendError(Exception):
-    """A backend call failed. `status` carries the HTTP code when known (None for a
-    config-class failure like a missing key), so an AIMD gate can act on a 429 specifically
-    instead of treating every failure as backpressure and halving on a missing API key.
-    Mirrors `pipeline.kb.embed.EmbedError.status`, which the embed gate already reads."""
+    """A backend call failed. `status` carries the HTTP code when known (None for a config
+    failure like a missing key), so an AIMD gate halves only on a 429."""
 
     def __init__(self, *args, status: int | None = None):
         super().__init__(*args)
@@ -97,17 +76,13 @@ class _BackendError(Exception):
 
 
 class ModelUnroutableError(_BackendError):
-    """No provider can serve this model — the request is IMPOSSIBLE, not merely failing, and
-    retrying it will never succeed. Excluded from the circuit breaker (`ignore=`) so one
-    unroutable role can't trip the shared breaker for every other role. Callers should treat it
-    as terminal for the whole run, not retry per item. See `pipeline/model_routing.py` for the
-    preflight that catches this before any request.
+    """No provider can serve this model; retrying never succeeds. Terminal for the whole run,
+    and kept off the circuit breaker so one unroutable role can't trip it for every other role.
     """
 
 
-# The marker OpenRouter returns when the provider filter leaves no candidates. Matched on the
-# response BODY because the status code alone (404) cannot distinguish "no such model" from
-# "no permitted provider for this model" — and only the latter is a config error we can name.
+# OpenRouter's body text when the provider filter leaves no candidates; the 404 status alone
+# cannot tell this from "no such model".
 _UNROUTABLE_MARKERS = ("all providers have been ignored", "no allowed providers",
                        "no providers available")
 
@@ -121,8 +96,6 @@ def _http_json(req: urllib.request.Request, timeout: float = 180.0) -> tuple[dic
         body = e.read().decode(errors="replace")[:500]
         low = body.lower()
         if any(m in low for m in _UNROUTABLE_MARKERS):
-            # Terminal, not transient — see ModelUnroutableError. Raised as its own type so the
-            # breaker can ignore it and the caller can disable the stage instead of per-item retry.
             raise ModelUnroutableError(f"HTTP {e.code}: {body}", status=e.code) from None
         raise _BackendError(f"HTTP {e.code}: {body}", status=e.code) from None
     return data, time.time() - t0
@@ -130,8 +103,7 @@ def _http_json(req: urllib.request.Request, timeout: float = 180.0) -> tuple[dic
 
 _or_breaker = None
 def _openrouter_breaker():
-    """Lazy module-level breaker: an OpenRouter outage trips once and every caller
-    (across sessions — state persists) fails fast instead of repeating futile retries."""
+    """Lazy module-level breaker shared by every OpenRouter call; its state persists across sessions."""
     global _or_breaker
     if _or_breaker is None:
         from pipeline.circuit_breaker import CircuitBreaker
@@ -142,11 +114,11 @@ def _openrouter_breaker():
 def _call_openrouter_sync(model: str, system: str, user: str, max_tokens: int,
                           response_format: str | None = None,
                           images: list[str] | None = None,
-                          frequency_penalty: float | None = None,
-                          api_key: str | None = None) -> tuple[str, int, int, float, dict]:
-    # api_key: explicit override (validate_provider) so a key under test never has to be
-    # written into the shared os.environ. Falls back to the env for normal calls.
-    api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+                          frequency_penalty: float | None = None
+                          ) -> tuple[str, int, int, float, dict]:
+    # The error string below is pinned by .guards.py; keep it verbatim.
+    from pipeline.credentials import get_credential
+    api_key = get_credential("openrouter")
     if not api_key:
         raise _BackendError("OPENROUTER_API_KEY not set")
     # Multimodal: OpenRouter is OpenAI-compatible — image blocks use {"type":"image_url"}.
@@ -172,9 +144,8 @@ def _call_openrouter_sync(model: str, system: str, user: str, max_tokens: int,
         # require_parameters: only route to a provider that honors JSON mode.
         body["response_format"] = {"type": "json_object"}
         prefs["require_parameters"] = True
-    # Upstream routing (deny broken upstreams, rank rest by latency — see opyt_core.config)
-    # applies to every chat role, not just JSON ones, since it's a shared transport concern.
-    # Lives here, not in `call()`, because provider routing is an OpenRouter-specific concept.
+    # Upstream routing (see opyt_core.config) applies to every chat role; it lives here because
+    # provider routing is OpenRouter-specific.
     prefs = merge_provider_routing(prefs)
     if prefs:
         body["provider"] = prefs
@@ -189,8 +160,6 @@ def _call_openrouter_sync(model: str, system: str, user: str, max_tokens: int,
             "X-Title": "opyt",
         },
     )
-    # Breaker: a sustained OpenRouter failure trips and fails fast for a cooldown. `ignore=` keeps
-    # a terminal routing failure (retrying can't help) off the shared breaker.
     data, elapsed = _openrouter_breaker().call(lambda: _http_json(req),
                                                ignore=(ModelUnroutableError,))
     # content can be null (refusal, content filter, empty / tool-only completion); coerce to "".
@@ -227,13 +196,11 @@ def _serving_upstream(provider: str, raw: dict | None) -> str:
 def call(role: str, *, system: str, user: str, model: str | None = None,
          max_tokens: int | None = None, images: list[str] | None = None,
          frequency_penalty: float | None = None) -> LLMResponse:
-    """The LLM call. Synchronous, and the only surface.
+    """The LLM call.
 
-    `images` (image URLs) routes through the provider's multimodal schema — used
-    by the `vision` role. `frequency_penalty` discourages the model from repeating
-    itself — the fix for a model looping on a dense image (see ocr_cascade.py's OCR
-    call). Like `response_format`, both are threaded to the backend ONLY when
-    supplied, so 4-arg test fakes stay valid."""
+    `images` (image URLs) use the provider's multimodal schema; `frequency_penalty` stops a model
+    looping on a dense image. Like `response_format`, both reach the backend only when supplied,
+    so 4-arg test fakes stay valid."""
     role_cfg = _load_role_config(role)
     if model:
         role_cfg["model"] = model
@@ -242,9 +209,6 @@ def call(role: str, *, system: str, user: str, model: str | None = None,
 
     provider = role_cfg["provider"]
     backend = _get_backend(provider)
-    # Pass response_format / images / frequency_penalty ONLY when present, so the
-    # test-fake backends (4-arg) and every existing role are untouched — only
-    # opted-in calls thread them.
     rf = role_cfg.get("response_format")
     extra = {"response_format": rf} if rf else {}
     if images:
@@ -267,17 +231,22 @@ def call(role: str, *, system: str, user: str, model: str | None = None,
 
 
 def preflight(role: str) -> str | None:
-    """Verify the role's provider has its API key set in the environment.
+    """Verify the role's provider has its API key resolvable.
 
-    Returns None if ready, or a human-readable reason string if not. Lets
-    callers fail-fast before starting batched work (e.g. extract_all)."""
+    Returns None if ready, or a human-readable reason. Resolves through `get_credential`, not
+    the env alone, so a key in the home's .env passes. With no key every role is refused: a free
+    install makes no model call.
+    """
     cfg = _load_role_config(role)
     provider = cfg["provider"]
     env_var = _PROVIDER_ENV.get(provider)
     if not env_var:
         return f"unknown provider {provider!r} for role {role!r}"
     if not os.environ.get(env_var):
-        return f"{env_var} not set (required for role {role!r} → {provider})"
+        from pipeline.credentials import SERVICES, get_credential
+        service = next((s for s, v in SERVICES.items() if v == env_var), None)
+        if service is None or not get_credential(service):
+            return f"{env_var} not set (required for role {role!r} → {provider})"
     return None
 
 
@@ -288,10 +257,8 @@ def _set_backend_for_tests(provider: str, fn) -> None:
     _BACKENDS[provider] = fn
 
 
-# ── Backward-compatible telemetry re-export ──────────────────────────────────
-# `llm_telemetry` owns this code; `__getattr__` keeps existing telemetry readers live without
-# giving `llm_client` a second writable state store. Provider discovery is imported directly by
-# its callers so the two modules do not form an import cycle.
+# ── Telemetry re-export ──────────────────────────────────────────────────────
+# `llm_telemetry` owns this state; `__getattr__` keeps `llm_client.<telemetry name>` readers live.
 _REEXPORTS = (llm_telemetry,)
 
 

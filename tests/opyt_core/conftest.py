@@ -3,16 +3,15 @@
 The service fixtures are reused verbatim from `tests/service/conftest.py`: a real export built
 by `build_export`, uploaded through the actual endpoint, read with a token from a redeemed
 grant. What this directory adds is the READER'S half — the same service registered as a peer
-whose location is a URL, with `kb_remote`'s transport pointed at `TestClient` so every request
-crosses the real FastAPI app in-process. Nothing about `kb_remote` is mocked; the one
+whose location is a URL, with `served`'s transport pointed at `TestClient` so every request
+crosses the real FastAPI app in-process. Nothing about `served` is mocked; the one
 substitution is the socket.
 
 `publisher` is the OWNER's half of the same wiring — the store an export is projected from, the
-settings naming the service, and `push`'s transport shimmed. Both `tests/opyt_core/test_push.py`
-(which calls `push.publish` directly) and `test_push_catchup.py` (which reaches it through the
-rail) run through it, which is the point: there is ONE publish implementation, so they have to
-share one fixture or the tests stop proving that. Until 2026-09-05 the two halves were the
-`opyt-push` command and the rail; the command is deleted and the rail is the only caller left.
+settings naming the service, and the service transport shimmed. Both `tests/opyt_core/test_push.py`
+(which calls `publish.publish` directly) and `test_publishing.py` (which reaches it
+through the publishing pass, importing this fixture) run through it, which is the point: there is
+ONE publish implementation, so they have to share one fixture or the tests stop proving that.
 """
 from __future__ import annotations
 
@@ -22,14 +21,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from opyt_core import config, push
-from pipeline.kb import peers
+from opyt_core import config, service_http
+from pipeline.retrieval import peers
 
 # Re-exported so this directory's tests run against the same served knowledge base the service
 # tests do. pytest collects fixtures by name from a conftest's namespace, so an import IS a
 # registration.
 from tests.service.conftest import (  # noqa: F401
-    emb,
     export_file,
     service_home,
     svc,
@@ -50,11 +48,10 @@ PEER = "x"
 def remote(svc, monkeypatch):
     """The svc service, registered as remote peer 'x' with the reader's token, transport shimmed.
 
-    The shim satisfies exactly the surface `kb_remote` uses — `.post`/`.get` — and `TestClient`
-    accepts absolute URLs because its transport routes every host to the app. So `kb_remote`
-    builds real URLs and real Authorization headers, and none of it is special-cased for tests."""
-    from opyt_core import kb_remote
-
+    The shim satisfies exactly the surface the service transport (`opyt_core/service_http.py`,
+    which `served` sends through) uses — `.post`/`.get` — and `TestClient` accepts absolute
+    URLs because its transport routes every host to the app. So `served` builds real URLs and
+    real Authorization headers, and none of it is special-cased for tests."""
     def _verb(send):
         def call(url, **kw):
             kw.pop("timeout", None)   # meaningless in-process; TestClient deprecates it per-request
@@ -63,15 +60,13 @@ def remote(svc, monkeypatch):
 
     location = f"https://svc.test/v1/kb/{svc.owner}"
     peers.add(PEER, location, "A served KB", token=svc.reader_token)
-    monkeypatch.setattr(kb_remote, "requests",
+    monkeypatch.setattr(service_http, "requests",
                         SimpleNamespace(post=_verb(svc.client.post), get=_verb(svc.client.get)))
-    kb_remote._META_CACHE.clear()
     yield SimpleNamespace(name=PEER, location=location, svc=svc)
-    kb_remote._META_CACHE.clear()
 
 
 @pytest.fixture()
-def publisher(svc, tmp_path, monkeypatch, emb):
+def publisher(svc, tmp_path, monkeypatch):
     """push's transport pointed at the real service, with the two homes SEPARATED the way a real
     publish has them: the OWNER's home holds the live store the export is projected from and the
     settings file naming the service, and anything crossing the shim runs under the SERVICE's,
@@ -103,7 +98,7 @@ def publisher(svc, tmp_path, monkeypatch, emb):
                 return verb(url, **kw)
         return call
 
-    monkeypatch.setattr(push, "requests", SimpleNamespace(
+    monkeypatch.setattr(service_http, "requests", SimpleNamespace(
         get=_shim(svc.client.get), post=_shim(svc.client.post)))
     return SimpleNamespace(svc=svc, on_service=on_service, home=owner_home,
-                           settings=settings, template=template, emb=emb)
+                           settings=settings, template=template)

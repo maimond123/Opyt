@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 """
-scripts/backfill_paper_authors.py — put an author list on paper atoms written before 2026-09-08.
+scripts/backfill_paper_authors.py — put an author list on paper atoms that have none.
 
-ONE-TIME, and it exists because papers are immutable under Policy B. `atomize_paper` began
-recording every author's registry ids on 2026-09-08 (stage 1 of
-docs/plans/2026-09-08-researchers-as-oracles.md); every paper atom written before that carries
-none, and no later run revisits a paper. So without this, `paper_authors` produces nothing at all
-for a store's existing saves — on the live store that was 82 paper atoms, 11 of them `user-saved`,
-which is the entire population the feature was built for.
-
-WHAT IT WRITES: `payload.authors` only. It does NOT touch `raw_ref`, `raw_hash`, the snapshot, or
-any chunk — nothing is re-fetched and nothing is re-embedded, so Policy B's actual subject (the
-paper's BODY, which is immutable and expensive) is untouched. Adding a metadata key to a row is
-the same class of write `promote_atom` already makes.
-
-WHAT IT COSTS: one free OpenAlex request per atom, paced. No embed, no LLM, no money.
-
-IDEMPOTENT: an atom that already has a non-empty `payload.authors` is skipped, so a re-run after a
-partial pass costs only the atoms still missing one. Safe to interrupt.
-
-IT HAS A DETECTOR, which is the bar the 2026-09-08 hand-run-entry-point audit set for a hand-run
-pass that survives: `paper_authors._papers_missing_an_author_list` counts what is due and every
-`curation_pull` report carries the number plus this command. `rechunk.py` was deleted that same
-day for lacking one — "a maintenance pass whose trigger nothing can detect is a pass nobody runs"
-— and `scripts/restrip_embed_surface.py` survives on exactly this basis.
+One-time: papers are immutable, so no later run adds `payload.authors` to a paper atom written
+before `atomize_paper` recorded authors. Writes `payload.authors` only; nothing is re-fetched or
+re-embedded. One free OpenAlex request per atom, paced. Idempotent: atoms that already have an
+author list are skipped, so a re-run after an interrupted pass costs only what is left.
+`papers._papers_missing_an_author_list` counts what is due, and the papers pass logs it.
 
     python scripts/backfill_paper_authors.py --dry-run     # what would change, no writes
     python scripts/backfill_paper_authors.py               # do it
@@ -39,7 +22,8 @@ import time
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from pipeline.kb import ingest_papers, schema                      # noqa: E402
-from pipeline.kb.frontier_sources import _get, _openalex_authors   # noqa: E402
+from pipeline.platforms.papers.registry import get                 # noqa: E402
+from pipeline.platforms.papers.openalex import openalex_authors           # noqa: E402
 
 _API = "https://api.openalex.org/works"
 _SELECT = "id,title,authorships"
@@ -48,9 +32,9 @@ _SELECT = "id,title,authorships"
 def _lookup_key(atom_id: str) -> str | None:
     """A paper atom id → the OpenAlex `/works` filter that finds it, or None.
 
-    Atom ids are `paper:arXiv:{id}` or `paper:DOI:{doi}` (`ingest_papers._canonical_paper_id`).
-    An arXiv id resolves through its registered DOI — `10.48550/arXiv.{id}` — which is what
-    OpenAlex indexes it under. Verified 2026-09-08 against 10.48550/arXiv.2404.07344.
+    Atom ids are `paper:arXiv:{id}` or `paper:DOI:{doi}` (`derive.canonical_paper_id`).
+    An arXiv id resolves through its registered DOI, `10.48550/arXiv.{id}`, which is what
+    OpenAlex indexes it under.
     """
     body = atom_id.removeprefix("paper:")
     if body.lower().startswith("arxiv:"):
@@ -65,7 +49,7 @@ def _fetch_authors(key: str) -> list[dict] | None:
     import urllib.parse
 
     url = f"{_API}?{urllib.parse.urlencode({'filter': key, 'select': _SELECT})}"
-    body = _get(url)
+    body = get(url)
     if body is None:
         return None
     try:
@@ -74,10 +58,9 @@ def _fetch_authors(key: str) -> list[dict] | None:
         return None
     if not results:
         return None
-    # Through the SAME extractor the adapter uses, then the same normalizer `atomize_paper` uses,
-    # so a backfilled row is byte-identical to one written fresh. Two spellings of one shape is
-    # how a backfill silently produces rows its own readers mis-parse.
-    oa = _openalex_authors(results[0])
+    # The adapter's extractor and `atomize_paper`'s normalizer, so a backfilled row is
+    # byte-identical to one written fresh.
+    oa = openalex_authors(results[0])
     return ingest_papers.atom_authors({
         "authors": [{"name": a["name"],
                      **({"openalexId": oid} if (oid := a.get("openalex_id")) else {}),
@@ -131,8 +114,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"   -- {atom_id}: OpenAlex has no author list")
                 continue
             merged = {**(json.loads(payload or "{}") or {}), "authors": authors}
-            # Payload only. `raw_hash`, `raw_ref` and every chunk are untouched, so the paper's
-            # BODY — Policy B's actual subject — is not re-fetched, re-rendered or re-embedded.
+            # Payload only: `raw_hash` and the body stay, so nothing is re-indexed.
             conn.execute("UPDATE atoms SET payload=? WHERE atom_id=?",
                          (json.dumps(merged), atom_id))
             conn.commit()
@@ -140,10 +122,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"   ok {atom_id} ({entry_mode}): {len(authors)} author(s)")
 
         print(f"[backfill] filled={filled} no_openalex_record={missing} unkeyable={unkeyable}")
-        print("[backfill] next: the paper-author signals are recomputed on the next "
-              "`curation_catchup` pass, or now with "
-              "`python -c \"from pipeline.kb import paper_authors, schema; "
-              "print(paper_authors.sync_paper_author_signals(schema.connect()))\"`")
+        print("[backfill] next: the paper-author signals are recomputed by the scrapers' "
+              "hourly papers pass, or now with "
+              "`python -c \"from pipeline.curation import papers; from pipeline.kb import schema; "
+              "print(papers.sync_paper_author_signals(schema.connect()))\"`")
         return 0
     finally:
         conn.close()

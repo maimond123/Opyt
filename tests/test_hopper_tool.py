@@ -23,7 +23,7 @@ class _MCP:
     def __init__(self):
         self.tools = {}
 
-    def tool(self):
+    def tool(self, **kw):
         def deco(fn):
             self.tools[fn.__name__] = fn
             return fn
@@ -62,7 +62,7 @@ def _bar(doc: str) -> str:
                                  "https://europepmc.org/article/PMC/PMC8371605",
                                  "https://europepmc.org/article/PPR/PPR217527",
                                  "https://openalex.org/W2741809807",
-                                 # Moved off the bare-host list 2026-09-16 — see
+                                 # Not on the bare-host list — see
                                  # `link_router._PAPER_PATH_RES`. Each host has a real non-paper
                                  # section (an author page, a community, an about page) that a
                                  # bare entry routed to the paper adapter.

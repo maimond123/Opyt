@@ -1,28 +1,24 @@
 """
-pipeline/kb/derive.py — LEAN derivation of an atom's routing metadata.
+pipeline/kb/derive.py — derive an atom's routing metadata from the source's structural fields.
 
-The plan's deliberate scope cut: `about_entities`/`description`/`who_id` come from the
-SOURCE's own structural metadata (GitHub topics, tweet hashtags/mentions, author fields)
-via simple slug normalization — NO LLM, NO NER, NO topic-clustering. Those richer
-derivations are already-built, separately-scoped features; wiring them in is a documented
-follow-on. Everything here is mechanical and deterministic, which keeps the `description`
-SAFE to surface in `aggregate` without violating the trust invariant (it asserts nothing
-the source didn't structurally state).
+Mechanical and deterministic (no LLM, no NER), so `description` asserts nothing the source didn't
+state and is safe to surface in `aggregate`.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 
-from pipeline.ingestion.url_canon import canonical_identity
+from pipeline.platforms.papers.arxiv import strip_arxiv_version
+from pipeline.platforms.url_canon import canonical_identity
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 
 
 def slugify(text: str) -> str:
-    """`"AI Agents"` / `"ai_agents"` / `"#AIAgents"` → `"ai-agents"`. Lowercased,
-    non-alphanumerics collapsed to single hyphens, trimmed. Empty → ""."""
+    """`"AI Agents"` / `"ai_agents"` → `"ai-agents"`."""
     return _SLUG_STRIP.sub("-", (text or "").lower()).strip("-")
 
 
@@ -40,12 +36,10 @@ def _slugs(items) -> list[str]:
 # ── X bookmarks → opinion-atom metadata ─────────────────────────────────────────
 
 def derive_x(norm: dict) -> dict:
-    """Structural fields off a normalized bookmark (x_graphql_core.normalize output).
+    """Structural fields off a normalized bookmark (x.records.normalize_tweet output).
 
-    `who_id` is the AUTHOR entity (`x:user:{id}`) — a bookmark records who SAID it, not
-    who saved it (that's `entry_mode="user-saved"`). Hashtags are AUTHOR-DECLARED, so they
-    land in `source_tags`. Entities = @-mentions, slugged. Description is mechanical:
-    handle, name, a text prefix, day.
+    `who_id` is the author, not the saver. Hashtags are author-declared, so they land in
+    `source_tags`; entities are the @-mentions.
     """
     author = norm.get("author") or {}
     username = author.get("userName") or "unknown"
@@ -76,11 +70,10 @@ def derive_x(norm: dict) -> dict:
 
 
 def _day(created_at: str) -> str:
-    """A twitter `createdAt` → `YYYY-MM-DD` (empty on parse failure). Reuses the
-    ingester's own date parser so bookmark + profile dates agree."""
+    """A twitter `createdAt` → `YYYY-MM-DD` (empty on parse failure)."""
     try:
-        from pipeline.ingestion.x_render import _parse_twitter_date
-        dt = _parse_twitter_date(created_at or "")
+        from pipeline.ingestion.x_render import parse_twitter_date
+        dt = parse_twitter_date(created_at or "")
         return dt.strftime("%Y-%m-%d") if dt else ""
     except Exception:
         return ""
@@ -93,24 +86,12 @@ _URL_HOST = re.compile(r"https?://([^/]+)", re.I)
 
 
 def substack_entity_id(handle: str | None = None, publication_url: str | None = None) -> str:
-    """The Substack join key: `substack:{author_handle}`, falling back to
-    `substack:{subdomain}` from a publication URL when the handle is absent (the
-    ACCOUNT-LEVEL reads drop the handle, so they land on the subdomain id while saved-posts
-    land on the handle id). Both Substack account reads have that limitation: `subscriber-lists`
-    returns {name, url} only, and `subscriptions/page_v2` carries a numeric `author_id` but no
-    handle — resolving it would cost one request per publication against a rate-limited host.
-    A custom domain has no subdomain either, so it keys on its HOST (20 of 36 subscriptions
-    measured 2026-09-08). The residual handle-vs-subdomain split for a pub the user BOTH
-    saved-from AND subscribes-to is resolved in Stage-3 via the publication URL both sides store
-    in `identity_links` — do NOT try to unify it here.
+    """The Substack join key: `substack:{handle}`, else `substack:{subdomain}`, else
+    `substack:{host}` for a custom domain.
 
-    One Substack read DOES carry a handle and still passes None: `substack.parse_recommendations`
-    gets a full nested `author` object, handle included, at no extra request. It drops it on
-    purpose. Keying a recommendation on the handle would mint a second id for a publication the
-    subscription list already keyed on its URL, leaving two candidates carrying one signal each
-    below the >=2-signal bar until resolution merged them. Measured 2026-09-08 on the live store:
-    one of six recommended publications was already subscribed, and passing None is what made it
-    corroborate on the spot instead of splitting. Having the handle is not a reason to use it."""
+    A handle-vs-subdomain split for the same publication is resolved later via `identity_links`;
+    don't unify it here.
+    """
     h = (handle or "").strip().lstrip("@").lower()   # handles are case-insensitive → canonicalize
     if h:
         return f"substack:{h}"
@@ -133,11 +114,9 @@ def _iso_day(iso: str) -> str:
 
 
 def derive_substack(rec: dict) -> dict:
-    """Structural fields off a saved-post record (`ingest_substack._saved_item_to_record`).
+    """Structural fields off a saved-post record (`substack.account.saved_item_to_record`).
 
-    `who_id` is the post's AUTHOR/publication (`substack:{handle|subdomain}`) — a saved post
-    records who WROTE it, not who saved it (that's `entry_mode="user-saved"`). Description
-    is mechanical."""
+    `who_id` is the post's author/publication, not the saver."""
     handle = rec.get("author_handle") or ""
     pub_url = rec.get("publication_url") or ""
     who_id = substack_entity_id(handle, pub_url)
@@ -164,11 +143,8 @@ def derive_substack(rec: dict) -> dict:
 def derive_github(repo: dict) -> dict:
     """Structural fields off a GitHub repo dict (ingest_github._fetch_repos output).
 
-    `who_id` = the repo OWNER (`github:{login}`) — authoritative from the API, not the
-    crawl handle (an org repo surfaced via a user's membership still belongs to the org).
-    Repo topics are AUTHOR-DECLARED, so they land in `source_tags`. Entities = the primary
-    language. `when_precision="push"` flags that `when_ts` is LAST-PUSH, not a publish date
-    (don't read it as "new work").
+    `who_id` is the repo owner from the API, not the crawl handle. `when_precision="push"`
+    flags that `when_ts` is the last push, not a publish date.
     """
     name = repo.get("name", "")
     owner = (repo.get("owner") or {}).get("login", "")
@@ -195,34 +171,20 @@ def derive_github(repo: dict) -> dict:
 # ── Blog footprint identity + per-post metadata ─────────────────────────────────
 
 def blog_entity_id(blog_url: str | None) -> str:
-    """The blog join key: `blog:{canonical_host}` (via `url_canon.canonical_identity`, which
-    returns the bare host for a personal site — `karpathy.github.io`, `simonwillison.net`). The
-    host is the person's blog trust-unit, and it is UNIQUE per site, so resolve can treat the
-    stored home as `self` without false-merging two people. Distinct from the PER-POST atom id
-    (`_canon_post_url` in ingest_blog), which keeps the path so posts don't collapse to the host.
-    Empty/garbage URL → `blog:unknown` (a stable, never-merging singleton)."""
+    """The blog join key: `blog:{canonical_host}`; `blog:unknown` for an empty or garbage URL.
+
+    The host is unique per site, so resolve can treat it as `self` without false-merging people.
+    """
     host = canonical_identity(blog_url or "")
     return f"blog:{host}" if host else "blog:unknown"
 
 
-def org_entity_id(org_url: str | None) -> str:
-    """The org join key: `org:{canonical_host}` (via `url_canon.canonical_identity`). Mirrors
-    `blog_entity_id` but tags a MULTI-author / company site the footprint gate SKIPPED — recorded
-    as an affiliation fact-node — this `org:` id PREFIX is the marker, there being no type column on
-    `entities` (one was deleted 2026-08-23) — NEVER a source of opinion atoms. Unique per host,
-    so it never false-merges two orgs. Empty/garbage URL → `org:unknown`."""
-    host = canonical_identity(org_url or "")
-    return f"org:{host}" if host else "org:unknown"
-
-
 def derive_blog(article: dict, *, blog_url: str, handle: str | None = None,
                 author_name: str | None = None) -> dict:
-    """Structural fields off a fetched blog post (`sources/blog._fetch_article` output:
-    `{url, title, date, content}`), mirroring `derive_substack`.
+    """Structural fields off a fetched blog post (`platforms/web/article.fetch_article` output).
 
-    `who_id` is the blog HOME (`blog:{host}`) — the same for every post of one blog, so the whole
-    footprint attributes to one Oracle. `when_ts` is the post's date (day precision).
-    `description` is mechanical (name · title · date)."""
+    `who_id` is the blog home, the same for every post, so the footprint attributes to one Oracle.
+    """
     who_id = blog_entity_id(blog_url)
     name = (author_name or (f"@{handle.lstrip('@')}" if handle else "")
             or canonical_identity(blog_url or "") or "blog")
@@ -235,8 +197,7 @@ def derive_blog(article: dict, *, blog_url: str, handle: str | None = None,
         "who_name": name,
         "who_site": blog_url,
         "when_ts": date,
-        # Honor the date cascade's precision when it set one (e.g. `approx` for a Wayback upper
-        # bound); else infer — never claim day-precision on an empty date.
+        # Honor the date cascade's precision when set; never claim day precision on no date.
         "when_precision": article.get("when_precision") or ("day" if date else "unknown"),
         "about_entities": [],
         "description": desc.strip(" ·"),
@@ -245,29 +206,36 @@ def derive_blog(article: dict, *, blog_url: str, handle: str | None = None,
 
 # ── Paper (arXiv / Semantic Scholar) → artifact-atom metadata ────────────────────
 
+def canonical_paper_id(paper: dict) -> str | None:
+    """The dedup key behind `atom_id = paper:{id}`. Prefer the explicit `paperId`/`id` a source
+    supplied (paper_from_url stamps a deterministic one); else derive from external ids (arXiv id,
+    version-stripped > DOI). None → the paper cannot be identified (caller returns None)."""
+    pid = paper.get("paperId") or paper.get("id")
+    if pid:
+        return str(pid)
+    ext = paper.get("externalIds") or {}
+    arxiv = ext.get("ArXiv")
+    if arxiv:
+        return f"arXiv:{strip_arxiv_version(arxiv)}"
+    doi = ext.get("DOI")
+    if doi:
+        return f"DOI:{str(doi).rstrip('.').lower()}"
+    return None
+
+
 def derive_paper(paper: dict) -> dict:
-    """Structural fields off a normalized Paper (the S2 metadata SHAPE:
-    `title/abstract/authors/externalIds/venue/year/publicationDate/…`), mirroring
-    `derive_blog`/`derive_substack`.
+    """Structural fields off a normalized Paper (Semantic Scholar metadata shape).
 
-    `who_id` is the paper's own author — NOT the Oracle. A footprint-linked paper is one the
-    Oracle *pointed at*, usually not one they wrote; the Oracle's relationship is a caller-supplied
-    vouch edge (`oracle → references → paper`), never an authorship claim. `who_id` =
-    `scholar:{first_author_id}` when the first author carries a Semantic Scholar author id, else
-    `paper-authors:{canonical_id}` (a stable per-paper placeholder for the rare id-less case — a
-    raw hosted PDF with no metadata). `when_precision` is HONEST: `"day"` from a `publicationDate`,
-    else `"year"` from the `year` (a paper with only a year is not dated to Jan 1 for real).
-    `about_entities` is `[]` on purpose — a structural guess here would be wrong. `description`
-    is mechanical (author · title · venue · year), so it stays SAFE to surface without asserting
-    anything the metadata didn't state."""
-    from .ingest_papers import _canonical_paper_id   # shared canonical-id rule (dedup parity)
-
+    `who_id` is the paper's first author, not the Oracle: `scholar:{author_id}`, else the
+    placeholder `paper-authors:{canonical_id}`. The Oracle's link is a separate vouch edge.
+    `when_precision` is `"day"` from `publicationDate`, else `"year"`.
+    """
     authors = paper.get("authors") or []
     first = authors[0] if authors else {}
     first_name = (first.get("name") or "").strip()
     first_id = first.get("authorId")
 
-    pid = _canonical_paper_id(paper) or "unknown"
+    pid = canonical_paper_id(paper) or "unknown"
     who_id = f"scholar:{first_id}" if first_id else f"paper-authors:{pid}"
     who_name = first_name or "paper"
 
@@ -294,3 +262,25 @@ def derive_paper(paper: dict) -> dict:
         "about_entities": [],
         "description": description,
     }
+
+
+def _profile_dict(value) -> dict:
+    """A stored `entities.profile` → a dict; null, empty, malformed or non-dict → {}."""
+    if isinstance(value, dict):
+        return value
+    try:
+        loaded = json.loads(value) if value else {}
+    except (ValueError, TypeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def best_name(members: list[dict]) -> tuple[str | None, str | None]:
+    """(display_name, handle) for a cluster, preferring the X member. The one name-picking rule
+    for the whole KB."""
+    x_members = [m for m in members if (m["entity_id"] or "").startswith("x:")]
+    ordered = x_members + [m for m in members if m not in x_members]
+    name = next((m["name"] for m in ordered if m["name"]), None)
+    handle = next((_profile_dict(m["profile"]).get("handle") for m in ordered
+                   if _profile_dict(m["profile"]).get("handle")), None)
+    return name, handle

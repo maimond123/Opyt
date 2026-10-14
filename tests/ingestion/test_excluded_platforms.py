@@ -1,15 +1,14 @@
 """Retired platforms cannot enter discovery through profiles, hubs, or saved roots."""
 
-import importlib
 
 import pytest
 
-from pipeline.ingestion import trust_edges
-from pipeline.ingestion.source_classify import classify_source
-from pipeline.ingestion.url_canon import canonical_identity
-from pipeline.kb.oracles import _unsupported_root
+from pipeline.platforms.source_classify import classify_source
+from pipeline.platforms.url_canon import canonical_identity
+from pipeline.oracles.reference import unsupported_root
 
-dp = importlib.import_module("pipeline.ingestion.discover_profile")
+from pipeline.oracles.discovery import probes
+from pipeline.oracles.discovery import shaping
 
 
 @pytest.mark.parametrize("url", [
@@ -27,13 +26,9 @@ dp = importlib.import_module("pipeline.ingestion.discover_profile")
 def test_excluded_urls_cannot_be_discovered_or_fetched_as_blogs(url):
     assert canonical_identity(url) == ""
     assert classify_source(url) is None
-    assert dp._classify_url(url) is None
-    assert dp._sources_from_urls([url]) == []
-    assert dp._probe_blog_profile(url) == ({}, [], [])
-    assert _unsupported_root(url)
-    html = f'<a href="{url}">profile</a><a href="https://alice.example">writing</a>'
-    assert [link.url for link in trust_edges.profile_links_from_html(html)] == [
-        "https://alice.example"]
+    assert shaping.classify_url(url) is None
+    assert probes.probe_blog_profile(url) == ({}, [], [])
+    assert unsupported_root(url)
 
 
 @pytest.mark.parametrize("url", [

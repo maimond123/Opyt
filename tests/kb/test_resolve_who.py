@@ -1,11 +1,11 @@
 """retrieve.resolve_who — a handle/URL/id → the entity cluster(s) it names.
 
-The read-side lookup, and deliberately NOT the one in `oracles._resolve_handle`: that one pays
+The read-side lookup, and deliberately not the one in `identify.resolve_handle`: that one pays
 twitterapi.io and mints entities (correct for onboarding), this one is pure local SQL over what
 the store already has (the only thing a query is allowed to cost).
 
 The load-bearing test here is `test_a_single_id_would_have_missed_half_their_work`: an atom
-carries its author's PER-PLATFORM id, so one person is several ids, and a resolver that returned
+carries its author's per-platform id, so one person is several ids, and a resolver that returned
 just one would report a fraction of someone's output as all of it.
 """
 from __future__ import annotations
@@ -14,11 +14,13 @@ import pytest
 
 from pipeline.kb import resolve, schema
 from pipeline.kb.ingest_common import store_atom
-from pipeline.kb.raw_store import write_snapshot
-from pipeline.kb.retrieve import candidate_atom_ids, resolve_who, search_atoms
+from pipeline.kb.ingest_common import snapshot_hash
+from pipeline.retrieval.engine import search_atoms
+from pipeline.retrieval.filters import candidate_atom_ids
+from pipeline.retrieval.who import resolve_who
 
 X_ID = "x:user:33836629"
-GH_ID = "github:Karpathy"          # the API's casing — NOT what a user types
+GH_ID = "github:Karpathy"          # the API's casing — not what a user types
 BLOG_ID = "blog:karpathy.github.io"
 
 
@@ -30,7 +32,7 @@ def conn(kb_home):
 
 
 def _person(conn):
-    """One person, three platform rows, cross-linked by a shared home URL so Stage-3 resolution
+    """One person, three platform rows, cross-linked by a shared home URL so entity resolution
     merges them into a single cluster — the ordinary shape after an Oracle footprint expand."""
     home = "https://karpathy.github.io"
     schema.upsert_entity(conn, X_ID, name="Andrej Karpathy", identity_links=[home], profile={"handle": "karpathy"})
@@ -39,20 +41,20 @@ def _person(conn):
     resolve.resolve_entities(conn)
 
 
-def _atom(conn, emb, atom_id, source_type, who_id, text):
-    raw_ref, raw_hash = write_snapshot(source_type, atom_id, text)
-    store_atom(conn, emb, atom=dict(
+def _atom(conn, atom_id, source_type, who_id, text):
+    raw_hash = snapshot_hash(text)
+    store_atom(conn, dict(
         atom_id=atom_id, source_type=source_type, what_kind="opinion", who_id=who_id,
         when_ts="2024-05-01", when_precision="day", about_entities=[],
-        source_url=f"https://example/{atom_id}", raw_ref=raw_ref, raw_hash=raw_hash,
+        source_url=f"https://example/{atom_id}", raw_hash=raw_hash,
         description=f"{atom_id} card", payload={}, entry_mode="user-saved",
-    ), snapshot_text=text)
+    ), text)
 
 
 # ── the three storage shapes one handle can live in ────────────────────────────
 
 def test_x_handle_resolves_through_the_profile_not_the_id(conn):
-    # X's id is numeric, so the handle is NOT reconstructable from it — it lives in `profile`.
+    # X's id is numeric, so the handle is not reconstructable from it — it lives in `profile`.
     _person(conn)
     got = resolve_who(conn, "@karpathy")
     assert len(got) == 1
@@ -79,7 +81,7 @@ def test_a_blog_url_resolves_through_the_same_id_the_ingest_side_minted(conn):
 
 
 def test_an_id_passes_straight_through(conn):
-    # A caller that already HAS an id shouldn't need a different entry point.
+    # A caller that already has an id shouldn't need a different entry point.
     _person(conn)
     assert resolve_who(conn, X_ID)[0]["canonical_id"] \
         == resolve_who(conn, "karpathy")[0]["canonical_id"]
@@ -94,13 +96,13 @@ def test_resolve_returns_every_platform_id_for_one_person(conn):
     assert got[0]["who_ids"] == sorted([X_ID, GH_ID, BLOG_ID])
 
 
-def test_a_single_id_would_have_missed_half_their_work(conn, fake_embedder):
-    """The reason `who_ids` is a list. An atom carries its author's PER-PLATFORM id, so
-    filtering on any ONE of them silently returns a fraction of what that person wrote —
+def test_a_single_id_would_have_missed_half_their_work(conn):
+    """The reason `who_ids` is a list. An atom carries its author's per-platform id, so
+    filtering on any one of them silently returns a fraction of what that person wrote —
     and presents it as everything."""
     _person(conn)
-    _atom(conn, fake_embedder, "x:1", "x", X_ID, "thoughts on an autonomous agent")
-    _atom(conn, fake_embedder, "github:Karpathy/nanogpt", "github", GH_ID,
+    _atom(conn, "x:1", "x", X_ID, "thoughts on an autonomous agent")
+    _atom(conn, "github:Karpathy/nanogpt", "github", GH_ID,
           "a minimal agent framework")
 
     one_id = candidate_atom_ids(conn, None, None, None, X_ID)
@@ -111,20 +113,20 @@ def test_a_single_id_would_have_missed_half_their_work(conn, fake_embedder):
 
 
 def test_the_cluster_is_only_as_good_as_stage3_resolution(conn):
-    """The known ceiling on this whole feature, pinned so it is a documented boundary rather
-    than a surprise. Stage-3 unions on `self ∩ attests` — someone has to BE a URL for the
-    entities that LINK to it to merge. Two platform rows that merely both point at the same
-    home stay SEPARATE, because two different people can each link to one company page.
+    """The known ceiling on this feature, pinned as a documented boundary.
+    Entity resolution unions on `self ∩ attests` — someone has to be a URL for the
+    entities that link to it to merge. Two platform rows that merely both point at the same
+    home stay separate, because two different people can each link to one company page.
 
     The consequence for the caller: `resolve_who` reports two clusters for one person, and a
-    caller that takes only the first gets half their work. It UNDER-returns; it never returns
-    the wrong person's atoms. Fixing it means attesting the link (Stage-3's job), not loosening
+    caller that takes only the first gets half their work. It under-returns; it never returns
+    the wrong person's atoms. Fixing it means attesting the link (entity resolution's job), not loosening
     the match here — a looser rule would merge strangers who share an employer."""
     home = "https://acme.example.com"
     schema.upsert_entity(conn, "github:root", name="Root", identity_links=[home])
     schema.upsert_entity(conn, X_ID, name="Root", identity_links=[home], profile={"handle": "root"})
     resolve.resolve_entities(conn)
-    assert len(resolve_who(conn, "root")) == 2       # one PERSON, two clusters — not yet merged
+    assert len(resolve_who(conn, "root")) == 2       # one person, two clusters — not yet merged
 
     # Add the entity that IS that home, and the same two rows now merge into one cluster.
     schema.upsert_entity(conn, "blog:acme.example.com", name="Root", identity_links=[home])
@@ -133,9 +135,9 @@ def test_the_cluster_is_only_as_good_as_stage3_resolution(conn):
 
 
 def test_two_different_people_stay_two_clusters(conn):
-    # The same handle string on two platforms with NO attested link between them. Reporting one
+    # The same handle string on two platforms with no attested link between them. Reporting one
     # merged person would be a false identity claim, so they stay separate and the caller
-    # decides — the resolver never guesses a merge that Stage-3 didn't attest.
+    # decides — the resolver never guesses a merge that entity resolution didn't attest.
     schema.upsert_entity(conn, "github:karpathy", name="A")
     schema.upsert_entity(conn, "substack:karpathy", name="B")
     got = resolve_who(conn, "karpathy")
@@ -174,19 +176,19 @@ def test_a_bare_handle_does_not_seed_a_bogus_blog_id(conn):
 
 # ── the empty-author-set trap ─────────────────────────────────────────────────
 
-def test_an_empty_id_list_matches_nothing_never_everything(conn, fake_embedder):
+def test_an_empty_id_list_matches_nothing_never_everything(conn):
     """A failed resolution yields an empty author list. If the pre-filter read that as "no
-    filter", the caller would get the WHOLE store back and present a stranger's atoms as the
+    filter", the caller would get the whole store back and present a stranger's atoms as the
     person they asked for. The empty list must mean nobody."""
     _person(conn)
-    _atom(conn, fake_embedder, "x:1", "x", X_ID, "thoughts on an autonomous agent")
+    _atom(conn, "x:1", "x", X_ID, "thoughts on an autonomous agent")
     assert candidate_atom_ids(conn, None, None, None, []) == set()
-    assert search_atoms(conn, "agent", fake_embedder, who_id=[]).hits == []
+    assert search_atoms(conn, "agent", who_id=[]).hits == []
 
 
-def test_an_empty_string_still_means_no_filter(conn, fake_embedder):
+def test_an_empty_string_still_means_no_filter(conn):
     # The other empty case, and it reads the opposite way on purpose: a host filling an unused
     # optional slot with "" means "no filter", not "nobody".
     _person(conn)
-    _atom(conn, fake_embedder, "x:1", "x", X_ID, "thoughts on an autonomous agent")
+    _atom(conn, "x:1", "x", X_ID, "thoughts on an autonomous agent")
     assert candidate_atom_ids(conn, None, None, None, "") is None

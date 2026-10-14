@@ -2,9 +2,7 @@
 
 Nothing here is a mock of the thing under test. `export_file` is built by `build_export` from a
 seeded live store, it is uploaded through the actual endpoint, and the reader token is obtained by
-minting a grant and redeeming it — the same three calls a real owner and reader make. The only
-stand-in is the EMBEDDER, and only because the hosted one costs money and the test suite blocks
-sockets; the vectors it produces are stored, exported and ranked by the unmodified code.
+minting a grant and redeeming it — the same three calls a real owner and reader make.
 
 Two homes, and keeping them apart is the point: the OWNER's `$OPYT_HOME` holds the live store the
 export is projected from, and the SERVICE's holds the peers registry, `service.db`, and
@@ -12,16 +10,17 @@ export is projected from, and the SERVICE's holds the peers registry, `service.d
 """
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from pipeline.kb import export, schema
-from service import store
+from pipeline.kb import schema
+from pipeline.sharing import export
+from service import line, tokens
 from service.app import app
-from tests.kb.conftest import FakeEmbedder
 from tests.kb.test_export import _corpus
 
 OWNER = "david"
@@ -29,20 +28,14 @@ LABEL = "David's KB"
 
 
 @pytest.fixture()
-def emb():
-    """The same vocabulary `tests/kb/test_export.py` seeds its corpus with, so the queries that
-    file already exercises mean the same thing here."""
-    return FakeEmbedder(["agent", "framework", "autonomous", "tools", "library",
-                         "crypto", "rollup", "proof", "react", "dashboard", "web"])
-
-
-@pytest.fixture()
-def export_file(tmp_path, monkeypatch, emb):
-    """A real export, built by `build_export` from a seeded live store under its own home."""
+def export_file(tmp_path, monkeypatch):
+    """A real export, built by `build_export` from a seeded live store under its own home. The
+    corpus is `tests/kb/test_export.py`'s, so the queries that file exercises mean the same thing
+    here."""
     live = tmp_path / "live"
     monkeypatch.setenv("OPYT_HOME", str(live))
     conn = schema.connect()
-    _corpus(conn, emb)
+    _corpus(conn)
     conn.close()
     out = tmp_path / "export.db"
     export.build_export(out)
@@ -68,7 +61,7 @@ def svc(service_home, export_file):
     exercises the self-service path against the same app.
     """
     client = TestClient(app)
-    owner_token = store.mint_token(OWNER, "owner", label=LABEL)
+    owner_token = tokens.mint_token(OWNER, "owner", label=LABEL)
 
     owner_hdr = {"Authorization": f"Bearer {owner_token}"}
     up = client.post(f"/v1/upload/{OWNER}", content=export_file.read_bytes(), headers=owner_hdr)
@@ -90,7 +83,46 @@ def svc(service_home, export_file):
     )
 
 
-def query_vector(emb, query: str) -> list[float]:
-    """What a READER computes on their own machine and sends: the query embedded with the model
-    the export's `kb_meta` names, as plain floats. The server never calls an embedder for it."""
-    return [float(x) for x in np.asarray(emb.embed([query], role="query")[0])]
+def agent_key(svc, label: str | None = "Instinct") -> str:
+    """An agent token for `svc`'s library, got the way a real agent gets one: the owner mints an
+    agent invite and the agent redeems it."""
+    code = svc.client.post("/v1/grant", json={"label": label, "agent": True},
+                           headers=svc.owner_hdr).json()["code"]
+    return svc.client.post("/v1/redeem", json={"code": code}).json()["token"]
+
+
+class Mac:
+    """A Mac on the line, in a thread: it asks for calls through the real route with the
+    library's owner token, and posts `answer(call)` for each one it is handed. With no `answer`
+    it takes each call and never answers, like a Mac that stopped mid-call. `taken` is every call
+    it was handed. Entering waits until the service has seen it ask."""
+
+    def __init__(self, svc, answer=None, *, ok: bool = True):
+        self.owner, self.headers, self.answer, self.ok = svc.owner, svc.owner_hdr, answer, ok
+        self.taken: list[dict] = []
+        self._off = threading.Event()
+        self._thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self) -> None:
+        client = TestClient(app)
+        while not self._off.is_set():
+            call = client.get("/v1/line/next", params={"wait": 0.2},
+                              headers=self.headers).json()["call"]
+            if call is None:
+                continue
+            self.taken.append(call)
+            if self.answer is not None:
+                client.post(f"/v1/line/{call['id']}/answer", headers=self.headers,
+                            json={"ok": self.ok, "answer": self.answer(call)})
+
+    def __enter__(self) -> "Mac":
+        self._thread.start()
+        deadline = time.monotonic() + 5
+        while not line.held(self.owner):
+            assert time.monotonic() < deadline, "the Mac never asked"
+            time.sleep(0.01)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._off.set()
+        self._thread.join(timeout=5)

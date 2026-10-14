@@ -1,17 +1,10 @@
 """
-opyt_core/credentials_registry.py — THE list of credentials OPYT knows how to use.
+opyt_core/credentials_registry.py — the list of credentials OPYT knows how to use.
 
-One row per credential. Adding a key is adding a row here, and nothing else. This replaced five
-hand-maintained lists of "which env var holds which credential" that could silently disagree;
-`KNOWN`, `SERVICES`, and `PROVIDER_ENV`
-are derived views at the bottom of this file, not copies. (The other two derived surfaces — the
-`.env` template writer and the `check_prerequisites` preflight — were deleted caller-less on
-2026-08-28/29; the rows outlived every hand list.)
+One row per credential; adding a key is adding a row here, and nothing else. `KNOWN`,
+`SERVICES` and `PROVIDER_ENV` are derived views at the bottom, not copies.
 
-Validators deliberately do not live here: `validate_credential` does real network calls, and this
-module must import nothing but `dataclasses` since `opyt_core/keys.py` depends on it and must
-stay cheap and import-free. Dispatch stays in `pipeline/credentials.py`, keyed on `service`;
-`test_every_registry_service_has_a_validator` pins that every row has a branch there.
+Imports nothing but `dataclasses`: `opyt_core/keys.py` depends on it and must stay cheap.
 """
 from __future__ import annotations
 
@@ -20,44 +13,36 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Credential:
-    """One credential, stated once.
-
-    `tier` is `required` or `optional` — deliberately no third value. Do not add a `dormant` tier;
-    see doc for why one was rejected.
-    """
+    """One credential, stated once. `tier` is `required` or `optional`, deliberately no third value."""
 
     env: str                        # the identity: the environment variable name
     service: str                    # the short alias callers use: get_credential("github")
     provider: str | None = None     # LLM providers only; None for everything else
     tier: str = "optional"          # required | optional — decides missing-key severity
     purpose: str = ""               # one line: what stops working without it
-    signup_url: str = ""            # a user with a MISSING key needs the link, not just the name
+    signup_url: str = ""            # a user with a missing key needs the link, not just the name
 
     @property
     def required(self) -> bool:
         return self.tier == "required"
 
 
-# Order is the order a user sees: required first, then optional. It drives BOTH the `.env`
-# scaffold's line order and `opyt-keys --list`, which previously disagreed with each other.
+# Order is the order a user sees in `opyt-keys --list`: required first, then optional.
 REGISTRY: tuple[Credential, ...] = (
     Credential(
         env="OPENROUTER_API_KEY",
         service="openrouter",
         provider="openrouter",
-        tier="required",
-        purpose="runs every LLM role (classification, extraction, vision) and the hosted "
-                "embedder, so hybrid search cannot be built or queried without it",
+        tier="optional",
+        purpose="runs image reading (charts in posts) during ingest. Without it Opyt runs "
+                "free and reads no images; search is by keyword either way",
         signup_url="https://openrouter.ai/keys",
     ),
     Credential(
         env="GITHUB_TOKEN",
         service="github",
         tier="optional",
-        # TWO limits, and the row used to name only the one its live consumer does not use.
-        # `github_client.readme`/`repo` hit the CORE REST budget (60/hr anonymous, 5000/hr with a
-        # token). `frontier_sources.GitHubAdapter` hits `/search/repositories`, which has its own
-        # far smaller budget: 10/min anonymous, 30/min with a token. The rail is PACED for the
+        # Two budgets: core REST reads and `/search/repositories`. The rail is paced for the
         # anonymous search limit, so this key is throughput, never capability.
         purpose="triples GitHub search from 10 to 30 requests/min and raises other GitHub reads "
                 "from 60 to 5000 req/hr; without it everything still works, just slower. A token "
@@ -68,16 +53,24 @@ REGISTRY: tuple[Credential, ...] = (
         env="OPYT_SERVICE_TOKEN",
         service="opyt_service",
         tier="optional",
-        # The OWNER half of foreign KB reads. A READER needs nothing here: they redeem a one-time
-        # grant code, and the reader token that comes back is written into their peers registry,
-        # not into `.env`. This row is only for the person PUBLISHING a knowledge base.
+        # Only for the person publishing a knowledge base; a reader's token lives in their peers
+        # registry, not `.env`.
         purpose="uploads your export to the service that hosts it for other people to query; "
                 "without it your knowledge base stays on your own disk and only readers you "
                 "hand the file to can read it",
-        # The one row whose issuer is not a third party: the token comes from whoever RUNS the
-        # service, which for a self-hosted one is the owner themselves. So the link is to the
-        # instructions for standing one up, because that is what a person holding no token needs.
+        # The token comes from whoever runs the service, so the link is to standing one up.
         signup_url="https://github.com/maimond123/Opyt",
+    ),
+    Credential(
+        env="OPENALEX_API_KEY",
+        service="openalex",
+        tier="optional",
+        # OpenAlex meters a daily budget per IP; a key is counted on its own and gets ten times
+        # the keyless one. A key OpenAlex does not know fails every call with 401, so
+        # `onboard(start='openalex')` checks it before storing.
+        purpose="raises OpenAlex's daily budget tenfold; without it paper lookups share the "
+                "keyless budget and pause once it is spent, until the next day",
+        signup_url="https://openalex.org/settings/api",
     ),
     Credential(
         env="S2_API_KEY",
@@ -90,9 +83,7 @@ REGISTRY: tuple[Credential, ...] = (
 )
 
 
-# ── Derived views — the four former registries, now computed ─────────────────────
-# Each of these WAS a hand-maintained literal somewhere else. They are exported so the old call
-# sites keep their names and shapes, which is what made this collapse behavior-preserving.
+# ── Derived views ─────────────────────────────────────────────────────────────────
 
 KNOWN: tuple[str, ...] = tuple(c.env for c in REGISTRY)
 SERVICES: dict[str, str] = {c.service: c.env for c in REGISTRY}

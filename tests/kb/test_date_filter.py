@@ -17,11 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from opyt_core import kb as kb_entry
+from pipeline.retrieval import reads as kb_entry
 from pipeline.kb import schema
 from pipeline.kb.ingest_common import store_atom
-from pipeline.kb.raw_store import write_snapshot
-from pipeline.kb.retrieve import _PRECISION_SPAN, _date_bound
+from pipeline.kb.ingest_common import snapshot_hash
+from pipeline.retrieval.filters import _PRECISION_SPAN, date_bound
 
 # One shared word ("agent") so a single bm25 query reaches every atom and the DATE is the only
 # thing separating them.
@@ -33,38 +33,37 @@ BLANK = "x:blank"        # when_ts = ""   (the undated shape the derivers write)
 NULL = "x:null"          # when_ts = NULL (the undated shape the column allows)
 
 
-def _add(conn, emb, atom_id, *, when_ts, when_precision, who_id="x:user:1", topics=("ai-agents",),
+def _add(conn, atom_id, *, when_ts, when_precision, who_id="x:user:1", topics=("ai-agents",),
          source_type="x", text="an agent framework post"):
-    raw_ref, raw_hash = write_snapshot(source_type, atom_id, text)
-    store_atom(conn, emb, atom=dict(
+    raw_hash = snapshot_hash(text)
+    store_atom(conn, dict(
         atom_id=atom_id, source_type=source_type, what_kind="opinion", who_id=who_id,
         when_ts=when_ts, when_precision=when_precision,
-        about_entities=[], source_url=f"https://example/{atom_id}", raw_ref=raw_ref,
-        raw_hash=raw_hash, description=f"{atom_id} card",
+        about_entities=[], source_url=f"https://example/{atom_id}", raw_hash=raw_hash,
+        description=f"{atom_id} card",
         payload={"source_tags": list(topics)}, entry_mode="user-saved",
-    ), snapshot_text=text)
+    ), text)
 
 
-def _corpus(conn, emb):
-    _add(conn, emb, OLD, when_ts="2024-03-04", when_precision="day")
-    _add(conn, emb, MID, when_ts="2026-05-11", when_precision="day")
-    _add(conn, emb, NEW, when_ts="2026-09-20", when_precision="day")
-    _add(conn, emb, YEAR, when_ts="2026-01-01", when_precision="year",
+def _corpus(conn):
+    _add(conn, OLD, when_ts="2024-03-04", when_precision="day")
+    _add(conn, MID, when_ts="2026-05-11", when_precision="day")
+    _add(conn, NEW, when_ts="2026-09-20", when_precision="day")
+    _add(conn, YEAR, when_ts="2026-01-01", when_precision="year",
          who_id="scholar:1", source_type="paper", text="an agent framework paper")
-    _add(conn, emb, BLANK, when_ts="", when_precision="unknown")
-    _add(conn, emb, NULL, when_ts=None, when_precision=None)
+    _add(conn, BLANK, when_ts="", when_precision="unknown")
+    _add(conn, NULL, when_ts=None, when_precision=None)
 
 
 def _ids(conn=None, **kw):
-    return {h["atom_id"] for h in kb_entry.run_kb_search("agent", mode="bm25", k=20, **kw)["hits"]}
+    return {h["atom_id"] for h in kb_entry.run_kb_search("agent", k=20, **kw)["hits"]}
 
 
 @pytest.fixture()
-def corpus(kb_home, fake_embedder):
+def corpus(kb_home):
     conn = schema.connect()
-    _corpus(conn, fake_embedder)
+    _corpus(conn)
     conn.close()
-    return fake_embedder
 
 
 # ── exact dates, both bounds, inclusive ──────────────────────────────────────────
@@ -109,7 +108,7 @@ def test_a_day_precision_atom_is_not_widened_by_the_year_rule(corpus):
     exact day and must filter exactly — this is where the vault rail's `date LIKE '%-01-01'`
     sniffing would produce a false positive, and why the precision column is not optional."""
     conn = schema.connect()
-    _add(conn, corpus, "x:jan1", when_ts="2026-01-01", when_precision="day")
+    _add(conn, "x:jan1", when_ts="2026-01-01", when_precision="day")
     conn.close()
     assert "x:jan1" not in _ids(date_from="2026-05-11")
 
@@ -122,7 +121,7 @@ def test_an_undated_atom_is_excluded_by_a_lower_bound(corpus):
 
 
 def test_an_undated_atom_is_excluded_by_an_upper_bound_too(corpus):
-    """The direction that used to disagree with itself. `'' >= '2026-05-11'` is FALSE while
+    """The upper bound must agree with the lower one. `'' >= '2026-05-11'` is FALSE while
     `'' <= '2026-05-11'` is TRUE, so an undated row was dropped by a lower bound and KEPT by an
     upper one — an inconsistency nobody chose and nothing reported."""
     got = _ids(date_to="2026-12-31")
@@ -139,7 +138,7 @@ def test_an_excluded_undated_atom_produces_a_notice_naming_the_count(corpus):
     """The disclaimer IS the deliverable. A `year` atom has partial evidence and earns the
     benefit of the doubt; an undated atom has none, so it is dropped — and dropping evidence the
     filter could not even EVALUATE has to be said, not inferred from a smaller result."""
-    out = kb_entry.run_kb_search("agent", mode="bm25", k=20, date_from="2024-01-01")
+    out = kb_entry.run_kb_search("agent", k=20, date_from="2024-01-01")
     note = next(n for n in out["notices"] if n["code"] == "undated_excluded")
 
     assert note["count"] == 2                                # BLANK and NULL
@@ -151,13 +150,13 @@ def test_an_excluded_undated_atom_produces_a_notice_naming_the_count(corpus):
 def test_no_undated_notice_when_no_date_filter_was_asked_for(corpus):
     """`notices` being empty on a healthy query is a contract. An undated atom is only news
     when something tried to filter on dates."""
-    assert kb_entry.run_kb_search("agent", mode="bm25", k=20)["notices"] == []
+    assert kb_entry.run_kb_search("agent", k=20)["notices"] == []
 
 
 def test_the_notice_still_fires_when_the_date_filter_empties_everything(corpus):
     """The case where the count matters MOST: zero hits, and the reason is partly that two atoms
     had no date to compare. Computed before the empty-candidate early return, deliberately."""
-    out = kb_entry.run_kb_search("agent", mode="bm25", k=20, date_from="2030-01-01")
+    out = kb_entry.run_kb_search("agent", k=20, date_from="2030-01-01")
     assert out["hits"] == []
     assert next(n for n in out["notices"] if n["code"] == "undated_excluded")["count"] == 2
 
@@ -175,9 +174,9 @@ def test_a_bare_year_upper_bound_means_december_thirty_first(corpus):
 
 
 def test_a_year_month_bound_widens_to_the_month_edges(corpus):
-    assert _date_bound("2026-02", end=False) == "2026-02-01"
-    assert _date_bound("2026-02", end=True) == "2026-02-28"      # real month length, not 31
-    assert _date_bound("2024-02", end=True) == "2024-02-29"      # leap year
+    assert date_bound("2026-02", end=False) == "2026-02-01"
+    assert date_bound("2026-02", end=True) == "2026-02-28"      # real month length, not 31
+    assert date_bound("2024-02", end=True) == "2024-02-29"      # leap year
 
 
 # ── a malformed bound is an ERROR, never a dropped filter ────────────────────────
@@ -187,19 +186,19 @@ def test_the_shape_that_motivated_this_feature_raises(corpus):
     LOOK filtered — the exact silent-wrong this feature exists to remove. An error is
     correctable; a filter that never ran is invisible."""
     with pytest.raises(ValueError, match="not a date"):
-        kb_entry.run_kb_search("agent", mode="bm25", date_from="5/11/2026")
+        kb_entry.run_kb_search("agent", date_from="5/11/2026")
 
 
 @pytest.mark.parametrize("bad", ["yesterday", "2026-13-01", "2026-02-30", "26-05-11", "20260511"])
 def test_other_unparseable_bounds_raise_too(bad):
     with pytest.raises(ValueError):
-        _date_bound(bad, end=False)
+        date_bound(bad, end=False)
 
 
 def test_an_absent_bound_is_not_a_filter(corpus):
     """None and "" both mean "no bound" — a host filling an unused optional slot with an empty
     string must not get an empty-set filter, which is how `who_id` distinguishes them too."""
-    assert _date_bound(None, end=False) is None and _date_bound("", end=True) is None
+    assert date_bound(None, end=False) is None and date_bound("", end=True) is None
     assert _ids(date_from="", date_to=None) == _ids()
 
 
@@ -217,7 +216,7 @@ def test_a_date_bound_narrows_the_other_filters_rather_than_replacing_them(corpu
 def test_the_applied_bounds_are_reported_normalized(corpus):
     """`trace.filters` shows filters AS APPLIED. `date_to="2026"` was applied as 2026-12-31, and
     reporting what the caller typed would hide the widening the engine chose for them."""
-    out = kb_entry.run_kb_search("agent", mode="bm25", k=20, date_from="2026", date_to="2026")
+    out = kb_entry.run_kb_search("agent", k=20, date_from="2026", date_to="2026")
     assert out["trace"]["filters"]["date_from"] == "2026-01-01"
     assert out["trace"]["filters"]["date_to"] == "2026-12-31"
 
@@ -229,7 +228,7 @@ def test_filter_cost_prices_a_date_bound(corpus):
     places — `_filter_clauses`, `_count_matching`'s forwarding, and `filter_costs`' args dict.
     Wire only the first two and this reads `{}`: 3 atoms excluded, and the one field whose job
     is exposing silent narrowing says nothing."""
-    out = kb_entry.run_kb_search("agent", mode="bm25", k=20, date_from="2026-05-11")
+    out = kb_entry.run_kb_search("agent", k=20, date_from="2026-05-11")
     # Dropping it would restore OLD (dated, outside the window) plus BLANK and NULL (undated).
     assert out["insights"]["filter_cost"]["date_from"] == 3
 
@@ -239,14 +238,14 @@ def test_the_priced_cost_and_the_undated_count_are_different_numbers(corpus):
     "how many more would I get dropping this bound" — outside-the-window PLUS undated. The
     notice is only the undated subset: what the filter could not EVALUATE, not what it evaluated
     and rejected."""
-    out = kb_entry.run_kb_search("agent", mode="bm25", k=20, date_from="2026-05-11")
+    out = kb_entry.run_kb_search("agent", k=20, date_from="2026-05-11")
     note = next(n for n in out["notices"] if n["code"] == "undated_excluded")
     assert note["count"] == 2 and out["insights"]["filter_cost"]["date_from"] == 3
 
 
 def test_a_date_bound_that_costs_nothing_is_not_reported(corpus):
     """`filter_cost` is self-pruning by construction, and a date bound is not an exception."""
-    out = kb_entry.run_kb_search("agent", mode="bm25", k=20, date_from="2020-01-01",
+    out = kb_entry.run_kb_search("agent", k=20, date_from="2020-01-01",
                                  source_type="paper")
     assert "date_from" not in out["insights"]["filter_cost"]
 
@@ -310,8 +309,7 @@ def test_every_precision_the_derivers_write_has_a_declared_range():
     through to exact-day. The case that motivated this: `approx`, drafted in `ingest_blog` as a
     Wayback UPPER bound, for which exact-day is WRONG on the `date_to` side — and nothing at
     runtime would say so, the filter would just quietly return fewer atoms. (That rung was never
-    wired and was deleted 2026-08-28, along with its `_PRECISION_SPAN` row; the guard stays,
-    because the next precision someone adds will arrive the same way.) Same shape as the AST guard in
+    wired; the guard stays, because the next precision someone adds will arrive the same way.) Same shape as the AST guard in
     `test_payload_key_names.py`, and for the same reason — there is no runtime moment where
     "a precision fell through" is observable.
     """
@@ -336,5 +334,5 @@ def test_every_precision_the_derivers_write_has_a_declared_range():
 def test_the_range_map_widens_exactly_one_precision_today():
     """The positive half. The guard above is satisfied trivially by a map where every entry is
     exact-day, which is the state this feature exists to fix."""
-    from pipeline.kb.retrieve import _WHEN
+    from pipeline.retrieval.filters import _WHEN
     assert [p for p, expr in _PRECISION_SPAN.items() if expr != _WHEN] == ["year"]

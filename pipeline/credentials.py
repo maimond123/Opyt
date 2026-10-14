@@ -1,34 +1,21 @@
 """
-pipeline/credentials.py
-Credential storage and validation for OPYT pipeline.
+pipeline/credentials.py — credential lookup for the OPYT pipeline.
 
-SECURITY: API keys should NEVER be passed through conversation text,
-command arguments, or logged to stdout. Keys are stored in ~/.opyt/.env
-and read from there. The agent should tell users to edit the file
-directly — never ask them to paste keys into the chat.
+Security: keys live in ~/.opyt/.env and are read from there; they never pass through
+conversation text or command arguments, and are never logged.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
-from opyt_core.credentials_registry import REGISTRY
 from opyt_core.credentials_registry import SERVICES as SERVICES   # derived: {service: env_var}
 from opyt_core.paths import opyt_path
 
 
-# SERVICES is derived from `opyt_core.credentials_registry.REGISTRY` — add a credential by adding
-# a row there, never a key to this map. Never add a REGISTRY entry whose `validate_credential`
-# falls through to "No validation available" — a credential path that accepts input and ignores it
-# is worse than one that doesn't exist.
-#
-# X needs no key AT ALL, and there is no way to supply one. EVERY X read — your bookmarks, an
-# Oracle's timeline, a single post, a profile — runs on your own logged-in x.com session through
-# x.com's internal GraphQL API. `TWITTERAPI_KEY` was a real credential here until 2026-08-30, for
-# an unrelated paid third party used to pull OTHER people's profiles; it is gone, and the guard
-# `retired-twitterapi-provider` stops it coming back.
+# Add a credential by adding a row to `opyt_core.credentials_registry.REGISTRY`, not to SERVICES.
+# X needs no key: every X read runs on the user's own logged-in x.com session.
 
 def _env_file_path(env_path: Path | None = None) -> Path:
     """Resolve .env file location."""
@@ -48,126 +35,60 @@ def _env_file_path(env_path: Path | None = None) -> Path:
 
 S2_USER_AGENT = "opyt/1.0"
 
-
 def s2_headers() -> dict[str, str]:
-    """Headers for ANY Semantic Scholar request — the one place the S2 key is attached, shared
-    across all six S2 call sites so a key added once works everywhere.
-
-    Unauthenticated S2 rate-limits aggressively across every anonymous caller; a key makes the
-    limit per-key instead of shared. Absent key -> plain headers, so requests still work, just
-    throttled (fail-safe). Returns a plain dict for compatibility with both `requests` and
-    `urllib.request`.
-    """
+    """Headers for any Semantic Scholar request — the one place the S2 key is attached.
+    Without a key, requests still work, just on the shared anonymous rate limit."""
     headers = {"User-Agent": S2_USER_AGENT}
     key = get_credential("semanticscholar")
     if key:
-        headers["x-api-key"] = key        # S2's scheme — NOT Bearer
+        headers["x-api-key"] = key        # S2's scheme, not Bearer
     return headers
 
 
-def validate_credential(service: str, key: str) -> tuple[bool, str]:
-    """Per-service validation. Returns (success, message).
-
-    - LLM providers (openrouter/anthropic/…): liveness ping via the configured
-      backend (llm_client.validate_provider) — provider-agnostic, no vendor hardcoded
-      and no direct Anthropic SDK. Routes through settings.yaml like every other call.
-    - github: GET /user (free for authenticated requests).
-    - semanticscholar: a real fetch of one known paper (free), because a bad S2 key does not
-      error — S2 ignores it and silently drops you back to the shared anonymous pool. A format
-      check would "pass" a dead key and the user would never learn why they still get 429s.
-    """
-    from pipeline.llm_providers import known_providers, validate_provider
-    if service in known_providers():
-        return validate_provider(service, key)
-    if service == "github":
-        return _validate_github(key)
-    if service == "semanticscholar":
-        return _validate_s2(key)
-    if service == "opyt_service":
-        return _validate_opyt_service_token(key)
-    return True, f"No validation available for {service}"
+def openalex_headers() -> dict[str, str]:
+    """Headers for any OpenAlex request — the one place the OpenAlex key is attached. Without a
+    key, requests still work, on the keyless daily budget, which is counted per IP."""
+    key = get_credential("openalex")
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
-def _validate_opyt_service_token(key: str) -> tuple[bool, str]:
-    """Format check only — there is no endpoint to ask.
+def _user_key(env_var: str) -> str | None:
+    """A key the user owns: ~/.opyt/.env → env var → repo .env. Re-read from disk on every call
+    so a mid-session connect takes effect without a restart.
 
-    Unlike every other row here, this credential does not name a third party with a fixed URL:
-    the service that issued it is whichever host the owner publishes to, and its address is not
-    in this file. Reaching one would need a base URL this function is never given, so the honest
-    check is the shape and the honest message says so."""
-    if not key or len(key.strip()) < 20:
-        return False, "Token is too short to be a service token"
-    if any(c.isspace() for c in key):
-        return False, "Token contains whitespace"
-    return True, "Format looks valid (no endpoint to test against — the host is yours to name)"
-
-
-def _validate_github(key: str) -> tuple[bool, str]:
-    """GET /user — free for authenticated requests."""
-    try:
-        import requests
-        resp = requests.get(
-            "https://api.github.com/user",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            username = resp.json().get("login", "unknown")
-            return True, f"GitHub token valid (user: {username})"
-        else:
-            return False, f"GitHub API returned {resp.status_code}"
-    except Exception as e:
-        return False, f"GitHub validation failed: {e}"
-
-
-def _validate_s2(key: str) -> tuple[bool, str]:
-    """Fetch one known paper with the key attached. Free — S2 charges nothing.
-
-    A 429 is NOT reported as invalid: it means the key was not honored on THIS request, which an
-    unauthenticated burst also produces, so it cannot distinguish a bad key from a busy moment.
-    Saying "invalid" there would send the user to regenerate a perfectly good key.
-    """
-    try:
-        import requests
-        resp = requests.get(
-            "https://api.semanticscholar.org/graph/v1/paper/arXiv:1706.03762",
-            params={"fields": "title"},
-            headers={"User-Agent": S2_USER_AGENT, "x-api-key": key},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return True, "Semantic Scholar key accepted"
-        if resp.status_code in (401, 403):
-            return False, f"Semantic Scholar rejected the key ({resp.status_code})"
-        if resp.status_code == 429:
-            return True, ("rate-limited right now, so the key could not be confirmed — "
-                          "this does NOT mean it is invalid; try again in a minute")
-        return False, f"Semantic Scholar returned {resp.status_code}"
-    except Exception as e:
-        return False, f"Semantic Scholar validation failed: {e}"
-
-
-def get_credential(service: str) -> str | None:
-    """Read credential from env vars → ~/.opyt/.env → repo .env."""
-    if service not in SERVICES:
-        raise ValueError(f"Unknown service: {service}. Valid: {list(SERVICES.keys())}")
-
-    env_var = SERVICES[service]
-
-    # Check environment first
+    The home file comes before the environment because `opyt_core` copies it into the environment
+    at import: a process started before a connect holds the old value there, and reading the
+    environment first served that stale copy for the life of the process (the worker
+    kept a spent starter key for hours after the user's own key was stored)."""
+    home = _read_env_line(opyt_path(".env"), env_var)
+    if home:
+        return home
     val = os.getenv(env_var)
     if val:
         return val
+    return _read_env_line(Path(__file__).parent.parent / ".env", env_var)
 
-    # Check .env files
-    for candidate in [
-        opyt_path(".env"),
-        Path(__file__).parent.parent / ".env",
-    ]:
-        if candidate.exists():
-            for line in candidate.read_text().splitlines():
-                line = line.strip()
-                if line.startswith(f"{env_var}="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
 
+def _read_env_line(path: Path, env_var: str) -> str | None:
+    """`env_var`'s value in one .env file, or None when the file or the line is absent."""
+    if not path.exists():
+        return None
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith(f"{env_var}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'") or None
     return None
+
+
+def get_credential(service: str) -> str | None:
+    """Read credential from ~/.opyt/.env → env vars → repo .env (see `_user_key`)."""
+    if service not in SERVICES:
+        raise ValueError(f"Unknown service: {service}. Valid: {list(SERVICES.keys())}")
+    return _user_key(SERVICES[service])
+
+
+def model_access() -> bool:
+    """Does this install hold an OpenRouter key? Without one Opyt runs free: no
+    image reading, no model call of any kind. Re-read per call, so a key connected
+    mid-session counts on the next one."""
+    return get_credential("openrouter") is not None

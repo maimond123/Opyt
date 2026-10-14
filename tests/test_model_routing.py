@@ -1,7 +1,7 @@
 """Model routing — provider redundancy as an enforced invariant, in three layers.
 
-WHY (2026-08-01): `google/gemma-3-4b-it` was the OCR model, and OpenRouter serves it from exactly
-ONE upstream — DeepInfra. The moment DeepInfra hit the deny-list (`7eb36301`, a CHAT-path latency
+WHY: `google/gemma-3-4b-it` was the OCR model, and OpenRouter serves it from exactly
+ONE upstream — DeepInfra. The moment DeepInfra hit the deny-list (a chat-path latency
 fix applied globally) every OCR call returned `404 All providers have been ignored`. A 100%-failure
 stage, silent for weeks because the cascade degrades fail-safe, and expensive because 18 straight
 failures opened the SHARED `openrouter` breaker and stalled `content_quality` behind it.
@@ -58,7 +58,7 @@ def test_denied_providers_are_removed(monkeypatch, tmp_path):
 
 
 def test_single_provider_model_reads_as_dead_under_its_deny(monkeypatch, tmp_path):
-    """The exact 2026-08-01 shape: one provider, and it is the denied one."""
+    """The failing shape: one provider, and it is the denied one."""
     monkeypatch.setenv("OPYT_HOME", str(tmp_path))
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     _fake_endpoints(monkeypatch, ["DeepInfra"])
@@ -82,7 +82,7 @@ def test_unknown_is_not_the_same_as_dead(monkeypatch, tmp_path):
 
 
 def test_cache_key_includes_the_deny_list():
-    """A deny-list edit is precisely what invalidated the previously-true answer. A cache that
+    """A deny-list edit is precisely what invalidated the earlier answer. A cache that
     outlived the edit would re-assert the stale verdict at the moment it stopped being true."""
     a = mr._cache_key("m", ["DeepInfra"])
     b = mr._cache_key("m", ["DeepInfra", "Cloudflare"])
@@ -113,30 +113,15 @@ def test_preflight_unknown_does_not_block():
     assert rep["ok"] is True and [x[0] for x in rep["unknown"]] == ["a/b"]
 
 
-def test_preflight_dead_ocr_with_live_fallback_does_not_block():
-    """§1 and §2 must not fight: when the primary OCR model is dead but a declared fallback
-    survives, the cascade substitutes and reports — flipping `ok` would halt every rail on a
-    failure the fallback chain exists to absorb. The dead model still shows in `dead`."""
-    primary, fallback = mr.OCR_FALLBACKS[0], mr.OCR_FALLBACKS[1]
-    models = {primary: "OCR", fallback: "OCR fallback", "embed/x": "emb"}
-    orgs = {primary: [], fallback: ["amazon"], "embed/x": ["a", "b"]}
+def test_a_dead_chart_model_blocks_like_any_model():
+    """No fallback is declared (twelve orgs serve it), so a dead chart model is dead."""
+    models = {mr.CHART_MODEL: "chart read", "embed/x": "emb"}
+    orgs = {mr.CHART_MODEL: [], "embed/x": ["a", "b"]}
 
     import unittest.mock as m
     with m.patch.object(mr, "surviving_orgs", side_effect=lambda mm, d, **kw: orgs[mm]):
         rep = mr.preflight(models, deny=["DeepInfra"])
-    assert rep["ok"] is True
-    assert [x[0] for x in rep["dead"]] == [primary]     # reported, not hidden
-
-
-def test_preflight_whole_dead_ocr_chain_blocks():
-    """With every declared OCR candidate dead there is nothing excusable left — block."""
-    primary, fallback = mr.OCR_FALLBACKS[0], mr.OCR_FALLBACKS[1]
-    models = {primary: "OCR", fallback: "OCR fallback"}
-
-    import unittest.mock as m
-    with m.patch.object(mr, "surviving_orgs", side_effect=lambda mm, d, **kw: []):
-        rep = mr.preflight(models, deny=["DeepInfra"])
-    assert rep["ok"] is False
+    assert rep["ok"] is False and [x[0] for x in rep["dead"]] == [mr.CHART_MODEL]
 
 
 def test_fetch_false_answers_from_cache_alone(monkeypatch, tmp_path):
@@ -160,40 +145,38 @@ def test_registered_models_includes_settings_roles(monkeypatch):
     preflight looked healthy while checking a third of what it claimed to."""
     monkeypatch.setattr(mr, "settings", lambda: {
         "llm_backends": {"roles": {
-            "content_quality": {"provider": "openrouter", "model": "vendor/chat-model"},
+            "vision": {"provider": "openrouter", "model": "vendor/chat-model"},
             "legacy": {"provider": "anthropic", "model": "should-be-ignored"}}}})
     reg = mr.registered_models()
-    assert "vendor/chat-model" in reg and reg["vendor/chat-model"] == "role:content_quality"
+    assert "vendor/chat-model" in reg and reg["vendor/chat-model"] == "role:vision"
     assert "should-be-ignored" not in reg          # non-openrouter roles aren't OpenRouter-routed
-    assert mr.OCR_MODEL in reg and mr.EMBED_MODEL in reg
+    assert mr.CHART_MODEL in reg
 
 
-# ── layer 2: fallback resolution is REPORTED, never inferred ──────────────────
-
-def test_fallback_is_used_and_announced():
-    import unittest.mock as m
-    primary, fallback = mr.OCR_FALLBACKS[0], mr.OCR_FALLBACKS[1]
-    with m.patch.object(mr, "surviving_orgs",
-                        side_effect=lambda mm, d, **kw: [] if mm == primary else ["amazon"]):
-        model, reason = mr.resolve_ocr_model(deny=["DeepInfra"])
-    assert model == fallback
-    assert "FALLBACK" in reason and primary in reason   # the swap must be visible in the report
+def test_a_role_the_code_no_longer_registers_is_not_preflighted(monkeypatch):
+    """An install's settings.yaml predates a role's deletion (`content_quality`). Its
+    model must not keep being preflighted: only `model_routing.ROLES` counts."""
+    monkeypatch.setattr(mr, "settings", lambda: {
+        "llm_backends": {"roles": {
+            "content_quality": {"provider": "openrouter", "model": "openai/gpt-oss-120b"}}}})
+    assert "openai/gpt-oss-120b" not in mr.registered_models()
 
 
-def test_all_dead_returns_no_model_rather_than_guessing():
+# ── layer 2: the chart model check ────────────────────────────────────────────
+
+def test_chart_model_with_no_org_is_unroutable():
     import unittest.mock as m
     with m.patch.object(mr, "surviving_orgs", side_effect=lambda mm, d, **kw: []):
-        model, reason = mr.resolve_ocr_model(deny=["DeepInfra"])
-    assert model is None                       # refuse to guess an unvetted model
-    assert "no declared OCR model is routable" in reason
+        reason = mr.chart_model_unroutable(deny=["DeepInfra"])
+    assert reason and mr.CHART_MODEL in reason
 
 
-def test_unknown_availability_resolves_to_the_primary():
-    """Preflight must never be the reason a run cannot start."""
+def test_chart_model_served_or_unknown_is_routable():
+    """Preflight must never be the reason a run cannot start: unknown proceeds."""
     import unittest.mock as m
-    with m.patch.object(mr, "surviving_orgs", side_effect=lambda mm, d, **kw: None):
-        model, reason = mr.resolve_ocr_model(deny=[])
-    assert model == mr.OCR_FALLBACKS[0] and "unknown" in reason
+    for orgs in (["deepinfra"], None):
+        with m.patch.object(mr, "surviving_orgs", side_effect=lambda mm, d, **kw: orgs):
+            assert mr.chart_model_unroutable(deny=[]) is None
 
 
 # ── layer 3: a "no providers" 404 is TERMINAL ────────────────────────────────
@@ -259,10 +242,10 @@ def test_ocr_stage_disables_itself_instead_of_retrying(monkeypatch):
     """One doomed round-trip, not one per image. The old behavior paid a network call for every
     image in the run and logged an indistinguishable failure each time."""
     from pipeline import llm_client
-    from pipeline import ocr_cascade as oc
+    from pipeline import chart_read as oc
 
     oc._reset_stage_for_tests()          # clears the conftest pin → pin resolution explicitly
-    monkeypatch.setattr(mr, "resolve_ocr_model", lambda **kw: (mr.OCR_MODEL, "pinned"))
+    monkeypatch.setattr(mr, "chart_model_unroutable", lambda **kw: None)
     calls = {"n": 0}
 
     def _unroutable(**kw):
@@ -280,10 +263,10 @@ def test_ocr_stage_disables_itself_instead_of_retrying(monkeypatch):
 
 def test_ordinary_ocr_failure_does_not_disable_the_stage(monkeypatch):
     """A transient per-image failure must stay per-image — one bad image can't kill the run."""
-    from pipeline import ocr_cascade as oc
+    from pipeline import chart_read as oc
 
     oc._reset_stage_for_tests()          # clears the conftest pin → pin resolution explicitly
-    monkeypatch.setattr(mr, "resolve_ocr_model", lambda **kw: (mr.OCR_MODEL, "pinned"))
+    monkeypatch.setattr(mr, "chart_model_unroutable", lambda **kw: None)
     calls = {"n": 0}
 
     def _flaky(**kw):

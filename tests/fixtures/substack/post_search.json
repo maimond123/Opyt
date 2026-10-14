@@ -1,0 +1,61 @@
+{
+  "focused": null,
+  "focusedExplanations": [],
+  "results": [
+    {
+      "id": 219807469,
+      "title": "CADD & AI in Drug Discovery",
+      "subtitle": "Weekly digest · October 9, 2026",
+      "description": "Weekly digest · October 9, 2026",
+      "search_engine_description": null,
+      "post_date": "2026-10-11T01:35:27.809Z",
+      "canonical_url": "https://reforgex.substack.com/p/cadd-and-ai-in-drug-discovery-e38",
+      "slug": "cadd-and-ai-in-drug-discovery-e38",
+      "audience": "everyone",
+      "type": "newsletter",
+      "publication_id": 9970191,
+      "wordcount": 1042,
+      "body_html": null,
+      "truncated_body_text": "Editor’s Note",
+      "publishedBylines": [{"id": 528137259, "name": "Fixture Author", "handle": "fixtureauthor"}]
+    },
+    {
+      "id": 219900001,
+      "title": "Rentosertib's aging-clock readout",
+      "subtitle": "What the phase 2a data say",
+      "description": "What the phase 2a data say",
+      "post_date": "2026-10-12T09:00:00.000Z",
+      "canonical_url": "https://www.forever.ai/p/rentosertib-aging-clock",
+      "slug": "rentosertib-aging-clock",
+      "audience": "only_paid",
+      "type": "newsletter",
+      "publication_id": 2610097,
+      "wordcount": 2300,
+      "body_html": null,
+      "truncated_body_text": "",
+      "publishedBylines": []
+    },
+    {
+      "id": 219000002,
+      "title": "A post with no address",
+      "subtitle": "",
+      "description": "",
+      "post_date": "2026-10-10T09:00:00.000Z",
+      "canonical_url": null,
+      "slug": "no-address",
+      "audience": "everyone",
+      "publication_id": 9970191
+    }
+  ],
+  "resultsWithTrackingParams": [],
+  "more": true,
+  "publications": [
+    {"id": 9970191, "name": "Weekly Drug Discovery & CADD Digest", "subdomain": "reforgex",
+     "custom_domain": null, "base_url": "https://reforgex.substack.com"},
+    {"id": 2610097, "name": "Forever", "subdomain": "forever",
+     "custom_domain": "www.forever.ai", "base_url": "https://www.forever.ai"}
+  ],
+  "explanations": [],
+  "highlights": {},
+  "feedSessionId": "fixture"
+}

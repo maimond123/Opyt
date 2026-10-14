@@ -1,36 +1,23 @@
 """
 pipeline/kb/ingest_common.py — the shared atom write-path every source ingester funnels through.
 
-One place owns snapshot -> chunks -> embed -> store, so a source ingester only differs in how it
-renders to markdown and derives fields, never in how an atom lands in the DB.
-
-Two entry points onto the same store:
-  - `store_atom` — synchronous submit+flush of ONE atom, durable on return.
-  - `AtomSink` — batches the embed across MANY atoms (used by ingest_x): pools chunks from many
-    atoms into fewer, fuller embed HTTP calls; same per-atom commit either way.
-
-Fail-safe: embedding is all-or-nothing — a failed batch raises rather than returning a
-partial vector list. `store_atom` propagates that so the caller skips the atom
-entirely. `AtomSink` re-embeds per atom on batch failure so only the bad atom skips. An atom is
-never written with missing vectors.
+One place owns how an atom lands in the DB (`store_atom`: the atom row and its body, in one
+transaction), so a source ingester only differs in how it renders to markdown and derives fields.
 """
 
 from __future__ import annotations
 
+from contextvars import copy_context
+
+import hashlib
 import os
 import re
 import threading
 import time
 from contextlib import contextmanager
+from typing import Callable
 
-import numpy as np
-
-from . import schema
-from .chunk import split_text, strip_frontmatter
-from . import embed as _embed           # module, not the name: the width is read at CALL time, so
-from .embed import EmbedError, assert_strip_version, ensure_kb_meta  # writer+guard never drift
-from .embed_surface import DEFAULT_PROFILE, strip_for_embedding
-from .raw_store import write_snapshot, snapshot_hash
+from . import owed_links, schema, writes
 
 # Image/media by file extension (end of path, before an optional query/fragment).
 _IMG_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico|tiff?)(?:[?#]|$)", re.I)
@@ -39,40 +26,28 @@ _IMG_CDN_RE = re.compile(r"substackcdn\.com|/image/fetch/|/image/upload/", re.I)
 
 
 def looks_like_image_url(url: str) -> bool:
-    """Is this URL plausibly an IMAGE asset? Extension match OR a known image-CDN/proxy shape.
-
-    Both tests are needed: a self-hosted blog writes `/assets/rnn/diags.jpeg` (extension, no CDN)
-    while Substack writes `substackcdn.com/image/fetch/…` (CDN, NO extension), so an
-    extension-only rule drops every Substack image and a CDN-only rule drops every self-hosted
-    one.
-
-    ONE definition, used with both polarities: `outbound_links` EXCLUDES these (an image asset is
-    not a reference the author made) and the VLM enricher INCLUDES only these — so markdown using
-    image syntax for something else (`![@handle](https://twitter.com/handle)`, a real pattern in
-    trafilatura output) is never sent to a vision model, where it would fail, stay uncached by the
-    poison-value rule, and be retried on every run forever."""
+    """Is this URL plausibly an image asset? Extension match or a known image-CDN/proxy shape
+    (Substack's CDN URLs carry no extension). Used both to exclude images from `outbound_links`
+    and to pick what the VLM enricher reads."""
     u = url or ""
     return bool(_IMG_EXT_RE.search(u) or _IMG_CDN_RE.search(u))
 
 
-# fetch-outcome classification (shared by the scrape-backed adapters): a fetch has THREE
-# outcomes but `str | None` only expresses two, so "host challenged us" was indistinguishable
-# from "genuinely no body". Splitting them lets blog/Substack classify the same way and lets a
-# future per-source concurrency gate react to a real block signal. See ingest_common.md.
+# Fetch-outcome classification (shared by the scrape-backed adapters): a fetch has three
+# outcomes, so "host challenged us" stays distinct from "genuinely no body".
 FETCH_OK = "ok"                      # real content — proceed
 FETCH_ABSENT = "absent"              # confirmed empty (podcast / link post / stub) — skip, count
-FETCH_UNDETERMINED = "undetermined"  # we could not tell (challenge / transport failure) — skip, ALARM
+FETCH_UNDETERMINED = "undetermined"  # we could not tell (challenge / transport failure) — skip, alarm
 
 MIN_BODY_CHARS = 200        # below this a "body" is a stub/interstitial, never a real post
-CHALLENGE_MAX_CHARS = 600   # a marker only means "challenge" on a SHORT body — a real essay that
-                            # merely MENTIONS captchas/JS is long, so gating avoids false skips
+CHALLENGE_MAX_CHARS = 600   # a marker only means "challenge" on a short body; a real essay that
+                            # mentions captchas/JS is long
 CHALLENGE_MARKERS = (
     "just a moment", "checking your browser", "enable javascript",
     "captcha", "attention required", "verify you are human",
 )
-# Cloudflare sets this response header when it issues a challenge. It is the one MACHINE-READABLE
-# signal in the whole path — the body test below is a heuristic that a reworded challenge page can
-# defeat, this is not. Absent on non-Cloudflare WAFs, so the body test stays as the fallback.
+# Cloudflare sets this response header when it issues a challenge: the one machine-readable
+# signal. Absent on non-Cloudflare WAFs, so the body heuristic stays as the fallback.
 CF_MITIGATED_HEADER = "cf-mitigated"
 
 
@@ -104,9 +79,6 @@ def classify_fetch(body: str | None, *, headers=None, title: str = "",
     text = (body or "").strip()
     if not text or len(text) < min_chars:
         # A too-short body can still be a challenge shell, so sniff before calling it absent.
-        # No length test here: this branch already means `len(text) < min_chars` (200), which is
-        # inside `challenge_max_chars` (600) by construction. The conjunct that used to re-test it
-        # could never be false, and a reader had to compare two constants to learn that.
         if text:
             hay = f"{title} {text}".lower()
             if any(m in hay for m in CHALLENGE_MARKERS):
@@ -119,19 +91,17 @@ def classify_fetch(body: str | None, *, headers=None, title: str = "",
     return FETCH_OK
 
 
-# the ATOM-level completeness contract: `classify_fetch` answers "did the fetch succeed?"; this
-# answers "is the body on disk the WHOLE thing?" — a truncated body looks identical to a short
-# one, so it must be stored as data, not inferred. Two separate keys (state + basis), not one
-# enum, mirroring `when_ts`/`when_precision`. See ingest_common.md.
+# Atom-level completeness: is the stored body the whole thing? A truncated body looks identical
+# to a short one, so it is stored as data (state + basis), not inferred.
 BODY_COMPLETE = "complete"   # the stored body is the whole thing
 BODY_PARTIAL = "partial"     # real content, knowingly short of the whole — preview, abstract, teaser
-BODY_ABSENT = "absent"       # stored WITHOUT a body — podcast, link post, README-less repo
-BODY_PENDING = "pending"     # stored without a body because we were STOPPED — retryable
+BODY_ABSENT = "absent"       # stored without a body — podcast, link post, README-less repo
+BODY_PENDING = "pending"     # stored without a body because we were stopped — retryable
 
-# How the state above is KNOWN. `assumed` is the weakest claim: no evidence either way, distinct
+# How the state above is known. `assumed` is the weakest claim: no evidence either way, distinct
 # from a source-stated or an observed fact.
-BASIS_STATED = "stated"      # the SOURCE declared it (audience, has_fulltext, post type)
-BASIS_OBSERVED = "observed"  # WE determined it from what came back (fetch failed, README missing)
+BASIS_STATED = "stated"      # the source declared it (audience, has_fulltext, post type)
+BASIS_OBSERVED = "observed"  # we determined it from what came back (fetch failed, README missing)
 BASIS_ASSUMED = "assumed"    # no evidence either way — a default, and the weakest claim here
 
 _BODY_STATES = frozenset({BODY_COMPLETE, BODY_PARTIAL, BODY_ABSENT, BODY_PENDING})
@@ -151,42 +121,18 @@ def body_fields(state: str, basis: str) -> dict:
     return {"body_state": state, "body_basis": basis}
 
 
-# the RUN-level counterpart of classify_fetch: same question ("did we succeed or get blocked?")
-# one level up, for a WHOLE adapter run, since footprint callers consumed a summary as
-# unconditional success. See ingest_common.md.
-RUN_INGESTED = "ingested"
-RUN_BLOCKED = "blocked"
-RUN_ERROR = "error"
-
 # Counters worth surfacing to a caller. `dispatched` vs `added` is the honest read on `limit`
 # (caps posts dispatched, not atoms added); `producer_failed` is the only place a post that
 # vanished mid-run is counted. `fetched`/`stale`/`covered`/`capped` are adapter-specific (X's
 # request unit; GitHub's three reasons a repo was never fetched) — the list is the union worth
-# surfacing, not every adapter's intersection.
-#
-# `capped` in particular has to reach the caller: it is the work a bounded run still OWES, and a
-# report that cannot show it cannot distinguish a finished archive from a resumable one.
+# surfacing. `capped` is the work a bounded run still owes.
 RUN_STAT_KEYS = ("added", "dispatched", "producer_failed", "undetermined",
-                 "gate_rejected", "skipped", "failed", "paywalled",
+                 "skipped", "failed", "paywalled",
                  "fetched", "stale", "covered", "capped")
 
 # Diagnostics (dict-valued), kept separate from the int counters above: RUN_STAT_KEYS is what a
 # user is told, this is what an engineer reads (wall-clock breakdown, serving upstream).
 RUN_DIAG_KEYS = ("stage_seconds", "stage_latency", "llm_call_latency", "llm_upstreams")
-
-
-def classify_run(summary) -> str:
-    """An adapter run summary → RUN_INGESTED / RUN_BLOCKED / RUN_ERROR.
-
-    Adapters signal a hard stop by returning a summary carrying `error` rather than raising, so a
-    caller must check both. BLOCKED means the host stopped us mid-run (transient, retry); ERROR
-    means a caller/input fault (needs a human). `undetermined` alone is not a block — only `error`
-    demotes a run, since some adapters increment it per-post on an otherwise healthy run."""
-    if not isinstance(summary, dict):
-        return RUN_INGESTED                      # fail-safe: an unreadable summary is not evidence
-    if not summary.get("error"):
-        return RUN_INGESTED
-    return RUN_BLOCKED if summary.get("undetermined") else RUN_ERROR
 
 
 def run_stats(summary) -> dict:
@@ -202,7 +148,7 @@ def run_stats(summary) -> dict:
 
 
 def _percentile(sorted_xs: list[float], p: float) -> float:
-    """The p-th percentile (0–100) of an ALREADY-SORTED list, nearest-rank. Empty → 0.0."""
+    """The p-th percentile (0–100) of an already-sorted list, nearest-rank. Empty → 0.0."""
     if not sorted_xs:
         return 0.0
     k = int(round((p / 100.0) * (len(sorted_xs) - 1)))
@@ -219,8 +165,7 @@ class StageTimer:
     def __init__(self):
         self.totals: dict[str, float] = {}
         self.samples: dict[str, list[float]] = {}
-        # Many producer threads can time into the SAME timer concurrently, so totals/samples
-        # updates must be serialized or a lost `+=` silently undercounts a stage. Held for µs.
+        # Many producer threads time into the same timer; a lost `+=` would undercount a stage.
         self._lock = threading.Lock()
 
     @contextmanager
@@ -235,7 +180,7 @@ class StageTimer:
                 self.samples.setdefault(name, []).append(dt)
 
     def distribution(self) -> dict[str, dict]:
-        """Per-stage {count, mean, p50, p95, max} in seconds — the Phase-2 worker-sizing input."""
+        """Per-stage {count, mean, p50, p95, max} in seconds."""
         out: dict[str, dict] = {}
         for name, xs in self.samples.items():
             if not xs:
@@ -251,370 +196,65 @@ class StageTimer:
         return out
 
 
-# the atom write-path: chunk (local) is separated from embed (batchable). Splitting
-# chunk-at-submit from embed-at-flush is what lets `AtomSink` pool the embed call across atoms.
-# See ingest_common.md for the measured HTTP-call reduction.
+def store_atom(conn, atom: dict, text: str, *,
+               on_written: Callable[[], None] | None = None) -> None:
+    """Write one atom and its body `text` (the snapshot) in one transaction; inside a caller's
+    `write_tx` it joins that transaction. `on_written` fires once the atom is durable.
+
+    The atom row carries the new `raw_hash` that every adapter's hash check reads as done, so it
+    never lands without its body. Every KB atom passes here, so this is where a blog, Substack or
+    GitHub post first records the paper links it owes (`owed_links.long_form_links`)."""
+    if owed := owed_links.long_form_links(atom, text):
+        atom["payload"]["links_owed"] = owed
+    with writes.write_tx(conn, site="atom"):
+        schema.upsert_atom(conn, atom)
+        schema.put_body(conn, atom["atom_id"], text)
+    if on_written:
+        writes.after_commit(conn, on_written)
 
 
-def _chunk_snapshot(text: str, source_type: str | None = None) -> list[dict]:
-    """Snapshot text → chunk dicts with vectors LEFT `None` (embedding happens later, at flush).
-
-    Chunks the body only — frontmatter is provenance, not content. Spans stay snapshot-absolute
-    by adding the stripped prefix length back. Each chunk also carries `embed_text`: the same
-    window with OPYT's own renderer output stripped (`embed_surface`) — that's what gets
-    embedded, while `text` is what gets stored/rendered/span-indexed. `source_type` keys the
-    stripping rules (X alt text is a template slot, blog alt text is a caption); `None` gets the
-    conservative path.
-
-    Stripping PER CHUNK rather than re-deriving from raw is what keeps this free of a re-chunk:
-    `char_start`/`char_end` never move, so every stored `chunk_span` stays valid. Embedding the
-    frontmatter instead would dilute the routing vector and pollute FTS snippets with
-    `source:`/`author:` boilerplate."""
-    body, offset = strip_frontmatter(text)
-    return [
-        {"seq": s, "text": t,
-         "embed_text": strip_for_embedding(t, source_type, DEFAULT_PROFILE),
-         "char_start": a + offset, "char_end": b + offset, "vector": None}
-        for (s, t, a, b) in split_text(body)
-    ]
-
-
-def _attach(chunks: list[dict], vecs) -> list[dict]:
-    """Fill a chunk list's `None` vectors from an aligned vector slice (L2-normalized, narrowed to
-    `CHUNK_STORAGE_DTYPE` → bytes). Caller guarantees `len(vecs) == len(chunks)`.
-
-    The single writer of `chunks.vector` — every reader takes the width from `kb_meta`, so a
-    second writer at a different width would make those disagree. The narrowing happens AFTER
-    `_l2` normalized in float32, so it costs precision only in the stored blob — measured as zero
-    ranking change (see `CHUNK_STORAGE_DTYPE`)."""
-    dt = np.dtype(_embed.CHUNK_STORAGE_DTYPE)
-    return [
-        {**c, "vector": np.asarray(v, dtype=dt).tobytes()}
-        for c, v in zip(chunks, vecs)
-    ]
-
-
-def _write_atom(conn, embedder, atom: dict, chunks: list[dict]) -> None:
-    """Durably write ONE atom + its already-embedded chunks before advancing the batch."""
-    ensure_kb_meta(conn, embedder.model, int(embedder.dim), embedder.provider,
-                   getattr(embedder, "query_instruction", "") or "")
-    schema.upsert_atom(conn, atom)
-    schema.replace_chunks(conn, atom["atom_id"], chunks)
-    conn.commit()
-
-
-class AtomSink:
-    """Batches atoms across an ingest loop so embedding pools MANY atoms' chunks per HTTP call
-    instead of one call per atom. `submit()` chunks locally and buffers; crossing `flush_chunks`
-    triggers `flush()` — embed every buffered chunk, then write each atom with its own vector
-    slice. `close()` flushes the remainder.
-
-    Two invariants. Positional alignment between the flat embed response and each atom's chunk
-    span is guaranteed in `embed.py`, not here: `HostedEmbedder.embed` sorts by index and raises
-    `EmbedError` per batch when `len(out) != len(texts)` (`embed.py:329-331`), and
-    `PrecomputedEmbedder.embed` is exact by construction, so no shipping embedder can return a
-    short response. THIS class's `hi - lo == len(chunks)` assert compares the sink's own span
-    bookkeeping to itself and cannot see `len(vecs)`; until 2026-09-06 the docstring credited the
-    whole guarantee to that assert, which fires on neither flush path. Second invariant: a
-    poisoned batch re-embeds per atom so only the bad atom skips — `embed()` is all-or-nothing, so
-    one bad chunk fails a whole batch, and the per-atom retry costs at most two passes.
-
-    Why the alignment risk is worth two invariants at all: the embed API returns a FLAT list keyed
-    only by `index`, and nothing in it tags a vector with its atom. Get the unflatten wrong and
-    the store holds a right-looking vector against the wrong text, with no error anywhere.
-
-    Durability: a written atom commits per-atom, and a crash mid-buffer loses at most one buffer
-    of PRODUCER work (scrape/render). Those atoms are not marked `seen`, so they are simply redone
-    next run — the scrape is free and the paid VLM descriptions were already flushed.
-
-    `flush_chunks` defaults to 4x `batch_size` so the per-flush tail call is amortized rather than
-    paid on every flush (see `__init__`)."""
-
-    def __init__(self, conn, embedder, *, flush_chunks: int | None = None,
-                 timer: "StageTimer | None" = None, writer=None):
-        self.conn = conn
-        self.embedder = embedder
-        # Early strip guard, checked here (the seam every batched ingest passes through)
-        # rather than per-ingester, and FIRST as a precondition so a failed construction leaves
-        # nothing half-built.
-        assert_strip_version(conn)
-        # Target store as a FUNCTION rather than a table name, so the probe-store trust boundary
-        # (untrusted content must never reach the main store) can't be broken by a wrong string
-        # argument.
-        self._write = writer or _write_atom
-        # Buffer to 4×batch_size, not batch_size, so each flush's tail HTTP call is amortized
-        # rather than repeated every flush. batch_size stays a separate retry/latency knob.
-        bs = int(getattr(embedder, "batch_size", 64) or 64)
-        self._flush_chunks = int(flush_chunks) if flush_chunks else 4 * bs
-        self._timer = timer or StageTimer()          # never-null: unused totals just go unread
-        self._buf: list[tuple] = []                  # (atom, chunk_dicts, on_written)
-        self._pending = 0
-
-    def submit(self, atom: dict, snapshot_text: str, *, on_written=None) -> None:
-        """Chunk `snapshot_text` locally and buffer the atom. Auto-flushes once the buffered chunk
-        count reaches the threshold, bounding buffer RAM. `on_written` fires after this atom is
-        durably written. `atom["source_type"]` keys the embed-surface strip."""
-        chunks = _chunk_snapshot(snapshot_text, atom.get("source_type"))
-        self._buf.append((atom, chunks, on_written))
-        self._pending += len(chunks)
-        if self._pending >= self._flush_chunks:
-            self.flush()
-
-    def flush(self) -> None:
-        """Embed every buffered chunk in one call, then write each atom with its own vector slice."""
-        if not self._buf:
-            return
-        buf, self._buf, self._pending = self._buf, [], 0   # detach first: flush() is re-entrant-safe
-        flat: list[str] = []
-        spans = []
-        for atom, chunks, cb in buf:
-            lo = len(flat)
-            flat.extend(c["embed_text"] for c in chunks)   # the STRIPPED surface, not `text`
-            spans.append((atom, chunks, cb, lo, len(flat)))
-        try:
-            with self._timer.stage("embed"):
-                vecs = self.embedder.embed(flat, role="document")   # ONE call (auto-splits >64)
-        except EmbedError:
-            self._flush_isolated(spans)      # batch poisoned → re-embed per atom so good atoms write
-            return
-        with self._timer.stage("write"):
-            for atom, chunks, cb, lo, hi in spans:
-                assert hi - lo == len(chunks), (       # positional-alignment guard (loud, never silent)
-                    f"embed span {hi - lo} != {len(chunks)} chunks for {atom['atom_id']}")
-                self._write(self.conn, self.embedder, atom, _attach(chunks, vecs[lo:hi]))
-                if cb:
-                    cb()                                # bookkeep: seen/added/threads — durable-only
-
-    def _flush_isolated(self, spans) -> None:
-        """One flush's batch embed failed. Re-embed each atom ALONE so a single poison chunk skips
-        only its own atom (no write, no `on_written` → not marked seen → retried next run), while
-        every good atom still writes. Preserves the Fail-safe invariant (a failure skips its unit)."""
-        for atom, chunks, cb, _lo, _hi in spans:
-            try:
-                with self._timer.stage("embed"):
-                    vecs = self.embedder.embed([c["embed_text"] for c in chunks], role="document")
-                with self._timer.stage("write"):
-                    self._write(self.conn, self.embedder, atom, _attach(chunks, vecs))
-                if cb:
-                    cb()
-            except EmbedError as e:
-                try:
-                    from pipeline.ingestion.utils import log
-                    log(f"[kb] embed failed for {atom['atom_id']} — skipped (no write): {e}")
-                except Exception:
-                    pass
-
-    def close(self) -> None:
-        """Flush whatever remains. Call once at end of run (or use the sink as the store_atom body)."""
-        self.flush()
-
-    def discard(self) -> None:
-        """Forget buffered work when the caller no longer owns the write lease."""
-        self._buf.clear()
-        self._pending = 0
-
-
-# The one machine lane an atom can be promoted OUT of. Named explicitly rather than derived as
-# "anything not human-attested", because the deny-list direction would promote whatever mode gets
-# added next, silently — the same allow-list discipline `schema.HUMAN_ATTESTED` states for the
-# other direction.
+# The one machine lane an atom can be promoted out of. Named explicitly (an allow-list), so a mode
+# added later is never promoted by default.
 _PROMOTABLE_FROM = "frontier"
 
 
 def promote_atom(conn, atom_id: str, entry_mode: str) -> None:
     """Flip a machine-found atom to the human-attested mode of the ingest that just touched it.
 
-    RULED 2026-08-25 (docs/plans/2026-08-24-era-reads-claims-carry.md): any human-initiated
-    ingest — a bookmark sweep, a hopper deposit — that presence-hits a frontier atom promotes it.
-    Attestation is evidence a human cares, and depositing the URL IS that evidence.
-
-    ONE-WAY, enforced in the WHERE clause rather than by callers remembering: the update only ever
-    fires on a `frontier` row, so no frontier refresh can demote a human-attested atom (the
-    repo-refresh overwrite hazard `frontier_admit` already guards, arriving from the other side).
-
-    `entry_mode` is the CALLER's mode, never a hardcoded 'user-saved' — the column records how the
-    atom was FOUND, so a footprint crawl colliding with a frontier atom promotes to
-    `oracle-footprint`, and a hand deposit to `user-saved`. A NON-human mode is a no-op rather
-    than an error, and that is what lets every presence-hit site call this unconditionally: the
-    same mint helper serves both lanes (`atomize_paper` runs under `entry_mode='frontier'` for
-    Frontier stage 3 and under 'user-saved' for a hopper deposit), so "was this ingest
-    human-initiated" is already carried by the argument. Deciding it here rather than re-writing
-    the same guard at every call site keeps one definition of the question.
-
-    `promoted_at` is stamped in the same statement because promotion is what opens the wallet —
-    the re-read trigger keys on `COALESCE(promoted_at, first_seen)`, and a frontier atom's
-    `first_seen` is the crawl date, not the engagement.
-
-    Promotion is a side effect, never a feature: no caller may report it, which is why this
-    returns nothing. A presence-hit promotion answers exactly like a fresh save, because explaining
-    the flip means teaching the lane taxonomy, and lanes live below the interface boundary.
+    One-way: the WHERE clause only matches a `frontier` row. `entry_mode` is the caller's mode; a
+    non-human mode is a no-op, so every presence-hit site can call this unconditionally.
+    `promoted_at` is stamped because `latest` and search's `since` key on `COALESCE(promoted_at,
+    first_seen)`. Returns nothing: promotion is never reported to a user.
     """
     if entry_mode not in schema.HUMAN_ATTESTED:
         return                           # a machine-lane ingest attests nothing
-    conn.execute(
-        "UPDATE atoms SET entry_mode = ?, promoted_at = datetime('now') "
-        " WHERE atom_id = ? AND entry_mode = ?", (entry_mode, atom_id, _PROMOTABLE_FROM))
-    conn.commit()
-
-
-def store_atom(conn, embedder, *, atom: dict, snapshot_text: str) -> None:
-    """Write one atom + its chunks, embedding first (the step that can fail/cost).
-
-    Now a thin strangler-fig wrapper over a one-shot `AtomSink` (submit + immediate flush), so the
-    old synchronous-durable contract — "the atom is written when this returns" — holds unchanged for
-    every non-X call site. Only `ingest_x` drives the sink explicitly to capture the batching win."""
-    sink = AtomSink(conn, embedder)
-    sink.submit(atom, snapshot_text)
-    sink.close()
-
-
-def submit_atom(conn, embedder, sink: "AtomSink | None", *, atom: dict, snapshot_text: str,
-                on_written=None) -> None:
-    """Write one atom through a caller-owned `sink` when there is one, else synchronously.
-
-    Lets a single-atom mint helper (`atomize_paper`, `github_atom_from_url`) join a caller's
-    batch instead of forcing its own embed round-trip. `on_written(atom_id)` fires when the atom
-    is durable; a callback, not a return value, since a submitted-but-unflushed atom is in RAM
-    only and callers must be told when it lands rather than probing for it. It takes the atom_id,
-    unlike `AtomSink.submit`'s zero-arg callback, because the mint helper owns the canonical id
-    and its caller generally does not — a github URL's casing is only resolved against the API's
-    own `owner.login` inside the helper.
-
-    Without this seam those helpers call `store_atom`, which is a one-atom `AtomSink`: every
-    guarantee of the sink and none of the batching, because a batch of one batches nothing.
-    Measured 2026-08-02, X-footprint link dispatch paid 17 separate embed round-trips for 17
-    artifacts."""
-    if sink is not None:
-        sink.submit(atom, snapshot_text,
-                    on_written=(lambda: on_written(atom["atom_id"])) if on_written else None)
-        return
-    store_atom(conn, embedder, atom=atom, snapshot_text=snapshot_text)
-    if on_written:
-        on_written(atom["atom_id"])
-
-
-def llm_run_marker() -> dict:
-    """Take at run start; hand to `llm_run_stats` at summary time so the summary covers THIS run,
-    not the process lifetime (the underlying latency stats are append-only module globals).
-    Fail-safe: `{}` means "no offsets", read by `llm_run_stats` as the lifetime view."""
-    try:
-        from pipeline.llm_client import latency_marker
-        return latency_marker()
-    except Exception:
-        return {}
-
-
-def llm_run_stats(since: dict | None = None) -> dict:
-    """LLM diagnostics for a run summary: per-call latency by role, and by serving upstream.
-    Spread as `**` into the summary dict so every adapter reports the same keys. The upstream
-    view makes `provider.sort`'s live re-ranking auditable — a slow upstream otherwise has no
-    symptom. `since` is this run's `llm_run_marker()`; omit it for the process lifetime. Fail-safe:
-    a diagnostic must never break a run summary."""
-    try:
-        from pipeline.llm_client import latency_distribution, upstream_distribution
-        return {"llm_call_latency": latency_distribution(since),
-                "llm_upstreams": upstream_distribution(since)}
-    except Exception:
-        return {"llm_call_latency": {}, "llm_upstreams": {}}
+    with writes.write_tx(conn, site="atom.promote"):
+        conn.execute(
+            "UPDATE atoms SET entry_mode = ?, promoted_at = datetime('now') "
+            " WHERE atom_id = ? AND entry_mode = ?", (entry_mode, atom_id, _PROMOTABLE_FROM))
 
 
 # ── Long-form producer-pool policy (blog + Substack) ───────────────────────────────
-# Shared so the two loops cannot drift apart. Deliberately far smaller than
-# `OPYT_INGEST_WORKERS` (20, for X): provider fan-out is already capped downstream by the
-# content-gate and VLM semaphores, so this only bounds how many POSTS are in flight — and its cost
-# is RAM, since a rendered blog post is far larger than a tweet.
-#
-# This paragraph sat 37 lines below, above `llm_run_marker`, from 2026-08-01 to 2026-09-06.
-# `8ae4b053` inserted a function between it and the constants it explains, `fc1070f1` widened the
-# gap to 29 lines, and `6a13408d` stripped the rule that made it read as a section header — so it
-# arrived at a reader as commentary on a latency helper it has nothing to do with.
+# Far smaller than `OPYT_INGEST_WORKERS` (X): provider fan-out is capped downstream by the
+# content-gate and VLM semaphores, so this bounds how many posts are in flight, and its cost is RAM.
 POST_WORKERS = int(os.environ.get("OPYT_POST_WORKERS", "4"))
-# Submission window. `run_concurrent` defaults to 4x workers; halved here because each outstanding
-# result holds a fully rendered post (snapshot + enriched markdown) rather than a tweet.
-POST_INFLIGHT = POST_WORKERS * 2
-
-# `seen` maps atom_id -> raw_hash, but the hash doesn't exist until after the network work, and the
-# producer must CLAIM an atom_id before yielding it or two threads pay for the same post. This
-# placeholder holds that claim until the consumer upgrades it to the real hash; `seen` therefore
-# holds non-hash values mid-run and must not be read as a hash ledger before the run completes.
-PENDING_CLAIM = "\x00pending"
-
-
-def make_consumer(sink: "AtomSink", seen: dict, counters: dict, on_mark) -> callable:
-    """The shared `consume_fn` blog and Substack both hand `run_concurrent`. Upgrades a
-    `PENDING_CLAIM` in `seen` to the real hash and writes via `sink`; adapter-specific counters
-    stay local to each caller. `counters` is a dict (not `nonlocal` ints) since the returned
-    closure is defined outside the caller's lexical scope. Needs int values at `"submitted"`,
-    `"skipped"`, `"gate_rejected"`.
-
-    A `"consumed"` counter rode along until 2026-09-06, existing only so two callers could compute
-    `producer_failed = dispatched - consumed`. `run_concurrent` counts a raised producer directly
-    now, so both copies went and so did the counter feeding them."""
-    def _consume(res: dict) -> None:
-        """Tally + write, SERIALLY on the calling thread — so the sink stays a single writer and
-        every counter is owned by one thread."""
-        outcome = res["outcome"]
-        if outcome == "gate_rejected":
-            counters["gate_rejected"] += 1
-            return
-        if outcome == "unchanged":
-            counters["skipped"] += 1
-            return
-        seen[res["atom_id"]] = res["raw_hash"]   # upgrade the generator's claim to the real hash
-        counters["submitted"] += 1
-        sink.submit(res["atom"], res["md_kept"], on_written=on_mark)
-    return _consume
 
 
 def run_concurrent(items, work_fn, consume_fn, *, workers: int,
                    inflight: int | None = None) -> dict:
     """Fan `items` across `workers` producer threads and feed each non-None result to `consume_fn`.
 
-    RETURNS what went wrong: `{"producer_failed": int, "consumer_failed": int,
-    "source_error": Exception | None}`. Results themselves do NOT come back this way — this is a
-    procedure and they leave through the caller's own closures, which is why `ingest_x.py` calls
-    it with no assignment. What could not leave that way was a FAILURE: the three handlers below
-    wrote to the log and to nothing else, so `_next()` catching a dead X session logged one stderr
-    line and returned the same sentinel a finished source returns. The loop then drained normally
-    and the caller honestly reported counters that happened to be zero — byte-identical to "you
-    have not bookmarked anything lately". A rail that believes it succeeded does not retry.
+    Results leave through the caller's closures; the return value reports what went wrong:
+    `{"producer_failed": int, "consumer_failed": int, "source_error": Exception | None}`.
+    `source_error` is returned unclassified, since only the source knows whether it means blocked
+    or error; already-produced work still lands. `producer_failed` counts `work_fn` raises.
 
-    `source_error` is the EXCEPTION, returned rather than raised, and the caller classifies it.
-    Returned, because `a98cadae` established that already-produced work still lands on a source
-    error and this changes reporting, not when the run stops. Unclassified, because the taxonomy
-    belongs to the source: only `ingest_x` knows that `XRateLimited` is a host meter to come back
-    to (`blocked`) while `SyncAuthError` needs a person (`error`), and `d7dbcfcf` rejected
-    collapsing those two — "collapsing them trains the reader to ignore errors".
+    `work_fn(item)` runs on pool threads. `consume_fn(result)` and advancing the source both run
+    on the calling thread (contract: a rate-limited generator stays serialized), so the consumer
+    is the single owner of the connection. A bounded window (`inflight`, default
+    4×workers) caps peak RAM; results are consumed in submission order.
 
-    `producer_failed` counts items whose `work_fn` RAISED. `ingest_blog` and `ingest_substack`
-    each hand-rolled this as `dispatched - consumed`, independently, both with a comment saying
-    that without it a raised producer's post "would vanish from every counter" — so counting it
-    here deletes two copies. It is also more accurate than the subtraction, which cannot tell a
-    raise from a `work_fn` that legitimately returned None; and neither hand-roll could see a
-    SOURCE failure at all, because an iterator that dies before yielding dispatches nothing and
-    the difference is 0. The bookmarks rail, whose iterator carries the broken promise, hand-rolled
-    nothing.
-
-    `work_fn(item)` is the network-bound per-item work and runs on a pool thread, many at
-    once. `consume_fn(result)` is the write path (embed + DB) and runs serially on the calling
-    thread, so it is the single owner of the connection and embed batch.
-
-    CONTRACT: the source is advanced on the calling thread too (priming loop and refill point),
-    guaranteed behavior, not an implementation detail — a caller can rely on a rate-limited
-    generator staying serialized even while `work_fn` fans out. Pinned by
-    `tests/kb/test_run_concurrent.py::test_source_is_advanced_only_on_the_calling_thread`.
-
-    A bounded submission window (`inflight`, default 4×workers) keeps peak RAM at O(window),
-    independent of `len(items)`. Results are consumed in submission order; a slow item delays
-    only the consumer, never the producers.
-
-    The consumer is the floor, and by a wide margin: measured **97.8% consumer — 61.4 s of a
-    62.8 s phase**, with the 20-thread producer pool doing 8.7 thread-seconds in that window
-    (~0.7% utilization). That ratio is a property of the CALLER's work split, not of this loop,
-    so a caller that cheapens `work_fn` walks itself into a serial floor and adding workers buys
-    nothing.
-
-    Fail-safe: a `work_fn` or `consume_fn` that raises is logged and skips that one item."""
+    A `work_fn` or `consume_fn` that raises is logged and skips that one item."""
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
 
@@ -623,9 +263,8 @@ def run_concurrent(items, work_fn, consume_fn, *, workers: int,
     inflight = inflight or max(workers * 4, workers + 1)
     report: dict = {"producer_failed": 0, "consumer_failed": 0, "source_error": None}
 
-    # A raise and a legitimate `None` are different outcomes, so they need different values. Both
-    # skip the consumer; only this one is counted, and counting it on the CALLING thread is why
-    # `_safe_work` returns a sentinel instead of incrementing from a pool thread.
+    # A raise, distinct from a legitimate `None`; returned as a sentinel so it is counted on the
+    # calling thread rather than from a pool thread.
     _FAILED = object()
 
     def _safe_work(item):
@@ -647,7 +286,7 @@ def run_concurrent(items, work_fn, consume_fn, *, workers: int,
             return _EXHAUSTED
         except Exception as e:
             log(f"[kb] source iterator error — stopping intake, draining the window: {e}")
-            report["source_error"] = e               # the ONLY thing separating this from a
+            report["source_error"] = e               # the only thing separating this from a
             return _EXHAUSTED                        # finished source; a raised generator is
                                                      # closed, so a later next() = StopIteration
 
@@ -657,12 +296,12 @@ def run_concurrent(items, work_fn, consume_fn, *, workers: int,
             item = _next()
             if item is _EXHAUSTED:
                 break
-            pending.append(ex.submit(_safe_work, item))
+            pending.append(ex.submit(copy_context().run, _safe_work, item))
         while pending:
             res = pending.popleft().result()         # in submission order (_safe_work never raises)
-            item = _next()                           # top up BEFORE consuming → pool stays full
+            item = _next()                           # top up before consuming → pool stays full
             if item is not _EXHAUSTED:
-                pending.append(ex.submit(_safe_work, item))
+                pending.append(ex.submit(copy_context().run, _safe_work, item))
             if res is _FAILED:
                 report["producer_failed"] += 1
                 continue
@@ -676,16 +315,13 @@ def run_concurrent(items, work_fn, consume_fn, *, workers: int,
     return report
 
 
-def snapshot_and_hash(source: str, atom_id: str, markdown: str,
-                      seen: dict[str, str]) -> tuple[str, str] | None:
-    """Compute the snapshot hash and decide whether to write.
+def snapshot_hash(markdown: str) -> str:
+    """sha256 of the snapshot text: an atom's `raw_hash`, its change detector."""
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
 
-    Returns `(raw_ref, raw_hash)` if this atom is NEW or CHANGED (caller should store),
-    or None if unchanged (caller SKIPS — no re-embed, no re-write). Only writes the
-    snapshot file when there's something to store, so an unchanged run touches no disk.
-    """
+
+def changed_hash(atom_id: str, markdown: str, seen: dict[str, str]) -> str | None:
+    """The snapshot's `raw_hash` when this atom is new or changed (the caller stores it), or None
+    when `seen` already holds that hash."""
     raw_hash = snapshot_hash(markdown)
-    if seen.get(atom_id) == raw_hash:
-        return None
-    raw_ref, _ = write_snapshot(source, atom_id, markdown)
-    return raw_ref, raw_hash
+    return None if seen.get(atom_id) == raw_hash else raw_hash

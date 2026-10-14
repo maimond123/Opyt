@@ -34,7 +34,7 @@ def test_empty_and_stub_bodies_are_absent():
 
 
 def test_challenge_shell_is_undetermined_not_absent():
-    """The case the old code got wrong: a Cloudflare shell is SHORT, so a length-only test
+    """A Cloudflare shell is SHORT, so a length-only test
     files it as 'empty page' when it actually means 'we were stopped'."""
     assert classify_fetch(_SHELL) == FETCH_UNDETERMINED
 
@@ -81,11 +81,10 @@ def test_unreadable_headers_are_not_evidence_of_a_block():
 # ── the blog seam now CARRIES headers, so the explicit marker is reachable there ──
 
 def test_blog_classify_uses_the_response_headers():
-    """`_fetch_article` used to discard `resp.headers`, so on the path most likely to meet a WAF
-    the only machine-readable challenge signal was unavailable and the body heuristic carried it
-    alone. A challenge page defeats the body test by being LONG — a real Substack block page
-    measured 5987 chars against the 600-char gate — so a long decoy body would have been STORED
-    AS AN ARTICLE. Fails if the headers stop being threaded through."""
+    """`_fetch_article` passes `resp.headers` on: on the path most likely to meet a WAF they are the
+    only machine-readable challenge signal, and the body heuristic alone is not enough. A challenge page defeats the body test by being LONG — a real Substack block page
+    measured 5987 chars against the 600-char gate — so a long decoy body would be stored
+    as an article. Fails if the headers stop being threaded through."""
     from pipeline.kb.ingest_blog import _classify_article
     long_decoy = "Checking your browser before accessing. " * 200      # ~8000 chars
     assert len(long_decoy) > CHALLENGE_MAX_CHARS * 10

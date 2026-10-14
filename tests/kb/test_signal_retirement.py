@@ -1,10 +1,9 @@
-"""Retiring an unfollowed candidate — the one place an ABSENCE changes what the user sees.
+"""Retiring an unfollowed candidate — the one place an absence changes what the user sees.
 
 Signals are monotonic by default: unfollow someone and the `follow` row stays forever, so the
-candidate list is a high-water mark of everyone ever curated. §7.4 left that deliberately. It was
-reopened 2026-08-13 after the list clock measured it: 52 of 470 follow signals on the live store
-were people no longer followed, and a list whose entire value is being pre-vetted was carrying 11%
-anti-selected names.
+candidate list would be a high-water mark of everyone ever curated. Measured on a live store, 52
+of 470 follow signals were people no longer followed, and a list whose entire value is being
+pre-vetted was carrying 11% anti-selected names.
 
 Every test here defends one of the three ways acting on an absence goes wrong: retiring on a
 truncated walk, retiring everyone the moment the column is added, and retiring silently.
@@ -15,8 +14,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from pipeline.kb import curation_state as cs
-from pipeline.kb import schema, screen
+from pipeline.curation import clock as cs
+from pipeline.kb import schema
+from pipeline.oracles import ranking
 
 FOLLOW_COLLECTOR = "x_following"
 
@@ -40,7 +40,7 @@ T0 = datetime(2026, 8, 13, 6, 0, 0, tzinfo=timezone.utc)
 def _walk(conn, seen_uids, *, at, found=None, prev_found=None):
     """Simulate one full following walk at instant `at`: confirm everyone seen, stamp the clock.
 
-    The confirmations are REWRITTEN to `at` after the fact. `set_signal` stamps through SQLite's
+    The confirmations are rewritten to `at` after the fact. `set_signal` stamps through SQLite's
     own clock, so two walks in a test land in the same second and become indistinguishable — real
     walks are hours apart. Backdating the stored stamp is how the test buys that elapsed time
     without adding a test-only argument to production code."""
@@ -72,51 +72,51 @@ def test_an_unfollowed_person_drops_out_of_the_candidate_list(conn):
     _walk(conn, ["1", "2", "3"], at=T0)                          # baseline walk
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6))          # 3 is gone
 
-    assert _names(screen.rank_candidates(conn)) == ["x:user:1", "x:user:2"]
+    assert _names(ranking.rank_candidates(conn)) == ["x:user:1", "x:user:2"]
 
 
 def test_the_signal_row_survives_the_retirement(conn):
-    """Exclusion is at RANKING time. Nothing is deleted — the evidence that you did follow them is
+    """Exclusion is at ranking time. Nothing is deleted — the evidence that you did follow them is
     real and stays, and their saved posts stay searchable in `atoms` regardless."""
     _person(conn, "3")
     _walk(conn, ["1", "2", "3"], at=T0)
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6))
 
-    assert screen.rank_candidates(conn) == [] or "x:user:3" not in _names(
-        screen.rank_candidates(conn))
+    assert ranking.rank_candidates(conn) == [] or "x:user:3" not in _names(
+        ranking.rank_candidates(conn))
     row = conn.execute("SELECT count, last_confirmed_at FROM curation_signals "
                        " WHERE entity_id='x:user:3' AND signal_type='follow'").fetchone()
     assert row is not None and row["count"] == 1 and row["last_confirmed_at"] is not None
 
 
 def test_a_bookmark_does_not_rescue_an_unfollowed_person(conn):
-    """DECIDED 2026-08-13, reversing an earlier per-signal design. `save` and `like` are append-only
-    IN PRACTICE — nobody un-bookmarks someone they lost interest in — so letting them veto the one
-    signal the user does maintain makes removal impossible by construction. On the live store 11 of
-    the 52 unfollowed accounts carried a bookmark, and keeping them was the wrong call."""
+    """`save` and `like` are append-only in practice — nobody un-bookmarks someone they lost
+    interest in — so letting them veto the one signal the user does maintain would make removal
+    impossible by construction. On a live store 11 of the 52 unfollowed accounts carried a
+    bookmark."""
     _person(conn, "3")
-    schema.add_signal(conn, "x:user:3", "save", "x", count=12)
+    schema.ensure_signal(conn, "x:user:3", "save", "x", count=12)
     schema.set_signal(conn, "x:user:3", "like", "x", count=4)
     _walk(conn, ["1", "2", "3"], at=T0)
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6))
 
-    assert "x:user:3" not in _names(screen.rank_candidates(conn))
+    assert "x:user:3" not in _names(ranking.rank_candidates(conn))
 
 
 def test_a_person_who_was_never_followed_is_untouched(conn):
     """No follow signal means no revocation act ever happened. The 603 bookmark-only candidates on
     the live store must not be swept up by a rule about following."""
     _person(conn, "9")
-    schema.add_signal(conn, "x:user:9", "save", "x")
+    schema.ensure_signal(conn, "x:user:9", "save", "x")
     _walk(conn, ["1", "2"], at=T0)
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6))
 
-    assert "x:user:9" in _names(screen.rank_candidates(conn))
+    assert "x:user:9" in _names(ranking.rank_candidates(conn))
 
 
 # ── the truncated-walk guard ────────────────────────────────────────────────────
 def test_a_collapsed_walk_retires_nobody(conn):
-    """THE dangerous failure. A session dying mid-page returns a short list that is
+    """The dangerous failure. A session dying mid-page returns a short list that is
     indistinguishable from a mass unfollow, and acting on it retires hundreds of live signals with
     no error anywhere. Absence is only evidence if the walk was complete."""
     for uid in "123456789":
@@ -124,18 +124,18 @@ def test_a_collapsed_walk_retires_nobody(conn):
     _walk(conn, list("123456789"), at=T0)
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6), prev_found=9)           # 9 → 2 is a collapse, not an unfollow spree
 
-    assert len(screen.rank_candidates(conn)) == 9   # everyone survives
+    assert len(ranking.rank_candidates(conn)) == 9   # everyone survives
 
 
 def test_a_gentle_decline_still_retires(conn):
     """The guard must not become a rubber stamp. A real unfollow session shrinks the list; only a
-    COLLAPSE is suspect."""
+    collapse is suspect."""
     for uid in "12345":
         _person(conn, uid)
     _walk(conn, list("12345"), at=T0)
     _walk(conn, ["1", "2", "3", "4"], at=T0 + timedelta(hours=6), prev_found=5)   # 5 → 4, well above the 0.5 ratio
 
-    assert "x:user:5" not in _names(screen.rank_candidates(conn))
+    assert "x:user:5" not in _names(ranking.rank_candidates(conn))
 
 
 def test_a_failed_run_retires_nobody(conn):
@@ -146,7 +146,7 @@ def test_a_failed_run_retires_nobody(conn):
     _walk(conn, list("123"), at=T0 + timedelta(hours=6))
     cs.record_run(conn, FOLLOW_COLLECTOR, status="error", detail="dead session")
 
-    assert len(screen.rank_candidates(conn)) == 3
+    assert len(ranking.rank_candidates(conn)) == 3
 
 
 def test_the_first_ever_walk_retires_nobody(conn):
@@ -158,7 +158,7 @@ def test_the_first_ever_walk_retires_nobody(conn):
     schema.set_signal(conn, "x:user:3", "follow", "x")
 
     assert cs.walk_is_trustworthy(cs.get_run(conn, FOLLOW_COLLECTOR)) is False
-    assert len(screen.rank_candidates(conn)) == 3
+    assert len(ranking.rank_candidates(conn)) == 3
 
 
 def test_no_clock_at_all_retires_nobody(conn):
@@ -166,16 +166,15 @@ def test_no_clock_at_all_retires_nobody(conn):
     for uid in "123":
         _person(conn, uid)
         schema.set_signal(conn, f"x:user:{uid}", "follow", "x")
-    assert len(screen.rank_candidates(conn)) == 3
+    assert len(ranking.rank_candidates(conn)) == 3
 
 
 def test_a_programming_error_is_not_reported_as_nobody_retired(conn, monkeypatch):
-    """⚠️ FIXED 2026-09-04. A bare `except Exception: return set()` wrapped the whole function,
-    including its imports and its field reads. Retirement permanently disabled by a rename or a
-    bad import therefore looked IDENTICAL to a healthy store with nobody to retire — the one
-    outcome this feature's own docstring says must never be silent. The four named fail-safe
-    paths (no clock, unreadable clock, untrustworthy walk, unparseable stamp) are handled
-    explicitly and keep working; everything else now surfaces."""
+    """A bare `except Exception: return set()` around the whole function would hide imports and
+    field reads: retirement permanently disabled by a rename or a bad import would look identical
+    to a healthy store with nobody to retire — the one outcome that must never be silent. The four
+    named fail-safe paths (no clock, unreadable clock, untrustworthy walk, unparseable stamp) are
+    handled explicitly; everything else surfaces."""
     for uid in "123":
         _person(conn, uid)
         schema.set_signal(conn, f"x:user:{uid}", "follow", "x")
@@ -184,38 +183,39 @@ def test_a_programming_error_is_not_reported_as_nobody_retired(conn, monkeypatch
     monkeypatch.setattr(cs, "walk_is_trustworthy",
                         lambda run: (_ for _ in ()).throw(AttributeError("renamed field")))
     with pytest.raises(AttributeError):
-        screen.rank_candidates(conn)
+        ranking.rank_candidates(conn)
 
 
 def test_a_store_without_the_retirement_tables_still_retires_nobody(conn, monkeypatch):
-    """The fail-safe that survives the narrowing: a missing//unreadable store is not a
-    programming error and must still degrade to the empty set."""
+    """A missing or unreadable store is not a programming error and must degrade to the empty
+    set."""
     import sqlite3
     for uid in "123":
         _person(conn, uid)
         schema.set_signal(conn, f"x:user:{uid}", "follow", "x")
     monkeypatch.setattr(cs, "get_run",
                         lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("no table")))
-    assert len(screen.rank_candidates(conn)) == 3
+    assert len(ranking.rank_candidates(conn)) == 3
 
 
 # ── the migration hazard ────────────────────────────────────────────────────────
 def test_upgrading_an_existing_store_retires_nobody(conn):
-    """⚠️ THE hazard. Pre-existing rows have no `last_confirmed_at`. If NULL compared as "older
-    than everything", the first read after upgrading would retire EVERY follow signal — 470 on the
-    live store — and empty the candidate list in one silent step. The backfill stamps them NOW, so
+    """The migration hazard. Pre-existing rows have no `last_confirmed_at`. If NULL compared as
+    "older than everything", the first read after upgrading would retire every follow signal —
+    470 on one live store — and empty the candidate list in one silent step. The backfill stamps
+    them at upgrade time, so
     the truth arrives one collector run late instead of destructively early."""
     for uid in "123":
         _person(conn, uid)
         # A pre-migration row: written by the summing path, which never confirms.
-        schema.add_signal(conn, f"x:user:{uid}", "follow", "x")
+        schema.ensure_signal(conn, f"x:user:{uid}", "follow", "x")
     conn.execute("UPDATE curation_signals SET last_confirmed_at = NULL")
     conn.commit()
 
     schema.init_kb_schema(conn)                      # the upgrade
     _walk(conn, ["1", "2", "3"], at=T0, prev_found=3)  # a healthy walk that DOES see everyone
 
-    assert len(screen.rank_candidates(conn)) == 3
+    assert len(ranking.rank_candidates(conn)) == 3
     assert all(r["last_confirmed_at"] for r in
                conn.execute("SELECT last_confirmed_at FROM curation_signals"))
 
@@ -224,7 +224,7 @@ def test_the_save_signal_never_gets_a_confirmation_stamp(conn):
     """`save` is unconfirmable by construction — no path re-reads your bookmark set. It must stay
     NULL rather than collect a meaningless stamp, or half the table carries a column that lies."""
     _person(conn, "1")
-    schema.add_signal(conn, "x:user:1", "save", "x")
+    schema.ensure_signal(conn, "x:user:1", "save", "x")
     schema.set_signal(conn, "x:user:1", "follow", "x")
     rows = {r["signal_type"]: r["last_confirmed_at"] for r in conn.execute(
         "SELECT signal_type, last_confirmed_at FROM curation_signals")}
@@ -233,62 +233,61 @@ def test_the_save_signal_never_gets_a_confirmation_stamp(conn):
 
 
 # ── shown, not vanished ─────────────────────────────────────────────────────────
-def test_the_retired_count_is_reported_not_hidden(conn, fake_embedder):
+def test_the_retired_count_is_reported_not_hidden(conn):
     """A list that quietly shrank by 52 is indistinguishable from one that never had them — and the
     reader cannot tell a working retirement from a broken walk without the number."""
-    from pipeline.kb import candidate_search
+    from pipeline.oracles import candidates
 
     for uid in ("1", "2", "3"):
         _person(conn, uid)
     _walk(conn, ["1", "2", "3"], at=T0)
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6))
 
-    out = candidate_search.candidates_payload(conn, "", None)
+    out = candidates.candidates_payload(conn, "")
     assert out["retired"] == 1
     assert "no longer follow" in out["retired_note"]
 
 
-def test_nothing_retired_reports_nothing(conn, fake_embedder):
+def test_nothing_retired_reports_nothing(conn):
     """Same rule as `signal_reconcile` and `list_freshness`: a line printed on every call stops
     being read."""
-    from pipeline.kb import candidate_search
+    from pipeline.oracles import candidates
 
     for uid in ("1", "2"):
         _person(conn, uid)
     _walk(conn, ["1", "2"], at=T0)
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6))
 
-    out = candidate_search.candidates_payload(conn, "", None)
+    out = candidates.candidates_payload(conn, "")
     assert "retired" not in out and "retired_note" not in out
 
 
 def test_include_retired_returns_them_flagged(conn):
-    """The caller that REPORTS needs them, so they are available on request rather than erased."""
+    """The caller that reports needs them, so they are available on request rather than erased."""
     for uid in ("1", "2", "3"):
         _person(conn, uid)
     _walk(conn, ["1", "2", "3"], at=T0)
     _walk(conn, ["1", "2"], at=T0 + timedelta(hours=6))
 
-    everyone = screen.rank_candidates(conn, include_retired=True)
+    everyone = ranking.rank_candidates(conn, include_retired=True)
     assert len(everyone) == 3
     assert [c.canonical_id for c in everyone if c.retired] == ["x:user:3"]
 
 
 def test_the_maintained_collector_is_named_not_inferred_from_its_signal_type(conn):
-    """Two collectors now write a `follow` signal — `x_following` and `substack_follows` — so a
-    signal type no longer identifies one collector's walk.
+    """Two collectors write a `follow` signal — `x_following` and `substack_follows` — so a
+    signal type does not identify one collector's walk.
 
-    This is a regression test for a SILENT failure. `_retired_ids` used to pick its spec with
-    `next(s for s in specs if s.signal_type == 'follow')`, which started resolving to whichever
-    spec came first in the registry the day the Substack rename landed. Retirement then compared
-    every X follow against a Substack clock that had never run, returned the empty set, and
-    retired nobody — with nothing raising and no count to notice.
+    Picking the spec with `next(s for s in specs if s.signal_type == 'follow')` would resolve to
+    whichever spec comes first in the registry. Retirement would then compare every X follow
+    against a Substack clock that had never run, return the empty set, and retire nobody — with
+    nothing raising and no count to notice.
     """
-    from pipeline.kb.ingest_curation import SPEC_BY_COLLECTOR
+    from pipeline.curation import substack_people
 
-    follow_specs = [s.collector for s in SPEC_BY_COLLECTOR.values() if s.signal_type == "follow"]
-    assert len(follow_specs) > 1, "the ambiguity this test defends against is gone — re-read it"
-    assert screen.MAINTAINED_COLLECTOR in SPEC_BY_COLLECTOR
+    assert substack_people.Follows.signal == ranking.MAINTAINED.signal == "follow", \
+        "the ambiguity this test defends against is gone — re-read it"
+    assert ranking.MAINTAINED_COLLECTOR == "x_following"
 
     # A Substack follow must not enter the retired set, and must not rescue a stale X follow.
     _person(conn, 1)
@@ -296,7 +295,7 @@ def test_the_maintained_collector_is_named_not_inferred_from_its_signal_type(con
     schema.set_signal(conn, "substack:pub", "follow", "substack")
     _walk(conn, [1], at=T0)
 
-    assert screen._retired_ids(conn) == set()
+    assert ranking._retired_ids(conn) == set()
     assert not any(r["signal_type"] == "follow" and r["platform"] == "substack"
                    for r in conn.execute("SELECT signal_type, platform FROM curation_signals "
                                          " WHERE entity_id IN (SELECT entity_id FROM entities "

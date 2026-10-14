@@ -1,31 +1,25 @@
 """
-pipeline/sync_lock.py
+pipeline/sync_lock.py — a heartbeat-lease lock for the bulk catch-up, one row in loops.db
+(`pipeline/loops_db.py`, which says why it is not opyt.db).
 
-A heartbeat-lease lock for the bulk catch-up, backed by one row in opyt.db.
-
-The catch-up subprocess holds this while bulk-embedding. If it's SIGKILL'd
-(laptop sleeps, OOM) it can never release a normal mutex — every future session
-would deadlock. So this is a *lease*, not a mutex: the holder re-stamps a
-heartbeat every H seconds, and a would-be acquirer treats the lock as dead once
-the stamp is older than the TTL (T = a few × H, so one missed beat from a GC
-pause doesn't cause a false eviction).
+A lease, not a mutex, because a SIGKILL'd holder can never release a mutex: the holder re-stamps
+a heartbeat every H seconds, and an acquirer treats the lock as dead once the stamp is older than
+the TTL (a few × H, so one missed beat doesn't evict).
 
 Three invariants, three mechanisms:
-  • no deadlock     — lease expiry: a stale heartbeat is reclaimable.
+  • no deadlock     — lease expiry: a stale heartbeat is reclaimable. So is a lease whose
+                      holder names this host and a process that no longer exists: a killed
+                      holder's lease is free at once, not after the TTL (see `_holder_is_dead`).
   • no double-run   — acquire is an atomic compare-and-set (UPDATE … WHERE stale),
                       serialized by SQLite's single writer; exactly one reclaimer wins.
   • no zombie       — epoch fencing: every acquire bumps `epoch`; a heartbeat whose
                       epoch no longer matches the row means we were evicted (a paused
                       holder that woke up) → the worker learns it lost and stops.
 
-All three rest on the heartbeat thread, so that thread must OUTLIVE ITS OWN ERRORS: it writes to
-a database shared with ingestion, where `database is locked` is a routine transient outcome, and
-a beat that could not be written says nothing about whether we still hold the lock. `_run_beats`
-therefore retries and never dies — see the long note there for what it cost when it did not.
+All three rest on the heartbeat thread, so `_run_beats` retries on any error and never dies: a
+beat that could not be written says nothing about whether we still hold the lock.
 
-Heartbeats are stored as unix seconds (REAL), not ISO text, so staleness is a
-clean numeric comparison (ISO strings don't sort correctly when microseconds are
-sometimes omitted).
+Heartbeats are stored as unix seconds (REAL), so staleness is a numeric comparison.
 """
 
 import os
@@ -36,7 +30,8 @@ import time
 import uuid
 from pathlib import Path
 
-from pipeline.sqlite_db import default_db_path
+from pipeline.loops_db import connect as connect_loops
+from pipeline.loops_db import loops_db_path
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sync_lock (
@@ -52,22 +47,14 @@ DEFAULT_HEARTBEAT = 10.0  # seconds between heartbeats (TTL = 3×, tolerates a m
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.executescript(_SCHEMA)
-    conn.commit()
-    return conn
+    return connect_loops(_SCHEMA, db_path)
 
 
 def _log(message: str) -> None:
     """Log without ever being a reason the heartbeat stops.
 
-    Imported lazily because `pipeline.ingestion.utils` drags in config/YAML machinery this module
-    otherwise has no use for, and `sync_lock` is imported by very small tools. Swallowing the
-    failure is deliberate: this runs on the thread whose whole job is to keep beating, and a
-    logging hiccup taking that down would reintroduce, through the back door, exactly the failure
-    the caller of this function exists to prevent."""
+    Imported lazily: `pipeline.ingestion.utils` drags in config/YAML machinery that the small
+    tools importing `sync_lock` don't need."""
     try:
         from pipeline.ingestion.utils import log
         log(message)
@@ -78,6 +65,51 @@ def _log(message: str) -> None:
 def _new_holder_id() -> str:
     """Unique per acquisition: host + pid + a random tag (pids get reused)."""
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def _holder_is_dead(holder: str | None) -> bool:
+    """Does `holder` (`host:pid:tag`) name this host and a process that no longer exists?
+
+    Frees a killed holder's lease at once instead of after the TTL. Only a definite "no such
+    process" counts: anything uncertain reads as alive, since a false "dead" would let two
+    holders run."""
+    if not holder:
+        return False
+    try:
+        host, pid_text, _tag = holder.rsplit(":", 2)
+        pid = int(pid_text)
+    except ValueError:
+        return False
+    if host != socket.gethostname() or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def is_held(name: str, *, ttl: float = DEFAULT_TTL, db_path: Path | None = None,
+            now: float | None = None) -> bool:
+    """Is someone holding `name` right now: a holder whose last beat is inside the TTL? A read
+    for a caller that only wants to know, never to take it. False when the lock was never made."""
+    p = Path(db_path) if db_path else loops_db_path()
+    try:
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        row = conn.execute("SELECT holder, heartbeat_at FROM sync_lock WHERE name=?",
+                           (name,)).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+    if row is None or row[0] is None or row[1] is None or _holder_is_dead(row[0]):
+        return False
+    return (time.time() if now is None else now) - row[1] < ttl
 
 
 class CatchupLock:
@@ -99,7 +131,7 @@ class CatchupLock:
         self.name = name
         self.ttl = ttl
         self.heartbeat = heartbeat
-        self._db_path = Path(db_path) if db_path else default_db_path()
+        self._db_path = Path(db_path) if db_path else loops_db_path()
         self.holder = _new_holder_id()
         self.epoch: int | None = None
         self.acquired = False
@@ -111,7 +143,8 @@ class CatchupLock:
     # ── core operations ───────────────────────────────────────────────────────
 
     def acquire(self) -> bool:
-        """Atomic compare-and-set: take the lock iff it's free or its lease is stale.
+        """Atomic compare-and-set: take the lock iff it's free, its lease is stale, or its holder
+        is a dead process on this host.
 
         Returns True and records our epoch on success; False if a live holder has it.
         """
@@ -121,10 +154,14 @@ class CatchupLock:
         conn.execute("BEGIN IMMEDIATE")  # grab the write lock up front; serializes racing acquirers
         try:
             conn.execute("INSERT OR IGNORE INTO sync_lock(name) VALUES (?)", (self.name,))
+            held = conn.execute("SELECT holder FROM sync_lock WHERE name=?",
+                                (self.name,)).fetchone()[0]
+            dead = held if _holder_is_dead(held) else None
             cur = conn.execute(
                 "UPDATE sync_lock SET holder=?, heartbeat_at=?, epoch=epoch+1 "
-                "WHERE name=? AND (holder IS NULL OR heartbeat_at IS NULL OR heartbeat_at < ?)",
-                (self.holder, now, self.name, cutoff),
+                "WHERE name=? AND (holder IS NULL OR heartbeat_at IS NULL OR heartbeat_at < ? "
+                "OR holder = ?)",
+                (self.holder, now, self.name, cutoff, dead),
             )
             if cur.rowcount == 1:
                 self.epoch = conn.execute(
@@ -173,9 +210,9 @@ class CatchupLock:
     # ── background heartbeat ──────────────────────────────────────────────────
 
     def _run_beats(self) -> None:
-        # Own the connection in THIS thread — SQLite connections can't cross threads.
+        # Own the connection in this thread — SQLite connections can't cross threads.
         conn = _connect(self._db_path)
-        last_proof = time.time()   # when we last PROVED the row still names us
+        last_proof = time.time()   # when we last proved the row still names us
         failing = False            # log the onset and the recovery, never every tick
         warned = False             # the past-TTL warning is once per outage, not once per beat
         try:
@@ -184,24 +221,9 @@ class CatchupLock:
                 try:
                     still_ours = self.beat(conn)
                 except Exception as exc:
-                    # A BEAT THAT FAILED IS NOT A BEAT THAT SAID WE LOST, and the difference is
-                    # the whole reason this `except` exists. `beat` writes to a database it shares
-                    # with ingestion, whose transactions outlast the 5s `busy_timeout` here, so
-                    # `database is locked` is a NORMAL transient outcome of a busy box. This
-                    # clause used to be absent: the first such error killed the thread, and with
-                    # it every future beat. `_lost` was never set (only an eviction sets it), so
-                    # `lost()` answered False forever while the stamp aged past the TTL and every
-                    # other process became entitled to reclaim a lease we were still using —
-                    # `no double-run` silently off, with a live holder and no way to notice.
-                    # Measured on the hosted box 2026-09-16: two of three locks in exactly this
-                    # state, `bookmark-catchup` 1094s stale against a 30s TTL with its writer
-                    # still paginating X.
-                    #
-                    # So: retry. Dying is never better than retrying, which is why this catches
-                    # `Exception` and not just `sqlite3.Error` — an unforeseen error here costs a
-                    # guarantee, and no unforeseen error is worth that. A genuine eviction still
-                    # arrives through the normal path, because the NEXT beat that completes reads
-                    # rowcount 0 and sets `_lost` then.
+                    # A failed beat is not a lost lease: `database is locked` is a normal transient
+                    # on a busy box. Retry on any error; a real eviction still arrives when the
+                    # next completed beat reads rowcount 0.
                     if not failing:
                         failing = True
                         _log(f"[sync-lock] {self.name}: heartbeat failed, retrying — {exc}")
@@ -211,12 +233,8 @@ class CatchupLock:
                         pass
                     if not warned and time.time() - last_proof > self.ttl:
                         warned = True
-                        # Past the TTL the lease is reclaimable by anyone, so single-flight is
-                        # no longer guaranteed for as long as this lasts. We do NOT stop the pass
-                        # over it: the work is idempotent by this module's contract, a stalled
-                        # write is not evidence anyone actually took the lock, and aborting a
-                        # healthy pass on a transient stall trades a rare double-run for a common
-                        # half-finished one. But it must not be silent.
+                        # Past the TTL anyone may reclaim the lease. The pass continues (the work
+                        # is idempotent), but the risk must not be silent.
                         _log(f"[sync-lock] {self.name}: no heartbeat has landed in "
                              f"{time.time() - last_proof:.0f}s (TTL {self.ttl:.0f}s) — another "
                              f"process may reclaim this lease while we are still holding it")
@@ -233,17 +251,26 @@ class CatchupLock:
             conn.close()
 
     def __enter__(self) -> "CatchupLock":
-        if self.acquire():
+        # `__exit__` never runs for an `__enter__` that raised, so a failed acquire (a locked
+        # store past the busy timeout) closes the connection here or leaks it.
+        try:
+            acquired = self.acquire()
+        except BaseException:
+            self._conn.close()
+            raise
+        if acquired:
             self._thread = threading.Thread(target=self._run_beats, daemon=True)
             self._thread.start()
         return self
 
     def __exit__(self, *exc) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.heartbeat + 2)
-        if self.acquired:
-            self.release()
-        self._conn.close()
+        try:
+            if self._thread is not None:
+                self._thread.join(timeout=self.heartbeat + 2)
+            if self.acquired:
+                self.release()
+        finally:
+            self._conn.close()
 
 

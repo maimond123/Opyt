@@ -26,7 +26,7 @@ def test_ok_and_not_ok_render_different_marks():
 
 
 def test_the_local_callback_page_is_a_rendered_panel():
-    """⚠️ THE 2026-09-09 FINDING. This page is the FIRST Opyt-served page a local user ever
+    """This page is the first Opyt-served page a local user ever
     sees — the OpenRouter approval is phase 1 of onboarding — and it returned a bare `<h2>` in
     the browser's default serif while the hosted home had a styled panel.
 
@@ -39,8 +39,8 @@ def test_the_local_callback_page_is_a_rendered_panel():
 
 
 def test_the_callback_page_names_no_filesystem_path():
-    """It named the keys file until 2026-09-09 — first as a hardcoded `~/.opyt/.env`, wrong
-    under `$OPYT_HOME`, then as the resolved path, right and still not wanted. Somebody who has
+    """It must not name the keys file — neither a hardcoded `~/.opyt/.env` (wrong
+    under `$OPYT_HOME`) nor the resolved path (right, and still not wanted). Somebody who has
     just authorised a third party needs the reassurance and the next step, not the location of
     a dotfile holding a secret.
 

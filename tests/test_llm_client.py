@@ -6,14 +6,14 @@ Exercises pipeline/llm_client.py without making real network calls. Uses the
 
 ⚠️ EVERY `role="..."` HERE MUST BE DECLARED IN config/settings.example.yaml. `call()` reads the
 ACTIVE settings.yaml, so a role name that exists only in the author's ~/.opyt/settings.yaml makes
-this file pass on his machine and fail on a fresh install. Measured 2026-08-30: `chat_extract`,
+this file pass on his machine and fail on a fresh install. Measured once: `chat_extract`,
 `note_classify` and `synthesis_verify` had all outlived their callers and been dropped from the
 template, and 5 of these 11 tests failed under a template-seeded OPYT_HOME with
 `ValueError: role not declared`. The template is the contract; check a role against it, not
 against whatever your own file happens to carry.
 
-The three used below are chosen for the properties the assertions need, not for their meaning:
-`entity_classify`, `content_quality` (declares response_format), and `vision` (declares none).
+`vision` is the one role the template declares, and it declares no response_format. The test
+that needs a role declaring one adds it to the config it reads (`_with_json_role`).
 """
 
 from __future__ import annotations
@@ -40,6 +40,22 @@ def _fake_backend_text(text: str, in_tok: int = 100, out_tok: int = 50):
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
+def _with_json_role(monkeypatch, name: str = "json_role") -> str:
+    """The active config plus one role that declares `response_format: json_object`."""
+    real = llm_client.load_yaml_config
+
+    def config():
+        cfg = real()
+        backends = dict(cfg.get("llm_backends") or {})
+        backends["roles"] = {**(backends.get("roles") or {}),
+                             name: {"provider": "openrouter", "model": "test/json-model",
+                                    "response_format": "json_object"}}
+        return {**cfg, "llm_backends": backends}
+
+    monkeypatch.setattr(llm_client, "load_yaml_config", config)
+    return name
+
+
 @pytest.fixture
 def fake_openrouter():
     """Substitute a fake openrouter backend; restore afterward."""
@@ -49,12 +65,17 @@ def fake_openrouter():
     llm_client._set_backend_for_tests("openrouter", real)
 
 
-# The `fake_anthropic` fixture was DELETED here 2026-08-13 with the direct Anthropic backend.
-# Nothing replaced it: the one test that took it asserted `provider == "openrouter"` on both of
-# its calls, so the fixture was substituting a backend the assertions never reached.
-
-
 # ── Tests ────────────────────────────────────────────────────────────────────
+
+
+def test_the_backend_table_has_one_entry():
+    """One backend: the direct Anthropic transport is retired.
+
+    Asserted as an exact set, not `"openrouter" in ...`, on purpose: this is the test that fails
+    if a second backend is registered without a matching credential-registry row. The dispatch
+    table surviving at size one is deliberate — it is the registration seam for the next
+    provider, not dead generality."""
+    assert set(llm_client._BACKENDS) == {"openrouter"}
 
 
 class TestRoleResolution:
@@ -63,16 +84,12 @@ class TestRoleResolution:
             llm_client.call(role="totally_made_up", system="x", user="y")
 
     def test_known_role_dispatches_to_correct_backend(self, fake_openrouter):
-        # entity_classify is configured to openrouter in the shipped template
-        resp = llm_client.call(role="entity_classify", system="s", user="u")
+        # vision is configured to openrouter in the shipped template
+        resp = llm_client.call(role="vision", system="s", user="u")
         assert resp.text == "hello"
         assert resp.provider == "openrouter"
-        # vision is now configured to openrouter (Gemini multimodal)
-        resp2 = llm_client.call(role="vision", system="s", user="u")
-        assert resp2.text == "hello"
-        assert resp2.provider == "openrouter"
 
-    def test_response_format_threaded_only_when_role_declares_it(self):
+    def test_response_format_threaded_only_when_role_declares_it(self, monkeypatch):
         """A role with `response_format` threads it to the backend; a role without it
         calls the backend with no such kwarg (so 4-arg backends stay compatible)."""
         seen = {}
@@ -84,8 +101,7 @@ class TestRoleResolution:
         real = llm_client._BACKENDS["openrouter"]
         llm_client._set_backend_for_tests("openrouter", capturing)
         try:
-            # content_quality declares response_format: json_object in the shipped template
-            llm_client.call(role="content_quality", system="s", user="u")
+            llm_client.call(role=_with_json_role(monkeypatch), system="s", user="u")
             assert seen["response_format"] == "json_object"
             # vision declares none → backend sees None (kwarg simply not passed)
             seen.clear()
@@ -117,7 +133,7 @@ class TestRoleResolution:
 class TestPerCallOverrides:
     def test_caller_can_override_model(self, fake_openrouter):
         resp = llm_client.call(
-            role="entity_classify",
+            role="vision",
             system="x", user="y",
             model="openai/gpt-4o-mini",  # override the configured model
         )
@@ -127,7 +143,7 @@ class TestPerCallOverrides:
         # We can't see max_tokens in the fake's output, but we can verify
         # the call completes without error when overriding.
         resp = llm_client.call(
-            role="entity_classify",
+            role="vision",
             system="x", user="y",
             max_tokens=512,
         )

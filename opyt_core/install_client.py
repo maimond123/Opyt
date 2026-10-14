@@ -6,30 +6,27 @@ Windsurf) by merging into that client's JSON file, instead of requiring a manual
 
 Each client stores MCP servers as `{"mcpServers": {"<name>": {...}}}` in a per-client JSON
 file. install() parses the existing file (or starts fresh), inserts/replaces our `opyt` key
-inside `mcpServers`, backs up the prior file, and writes valid JSON. Idempotent (re-running
-is a no-op) and reversible (--uninstall).
+inside `mcpServers`, backs up the prior file, and writes valid JSON. Idempotent and reversible
+(--uninstall, which also removes the background worker once no client still registers OPYT).
 
-The server command is `uvx --from opyt@latest opyt-mcp`, with `uvx` resolved to an absolute
-path at install time. That means a registered client needs no venv, no checkout, and no Python
-of its own — `uv` supplies the interpreter and the package. Requires `uv` on PATH when you run
-the installer:
+The server command is `uvx --from opyt@latest opyt-mcp`, so a registered client needs no venv,
+checkout or Python of its own. Requires `uv` on PATH when you run the installer:
 
     opyt-install-client --cursor
     opyt-install-client --all
     opyt-install-client --cursor --uninstall
 
-This is a CLI command, not an MCP tool, since a first-run installer must live outside the
-thing it installs.
-
-NOTE (v1 scope): the CLIENTS paths below are macOS locations only; add Linux/Windows paths
-when distribution expands. The merge logic itself is OS-independent.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
+
+from opyt_core import install_worker
+from opyt_core.launcher import uvx_command
 
 # Key we register under inside each client's "mcpServers" object; capitalized so Claude Code's
 # tool namespacing (mcp__<key>__<tool>) reads "Opyt".
@@ -46,46 +43,6 @@ CLIENTS: dict[str, Path] = {
     / "claude_desktop_config.json",
     "windsurf": Path.home() / ".codeium" / "windsurf" / "mcp_config.json",
 }
-
-
-def uvx_command(entry_point: str) -> list[str]:
-    """The argv that launches one of opyt's published entry points, with no checkout involved.
-
-    An ABSOLUTE path to `uvx`, not a bare name: both things that launch opyt unattended — a
-    desktop MCP client and a macOS LaunchAgent — are started by launchd, which supplies a
-    minimal PATH and never sources a shell profile. The `~/.local/bin` that `uv`'s installer
-    adds to your rc file does not exist as far as those processes are concerned.
-
-    `opyt@latest`, so a fix reaches an installed user without them running anything. This is the
-    ONLY form that does. Measured 2026-09-14 on uv 0.12.13, warm cache, per launch:
-
-        --from opyt==<version>   36 ms   never queries the index  (frozen)
-        --from opyt             36 ms   never queries the index  (frozen)
-        --from opyt@latest     226 ms   queries the index        (updates)
-
-    Note the middle row: dropping the `==` does NOT unfreeze anything. `uvx` reuses the cached
-    tool environment for a bare requirement, so an unpinned launcher pins just as hard as an
-    explicit one, only invisibly. `@latest` is uv's documented "ignore the cache" form and the
-    reason this function does not simply omit a version.
-
-    The 190 ms is an index query on every start, and it is not load-bearing: `uvx --offline
-    --from opyt@latest` exits 0 and runs the cached build. A user with no network gets the
-    version they already had, not a server that refuses to start.
-
-    Until 2026-09-14 this pinned `opyt=={version('opyt')}`, which meant a published fix reached
-    nobody: the pin is written into a client's mcp.json as literal text, and the only opyt that
-    then runs on that machine is the one with no way to learn a newer one exists. Nothing was
-    released publicly under that shape. Do not reintroduce a pin here without a way out of it.
-
-    Before 2026-08-29 the client installer registered `sys.executable` plus an absolute path to
-    this checkout's `mcp_server/server.py`, which welded every config to one folder that could
-    never move. That is the shape this function exists to prevent, for every launcher.
-    """
-    uvx = shutil.which("uvx") or str(Path.home() / ".local" / "bin" / "uvx")
-    if not Path(uvx).exists():
-        raise FileNotFoundError(
-            "uvx not found. Install uv first: curl -LsSf https://astral.sh/uv/install.sh | sh")
-    return [uvx, "--from", "opyt@latest", entry_point]
 
 
 def _server_spec() -> dict:
@@ -127,6 +84,19 @@ def _is_current(cfg: dict, spec: dict) -> bool:
     return servers.get(SERVER_KEY) == spec and not any(k in servers for k in _LEGACY_KEYS)
 
 
+def merge_server(cfg: dict, spec: dict) -> tuple[dict, list[str], bool]:
+    """`cfg` with our entry set under `mcpServers` and any legacy key dropped. Returns
+    (config, legacy keys dropped, whether our key was already there)."""
+    servers = cfg.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    migrated = [k for k in _LEGACY_KEYS if servers.pop(k, None) is not None]
+    existed = SERVER_KEY in servers
+    servers[SERVER_KEY] = spec
+    cfg["mcpServers"] = servers
+    return cfg, migrated, existed
+
+
 def install(client: str, *, force: bool = False, dry_run: bool = False) -> dict:
     """Merge the opyt server into `client`'s config. Idempotent. Refuses to touch a malformed
     existing file unless force=True, which backs it up then overwrites with an opyt-only
@@ -146,15 +116,7 @@ def install(client: str, *, force: bool = False, dry_run: bool = False) -> dict:
     if _is_current(cfg, spec):
         return {"client": client, "path": str(path), "status": "ALREADY_CURRENT"}
 
-    # Ensure mcpServers{} exists, drop any legacy key, then set ours.
-    servers = cfg.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-    migrated = [k for k in _LEGACY_KEYS if servers.pop(k, None) is not None]
-    existed = SERVER_KEY in servers
-    servers[SERVER_KEY] = spec
-    cfg["mcpServers"] = servers
-
+    cfg, migrated, existed = merge_server(cfg, spec)
     if dry_run:
         return {"client": client, "path": str(path),
                 "status": "DRY_RUN", "would_write": cfg}
@@ -191,7 +153,50 @@ def uninstall(client: str, *, dry_run: bool = False) -> dict:
 # file on the side.
 
 
+def _still_registered() -> tuple[list[str], list[str]]:
+    """(clients that still register OPYT, clients whose config could not be read)."""
+    kept, unreadable = [], []
+    for client, path in CLIENTS.items():
+        cfg, malformed = _load(path)
+        if malformed:
+            unreadable.append(client)
+            continue
+        servers = cfg.get("mcpServers", {})
+        if isinstance(servers, dict) and any(k in servers for k in (SERVER_KEY, *_LEGACY_KEYS)):
+            kept.append(client)
+    return kept, unreadable
+
+
+def remove_worker_if_unused(*, dry_run: bool = False) -> dict:
+    """After an uninstall, remove the background worker too — unless OPYT is still in use.
+
+    A removed OPYT must leave nothing relaunching. The worker stays while any known client still
+    registers OPYT, or while a config cannot be read.
+    """
+    if sys.platform != "darwin":
+        return {"status": "NOT_APPLICABLE"}
+    kept, unreadable = _still_registered()
+    if kept or unreadable:
+        return {"status": "KEPT", "still_registered": kept, "unreadable": unreadable}
+    return install_worker.uninstall(dry_run=dry_run)
+
+
 def main(argv: list[str] | None = None) -> int:
+    args, targets = _parse(argv)
+    rc = 0
+    for client in targets:
+        res = _run(client, args)
+        if str(res.get("status", "")).startswith("ERROR"):
+            rc = 1
+        print(_client_line(client, res))
+    if args.uninstall:
+        line = _worker_line(remove_worker_if_unused(dry_run=args.dry_run))
+        if line:
+            print(line)
+    return rc
+
+
+def _parse(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
     ap = argparse.ArgumentParser(
         prog="opyt_core.install_client",
         description="Register (or remove) the OPYT MCP server in a desktop MCP client's config.")
@@ -207,26 +212,36 @@ def main(argv: list[str] | None = None) -> int:
     targets = list(CLIENTS) if args.all else [n for n in CLIENTS if getattr(args, n.replace("-", "_"))]
     if not targets:
         ap.error("pick at least one client (e.g. --cursor) or --all")
+    return args, targets
 
-    rc = 0
-    for client in targets:
-        try:
-            if args.uninstall:
-                res = uninstall(client, dry_run=args.dry_run)
-            else:
-                res = install(client, force=args.force, dry_run=args.dry_run)
-        except FileNotFoundError as e:
-            res = {"client": client, "status": "ERROR", "detail": str(e)}
-        if str(res.get("status", "")).startswith("ERROR"):
-            rc = 1
-        # Compact, scannable one-line-per-client report.
-        line = f"[{res['status']}] {client} -> {res.get('path', '')}"
-        if res.get("backup"):
-            line += f"  (backup: {res['backup']})"
-        if res.get("detail"):
-            line += f"\n    {res['detail']}"
-        print(line)
-    return rc
+
+def _run(client: str, args: argparse.Namespace) -> dict:
+    try:
+        if args.uninstall:
+            return uninstall(client, dry_run=args.dry_run)
+        return install(client, force=args.force, dry_run=args.dry_run)
+    except FileNotFoundError as e:
+        return {"client": client, "status": "ERROR", "detail": str(e)}
+
+
+def _client_line(client: str, res: dict) -> str:
+    """Compact, scannable one-line-per-client report."""
+    line = f"[{res['status']}] {client} -> {res.get('path', '')}"
+    if res.get("backup"):
+        line += f"  (backup: {res['backup']})"
+    if res.get("detail"):
+        line += f"\n    {res['detail']}"
+    return line
+
+
+def _worker_line(res: dict) -> str | None:
+    if res["status"] == "KEPT":
+        why = ", ".join(res["still_registered"] + [f"{c} (unreadable config)"
+                                                   for c in res["unreadable"]])
+        return f"[KEPT] background worker — Opyt is still set up in {why}"
+    if res["status"] == "NOT_APPLICABLE":
+        return None
+    return f"[{res['status']}] background worker -> {res.get('path', '')}"
 
 
 if __name__ == "__main__":

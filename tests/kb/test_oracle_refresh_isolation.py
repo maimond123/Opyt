@@ -1,22 +1,18 @@
 """Atom-rail isolation for the Oracle refresh loop.
 
-`pipeline/kb/` has ZERO imports from `pipeline/radar/` or any vault module, and this change had to
-preserve that. The refresh loop was modelled on the radar rail's equivalent — a working
-implementation of exactly this shape — which made an import the tempting shortcut and the wrong
-move: that rail read `radar_atoms`, a pre-atom-KB table, so importing it would have welded this
-loop's lifetime to a module queued for deletion. The radar rail has since been deleted and this
-loop survived it, which is the outcome the rule buys.
+`pipeline/kb/` has no imports from `pipeline/radar/` or any vault module. The radar rail had an
+equivalent refresh loop, which made an import the tempting shortcut and the wrong move: that rail
+read `radar_atoms`, a pre-atom-KB table, so importing it would weld this loop's lifetime to a
+legacy module.
 
 The `atom-rail-not-welded-to-catchup` and `atom-rail-not-welded-to-radar` guards cover
 `mcp_server.catchup` and `pipeline.radar` at the AST level. This covers the rest by grep, and pins
 the tables the loop is allowed to write.
 
-⚠️ SCOPE WIDENED 2026-08-08, because scanning `pipeline/kb/` alone let a real one through. A live
-frontier module outside `pipeline/kb/` imported a timestamp parse from the dead rail, carrying
-exactly the weld this file exists to forbid, and this test was blind to it purely because of which
-directory it sat in. Both modules in that incident have since been deleted, so they are not named
-here — the LESSON is what survives: a scan scoped to one package proves a property about that
-package, not about the rail. Keep this scan on the rail, not on a directory.
+The scan covers every live package, not just `pipeline/kb/`: a module outside it once imported a
+timestamp parse from the dead rail, which is exactly the weld this file forbids. A scan scoped to
+one package proves a property about that package, not about the rail. Keep this scan on the rail,
+not on a directory.
 """
 from __future__ import annotations
 
@@ -27,38 +23,36 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
-_KB = _ROOT / "pipeline" / "kb"
-_NEW = ("oracle_refresh.py", "oracle_refresh_state.py")
+_NEW = ("pipeline/oracles/coverage.py", "pipeline/oracles/freshness.py", "pipeline/oracles/registry.py", "pipeline/oracles/pairs.py")
 
-# The LIVE atom rail, by package. Both must stay free of dead-rail imports; see the note above on
+# The live atom rail, by package. Both must stay free of dead-rail imports; see the note above on
 # why `pipeline/artifacts/` is not optional here.
 _LIVE_PACKAGES = ("pipeline/kb", "pipeline/artifacts")
 
 # Vault-rail + pre-atom-KB modules. `pipeline.ask` is the deleted vault retrieval rail;
-# `mcp_server.catchup` was the vault catch-up job and is DELETED too (2026-08-12) — it stays in
-# this list because a deleted module is exactly what someone re-creates; `pipeline.radar` is
-# pre-atom-KB.
+# `mcp_server.catchup` is a deleted vault catch-up job, kept in this list because a deleted module
+# is exactly what someone re-creates; `pipeline.radar` is pre-atom-KB.
 _FORBIDDEN = re.compile(
     r"\b(?:from|import)\s+(pipeline\.radar|pipeline\.ask|pipeline\.processing|"
     r"mcp_server\.catchup|opyt_core\.actions|gui\.indexer)\b")
 
-# Vault / pre-atom-KB tables. The refresh loop writes atoms, chunks, edges, entities,
-# engagements, oracle_sources, circuit_breaker and sync_lock — none of these.
+# Vault / pre-atom-KB tables. The refresh loop writes atoms, bodies, edges, entities,
+# oracle_sources, circuit_breaker and sync_lock — none of these.
 _VAULT_TABLES = re.compile(r"\b(notes_fts|note_embeddings|radar_atoms|note_topics|daily_activity)\b"
                            r"|\b(?:FROM|INTO|JOIN|UPDATE)\s+(?:notes|topics|taxonomy)\b", re.I)
 
 
 @pytest.mark.parametrize("name", _NEW)
 def test_new_modules_import_nothing_from_a_dead_rail(name):
-    hit = _FORBIDDEN.search((_KB / name).read_text())
+    hit = _FORBIDDEN.search((_ROOT / name).read_text())
     assert hit is None, f"{name} imports {hit.group(1)!r} — see this module's docstring"
 
 
 def _query_text(path: Path) -> str:
-    """Every string literal in the file EXCEPT docstrings, joined.
+    """Every string literal in the file except docstrings, joined.
 
     SQL lives in string literals, so a scan that strips all strings would catch nothing — but both
-    new modules name `radar_atoms` / `notes_fts` in their PROSE, on purpose, to record which tables
+    new modules name `radar_atoms` / `notes_fts` in their prose, on purpose, to record which tables
     must never be touched and why. A naive grep fails on exactly the comments that document the
     invariant, and the obvious fix (delete the prose) is backwards. Docstrings out, SQL in."""
     tree = ast.parse(path.read_text())
@@ -77,7 +71,7 @@ def _query_text(path: Path) -> str:
 
 @pytest.mark.parametrize("name", _NEW)
 def test_new_modules_query_no_vault_or_radar_table(name):
-    hit = _VAULT_TABLES.search(_query_text(_KB / name))
+    hit = _VAULT_TABLES.search(_query_text(_ROOT / name))
     assert hit is None, f"{name} names the retired table {hit.group(0)!r}"
 
 
@@ -101,8 +95,8 @@ def test_whole_live_package_still_has_no_dead_rail_imports(package):
 def test_the_import_scan_would_actually_catch_a_real_import(tmp_path):
     """Same reasoning as the table-scan control below: a negative assertion with no positive
     control is an assertion that always passes. This one is not theoretical — the exact line it
-    reconstructs is what `pipeline/artifacts/policy.py` carried until 2026-08-08, and what the
-    kb-only scan missed."""
+    reconstructs is one that `pipeline/artifacts/policy.py` once carried, and that a kb-only scan
+    missed."""
     ok = tmp_path / "ok.py"
     ok.write_text('"""Prose naming pipeline.radar, which must NOT trip the scan."""\nx = 1\n')
     assert _FORBIDDEN.search(ok.read_text()) is None
@@ -129,8 +123,8 @@ def test_the_guard_rules_are_registered():
 def test_the_shared_timestamp_parse_is_neutral_not_forked():
     """`parse_ts` lives in a neutral module both rails may import, and NOT as a private copy.
 
-    Three implementations of this parse existed before 2026-08-08 and had already drifted (the kb
-    copy had gained a `str()` coercion the others lacked). The fix only holds while there is one
+    Separate copies of this parse drift apart (one gained a `str()` coercion the others lacked). The
+    shared module only holds while there is one
     body: an inline re-fork in either live package would satisfy every other test in this file,
     since a copy imports nothing."""
     assert (_ROOT / "pipeline" / "timeparse.py").exists()
@@ -145,7 +139,7 @@ def test_the_shared_timestamp_parse_is_neutral_not_forked():
 
 def test_refresh_infra_deps_are_generic_not_vault():
     """circuit_breaker / sync_lock / dedup_store are shared infra; each may reach only
-    `pipeline.sqlite_db`, which is why the loop is allowed to depend on them."""
+    `pipeline.sqlite_db` and `pipeline.loops_db`, which is why the loop is allowed to depend on them."""
     root = Path(__file__).resolve().parents[2] / "pipeline"
     for mod in ("circuit_breaker.py", "sync_lock.py", "dedup_store.py"):
         assert _FORBIDDEN.search((root / mod).read_text()) is None, mod

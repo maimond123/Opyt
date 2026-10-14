@@ -26,7 +26,7 @@ def test_derive_x_pulls_author_topics_mentions_and_mechanical_desc():
     meta = derive_x(norm)
     assert meta["who_id"] == "x:user:33836629"      # author entity, not the saver
     assert meta["when_precision"] == "day"
-    # Hashtags are the AUTHOR's labels → `source_tags` (§6 of the capture audit).
+    # Hashtags are the AUTHOR's labels → `source_tags`.
     assert meta["source_tags"] == ["aiagents", "llms"]
     assert meta["about_entities"] == ["x:@ylecun"]
     assert meta["description"].startswith("@karpathy (Andrej) · great thread on agents")

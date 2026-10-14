@@ -1,32 +1,35 @@
-"""The two operations wired for the twitterapi.io cutover, plus the replies timeline's sharp edge.
+"""The two operations wired for the twitterapi.io cutover, and the per-operation request budget.
 
-Offline: every test drives `graphql_get` from a recorded response shape. What is worth pinning
-here is not the transport (curl_cffi's job) but the four things a live probe had to discover and
-that a fixture written from memory would get wrong:
+Offline: every test drives `XClient.graphql_get` from a recorded response shape. What is worth pinning
+here is not the transport (curl_cffi's job) but the things a live probe had to discover and that
+a fixture written from memory would get wrong:
 
   1. `UserByScreenName` has NO `legacy` block — the classic paths yield None on a 200 response.
-  2. The replies timeline returns OTHER PEOPLE'S tweets, 45% of them in the measured walk.
-  3. A page of nothing but conversation partners is not an exhausted cursor.
-  4. `TweetResultsByRestIds` answers positionally, padding a missing tweet with `{}`.
+  2. `TweetResultsByRestIds` answers positionally, padding a missing tweet with `{}`.
+
 """
 from __future__ import annotations
 
 import pytest
 
-from pipeline.ingestion import x_graphql_core as core
+from pipeline.platforms.x import conversation as x_conversation
+import pipeline.platforms.x.rate as x_rate
+from pipeline.platforms.x import profile as x_profile
+from pipeline.platforms.x.local import LocalXTransport
+from pipeline.platforms.x.request import XClient
+from tests.ingestion.x_client_fake import FakeXClient
 
-
-@pytest.fixture(autouse=True)
-def _no_qid_lookup(monkeypatch):
-    """queryId resolution reaches the network (and the on-disk cache). Every test here is about
-    what happens to a RESPONSE, so short-circuit it."""
-    monkeypatch.setattr(core, "resolve_query_id", lambda op, *a, **k: f"qid-{op}")
+# queryId resolution reaches the network (and the on-disk cache). Every endpoint test here is
+# about what happens to a RESPONSE, so the client is a fake that answers it.
+CLIENT = FakeXClient()
+# The budget tests drive the real client over the real local transport, with curl_cffi faked.
+LOCAL = XClient(LocalXTransport({}, {}))
 
 
 # ── UserByScreenName ─────────────────────────────────────────────────────────
 
 def _user_response(**over) -> dict:
-    """The live 2026-08-30 shape, trimmed to the fields that are read. Note what is ABSENT: there
+    """A live shape, trimmed to the fields that are read. Note what is ABSENT: there
     is no `legacy` block anywhere in it, which is the whole point."""
     user = {
         "__typename": "User",
@@ -55,8 +58,8 @@ def test_the_profile_maps_off_core_and_profile_bio_not_legacy(monkeypatch):
     """⚠️ THE trap. A first pass written from memory reaches for `legacy.followers_count` and
     `legacy.description`; the response has no `legacy` block, so every field comes back None on a
     request that returned 200. This pins the live paths."""
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: _user_response())
-    p = core.fetch_user_profile({}, {}, "@hypersoren")
+    monkeypatch.setattr(CLIENT, "get", lambda *a, **k: _user_response())
+    p = x_profile.fetch_user_profile(CLIENT, "@hypersoren")
     assert p["user_id"] == "975243637"          # rest_id — what `x:user:{id}` entities key on
     assert p["handle"] == "hypersoren"          # core.screen_name
     assert p["display_name"] == "Soren Larson"  # core.name
@@ -67,8 +70,8 @@ def test_the_profile_maps_off_core_and_profile_bio_not_legacy(monkeypatch):
 def test_the_website_is_expanded_past_tco(monkeypatch):
     """`website.url` is the SHORTENED form; the expansion lives only in the entities block beside
     it. Reading `website.url` alone hands every caller a t.co link."""
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: _user_response())
-    p = core.fetch_user_profile({}, {}, "hypersoren")
+    monkeypatch.setattr(CLIENT, "get", lambda *a, **k: _user_response())
+    p = x_profile.fetch_user_profile(CLIENT, "hypersoren")
     assert p["website"] == "http://hypersoren.xyz"
     assert p["bio_urls"] == ["https://example.com/pod"]
 
@@ -77,8 +80,8 @@ def test_blue_verification_counts_as_verified(monkeypatch):
     """Two separate flags, and the consumers only ever wanted "has a check". `verification.verified`
     is legacy blue and false for nearly everyone now, so reading it alone reports almost every
     account as unverified."""
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: _user_response())
-    assert core.fetch_user_profile({}, {}, "hypersoren")["verified"] is True
+    monkeypatch.setattr(CLIENT, "get", lambda *a, **k: _user_response())
+    assert x_profile.fetch_user_profile(CLIENT, "hypersoren")["verified"] is True
 
 
 @pytest.mark.parametrize("response, why", [
@@ -88,18 +91,18 @@ def test_blue_verification_counts_as_verified(monkeypatch):
     ({"data": {"user": {"result": {"__typename": "User"}}}}, "no rest_id to key on"),
 ])
 def test_an_unreadable_account_is_none_not_an_exception(monkeypatch, response, why):
-    """Returns None rather than raising `XUserUnavailable` like `fetch_user_tweets` does, because
+    """Returns None rather than raising `XUserUnavailable` like `fetch_user_originals` does, because
     neither caller distinguishes: both report "unresolved" for a suspended account and a network
     failure alike."""
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: response)
-    assert core.fetch_user_profile({}, {}, "someone") is None, why
+    monkeypatch.setattr(CLIENT, "get", lambda *a, **k: response)
+    assert x_profile.fetch_user_profile(CLIENT, "someone") is None, why
 
 
 def test_a_blank_handle_never_reaches_the_network(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("should not have made a request")
-    monkeypatch.setattr(core, "graphql_get", boom)
-    assert core.fetch_user_profile({}, {}, "  @  ".strip("@ ")) is None
+    monkeypatch.setattr(CLIENT, "get", boom)
+    assert x_profile.fetch_user_profile(CLIENT, "  @  ".strip("@ ")) is None
 
 
 # ── TweetResultsByRestIds ────────────────────────────────────────────────────
@@ -116,111 +119,30 @@ def _tweet_node(tid: str) -> dict:
 def test_a_missing_tweet_is_dropped_not_returned_as_a_placeholder(monkeypatch):
     """X answers positionally: ask for three ids where one is deleted and the middle slot comes
     back `{}`. Passing that through would make a caller's index silently mean a different tweet."""
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: {"data": {"tweetResult": [
+    monkeypatch.setattr(CLIENT, "get", lambda *a, **k: {"data": {"tweetResult": [
         {"result": _tweet_node("111")}, {}, {"result": _tweet_node("333")}]}})
-    got = core.fetch_tweets_by_ids({}, {}, ["111", "222", "333"])
+    got = x_conversation.fetch_tweets_by_ids(CLIENT, ["111", "222", "333"])
     assert [t["id"] for t in got] == ["111", "333"]
 
 
 def test_an_empty_id_list_never_reaches_the_network(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("should not have made a request")
-    monkeypatch.setattr(core, "graphql_get", boom)
-    assert core.fetch_tweets_by_ids({}, {}, []) == []
-    assert core.fetch_tweets_by_ids({}, {}, ["", "  "]) == []
+    monkeypatch.setattr(CLIENT, "get", boom)
+    assert x_conversation.fetch_tweets_by_ids(CLIENT, []) == []
+    assert x_conversation.fetch_tweets_by_ids(CLIENT, ["", "  "]) == []
 
 
 def test_past_the_per_request_maximum_it_raises_rather_than_truncating(monkeypatch):
     """No chunking loop is written, because no caller batches. The alternative to raising is
     letting X drop the overflow, and losing tweets quietly is the one failure this must not have."""
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: {"data": {"tweetResult": []}})
+    monkeypatch.setattr(CLIENT, "get", lambda *a, **k: {"data": {"tweetResult": []}})
     with pytest.raises(ValueError, match="at most 100 ids"):
-        core.fetch_tweets_by_ids({}, {}, [str(i) for i in range(101)])
-
-
-# ── The replies timeline ─────────────────────────────────────────────────────
-
-def _timeline_page(entries: list, cursor: str | None) -> dict:
-    items = list(entries)
-    if cursor:
-        items.append({"entryId": "cursor-bottom-0",
-                      "content": {"cursorType": "Bottom", "value": cursor}})
-    return {"data": {"user": {"result": {"timeline_v2": {"timeline": {
-        "instructions": [{"entries": items}]}}}}}}
-
-
-def _conversation_entry(*tweets: dict) -> dict:
-    """How the replies timeline ships EVERYTHING — as a `profile-conversation-` module holding the
-    whole exchange, the tweet replied to as well as the reply."""
-    return {"entryId": "profile-conversation-1", "content": {"items": [
-        {"item": {"itemContent": {"tweet_results": {"result": t}}}} for t in tweets]}}
-
-
-def _by(uid: str, tid: str) -> dict:
-    n = _tweet_node(tid)
-    n["core"]["user_results"]["result"]["rest_id"] = uid
-    return n
-
-
-def test_the_replies_walk_drops_other_peoples_tweets(monkeypatch):
-    """⚠️ Measured 2026-08-30: a raw @hypersoren replies walk returned 321 tweets from 92 DISTINCT
-    authors, 145 of them (45%) not his. `_filter_and_stitch` would NOT have caught them — it drops
-    retweets and replies-to-others, and another author's plain original is neither."""
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: _timeline_page(
-        [_conversation_entry(_by("999", "partner-1"), _by("42", "mine-1"))], None))
-    got = core.fetch_user_tweets({}, {}, "42", pages=1, timeline="replies")
-    assert [t["id"] for t in got] == ["mine-1"]
-
-
-def test_a_page_of_only_conversation_partners_does_not_end_the_walk(monkeypatch):
-    """On a replies walk that is an ordinary page, not an exhausted cursor. Stopping on "no new
-    tweet by this author" would end the walk the first time every reply on a page sat under
-    someone else's post — which is exactly what lost 2 tweets in the live comparison."""
-    pages = [
-        _timeline_page([_conversation_entry(_by("999", "partner-1"))], "c1"),
-        _timeline_page([_conversation_entry(_by("999", "partner-2"), _by("42", "mine-1"))], None),
-    ]
-    monkeypatch.setattr(core, "graphql_get", lambda *a, **k: pages.pop(0))
-    got = core.fetch_user_tweets({}, {}, "42", pages=5, timeline="replies")
-    assert [t["id"] for t in got] == ["mine-1"]
-
-
-def test_a_page_that_is_entirely_re_seen_does_end_the_walk(monkeypatch):
-    """The terminator must still fire, or X's forever-advancing cursor makes this run to the cap.
-    Re-seen ids count as neither new nor other — the page added nothing at all."""
-    calls = []
-
-    def fake(op, qid, variables, *a, **k):
-        calls.append(variables.get("cursor"))
-        return _timeline_page([_conversation_entry(_by("999", "p1"), _by("42", "m1"))], "c1")
-
-    monkeypatch.setattr(core, "graphql_get", fake)
-    got = core.fetch_user_tweets({}, {}, "42", pages=10, timeline="replies")
-    assert [t["id"] for t in got] == ["m1"]
-    assert len(calls) == 2, "should have stopped on the first fully-re-seen page"
-
-
-def test_the_posts_timeline_is_the_default_and_unchanged(monkeypatch):
-    seen = {}
-
-    def fake(op, *a, **k):
-        seen["op"] = op
-        return _timeline_page(
-            [{"entryId": "tweet-1", "content": {"itemContent": {
-                "tweet_results": {"result": _by("42", "t1")}}}}], None)
-
-    monkeypatch.setattr(core, "graphql_get", fake)
-    assert [t["id"] for t in core.fetch_user_tweets({}, {}, "42")] == ["t1"]
-    assert seen["op"] == "UserTweets"
-
-
-def test_an_unknown_timeline_raises_rather_than_silently_walking_posts(monkeypatch):
-    with pytest.raises(ValueError, match="timeline must be one of"):
-        core.fetch_user_tweets({}, {}, "42", timeline="likes")
+        x_conversation.fetch_tweets_by_ids(CLIENT, [str(i) for i in range(101)])
 
 
 # ── The per-operation request budget ─────────────────────────────────────────
-# Every X read passes through `graphql_get`, so this is where the budget belongs. What is pinned
+# Every X read passes through `XClient.graphql_get`, so this is where the budget belongs. What is pinned
 # here is that it reads the SERVER's meter rather than a constant, that each operation gets its
 # own bucket, and that a spent bucket is refused LOCALLY — the request X would 429 is never
 # issued, so it never counts against the window we are protecting.
@@ -241,13 +163,13 @@ class _Resp:
 
 @pytest.fixture(autouse=True)
 def _clear_rate_state():
-    core._RATE_STATE.clear()
+    x_rate._RATE_STATE.clear()
     yield
-    core._RATE_STATE.clear()
+    x_rate._RATE_STATE.clear()
 
 
 def _drive(monkeypatch, responses):
-    """Point `graphql_get` at a canned response sequence and hand back the issued-op log."""
+    """Point the local transport at a canned response sequence and hand back the issued-op log."""
     issued = []
 
     class _Cffi:
@@ -271,10 +193,10 @@ def test_the_budget_is_read_off_the_servers_own_headers(monkeypatch):
         _Resp(headers={"x-rate-limit-remaining": "37", "x-rate-limit-reset": "9999999999"}),
         _Resp(headers={}),
     ])
-    core.graphql_get("UserTweets", "q", {}, {}, {})
-    assert core.rate_budget("UserTweets") == (37, 9999999999.0)
-    core.graphql_get("UserTweets", "q", {}, {}, {})
-    assert core.rate_budget("UserTweets") == (37, 9999999999.0)   # unmetered != spent
+    LOCAL.graphql_get("UserTweets", "q", {}, {})
+    assert x_rate.rate_budget("UserTweets") == (37, 9999999999.0)
+    LOCAL.graphql_get("UserTweets", "q", {}, {})
+    assert x_rate.rate_budget("UserTweets") == (37, 9999999999.0)   # unmetered != spent
     assert issued == ["UserTweets", "UserTweets"]
 
 
@@ -286,11 +208,11 @@ def test_a_spent_bucket_refuses_before_the_request_goes_out(monkeypatch):
     issued = _drive(monkeypatch, [
         _Resp(headers={"x-rate-limit-remaining": "0", "x-rate-limit-reset": str(reset)}),
     ])
-    core.graphql_get("UserTweets", "q", {}, {}, {})
+    LOCAL.graphql_get("UserTweets", "q", {}, {})
     assert issued == ["UserTweets"]
 
-    with pytest.raises(core.XRateLimited) as e:
-        core.graphql_get("UserTweets", "q", {}, {}, {})
+    with pytest.raises(x_rate.XRateLimited) as e:
+        LOCAL.graphql_get("UserTweets", "q", {}, {})
     assert issued == ["UserTweets"]                  # nothing new went out
     assert e.value.op == "UserTweets" and e.value.reset_at == pytest.approx(reset)
 
@@ -305,12 +227,12 @@ def test_each_operation_holds_its_own_bucket(monkeypatch):
         _Resp(headers={"x-rate-limit-remaining": "480", "x-rate-limit-reset": str(reset)}),
         _Resp(headers={"x-rate-limit-remaining": "479", "x-rate-limit-reset": str(reset)}),
     ])
-    core.graphql_get("UserTweets", "q", {}, {}, {})
-    core.graphql_get("TweetResultsByRestIds", "q", {}, {}, {})
+    LOCAL.graphql_get("UserTweets", "q", {}, {})
+    LOCAL.graphql_get("TweetResultsByRestIds", "q", {}, {})
 
-    with pytest.raises(core.XRateLimited):
-        core.graphql_get("UserTweets", "q", {}, {}, {})
-    core.graphql_get("TweetResultsByRestIds", "q", {}, {}, {})   # its own bucket: unaffected
+    with pytest.raises(x_rate.XRateLimited):
+        LOCAL.graphql_get("UserTweets", "q", {}, {})
+    LOCAL.graphql_get("TweetResultsByRestIds", "q", {}, {})   # its own bucket: unaffected
     assert issued == ["UserTweets", "TweetResultsByRestIds", "TweetResultsByRestIds"]
 
 
@@ -323,10 +245,10 @@ def test_the_bucket_reopens_once_its_reset_instant_passes(monkeypatch):
         _Resp(headers={"x-rate-limit-remaining": "0", "x-rate-limit-reset": str(time.time() - 1)}),
         _Resp(headers={"x-rate-limit-remaining": "49", "x-rate-limit-reset": "9999999999"}),
     ])
-    core.graphql_get("UserTweets", "q", {}, {}, {})
-    core.graphql_get("UserTweets", "q", {}, {}, {})               # reset passed → allowed
+    LOCAL.graphql_get("UserTweets", "q", {}, {})
+    LOCAL.graphql_get("UserTweets", "q", {}, {})               # reset passed → allowed
     assert issued == ["UserTweets", "UserTweets"]
-    assert core.rate_budget("UserTweets") == (49, 9999999999.0)
+    assert x_rate.rate_budget("UserTweets") == (49, 9999999999.0)
 
 
 def test_a_429_still_records_its_reset_instant(monkeypatch):
@@ -338,7 +260,16 @@ def test_a_429_still_records_its_reset_instant(monkeypatch):
         _Resp(status=429, headers={"x-rate-limit-remaining": "0",
                                    "x-rate-limit-reset": str(reset)}),
     ])
-    with pytest.raises(core.XRateLimited) as e:
-        core.graphql_get("UserTweets", "q", {}, {}, {})
+    with pytest.raises(x_rate.XRateLimited) as e:
+        LOCAL.graphql_get("UserTweets", "q", {}, {})
     assert e.value.reset_at == pytest.approx(reset)
-    assert core.rate_budget("UserTweets") == (0, pytest.approx(reset))
+    assert x_rate.rate_budget("UserTweets") == (0, pytest.approx(reset))
+
+
+def test_a_blank_handle_resolves_no_query_id(monkeypatch):
+    """B06: the handle check ran after `resolve_query_id`, so a blank handle could discover and
+    cache a query id before refusing."""
+    def boom(*a, **k):
+        raise AssertionError("resolved a query id for a blank handle")
+    monkeypatch.setattr(CLIENT, "resolve_query_id", boom)
+    assert x_profile.fetch_user_profile(CLIENT, "  @ ") is None

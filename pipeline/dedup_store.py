@@ -1,28 +1,20 @@
 """
 pipeline/dedup_store.py
 
-SQLite-backed dedup state. Replaces the per-source ``state/*_synced.json`` blobs, whose
-whole-file read-modify-write let two concurrent sessions clobber each other's dedup IDs
-(costing a re-pull from a paid source). ``mark(ns, id)`` is a single-row ``INSERT OR
-IGNORE`` keyed by ``(namespace, item_id)`` instead — commutative and idempotent under
-concurrent writers; WAL lets a reader not block the writer.
-
-``namespace`` is the old filename stem (``synced_ids``, ``blog_synced``, ...), so
-existing call sites keep working unchanged via ``load_state``/``save_state``.
+SQLite-backed dedup state. Each add is a single-row ``INSERT OR IGNORE`` keyed by
+``(namespace, item_id)``, so concurrent writers never clobber each other's IDs.
+``namespace`` is a source's state name (``synced_ids``, ``blog_synced``, ...).
 """
 
 import json
 import sqlite3
-from datetime import datetime, timezone
 from pipeline.timeparse import utc_now
 from pathlib import Path
 
+from pipeline.kb.writes import write_tx
 from pipeline.sqlite_db import default_db_path
 
-# Table name is deliberately distinct from every other table in the shared ~/.opyt/opyt.db.
-# The two it was originally written to avoid — `note_vectors` and `note_embeddings` — have
-# both since been retired (2026-06 and 2026-08-05), but the rule stands and the names stay
-# burned: never reuse a retired table name, or a stale reader silently joins the wrong data.
+# Never reuse a retired table name for this ledger, or a stale reader silently joins the wrong data.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sync_dedup (
     namespace TEXT NOT NULL,
@@ -39,19 +31,21 @@ CREATE TABLE IF NOT EXISTS sync_dedup_seeded (
 
 
 def _now() -> str:
-    # Full precision, deliberately unchanged: this stamp is already stored in
-    # `collector_runs` / `oracle_sources` / `sync_dedup` at microsecond width, and
-    # narrowing it would make new rows sort against old ones on a shared prefix.
-    # `utc_iso()` (seconds) is the format for NEW stamps. See the audit's open
-    # question on unifying stored-stamp precision.
+    # Full precision, unlike `utc_iso()`: stored rows are already at microsecond width, and
+    # narrowing would make new rows sort against old ones on a shared prefix.
     return utc_now().isoformat()
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    """Create the ledger on a caller's connection, before its first transaction."""
+    conn.executescript(_SCHEMA)
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")     # readers don't block the writer
     conn.execute("PRAGMA busy_timeout=5000")    # wait up to 5s for a concurrent writer, don't error
-    conn.executescript(_SCHEMA)
+    init_schema(conn)
     conn.commit()
     return conn
 
@@ -59,14 +53,8 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 class SyncSet:
     """A set-like dedup store backed by one ``namespace`` of ``sync_dedup``.
 
-    Quacks like the plain ``set`` that ``load_state`` used to return — ``id in
-    seen``, ``seen.add(id)``, ``len(seen)``, iteration — so call sites need no
-    changes. But every ``.add()`` is a durable single-row ``INSERT OR IGNORE``:
-    no whole-collection rewrite, and concurrent adds of disjoint IDs never
-    conflict.
-
-    Add-only by design. Dedup sets only ever grow; there is no ``remove`` because
-    dropping a synced ID would silently re-pull (and re-bill) that item.
+    Quacks like a ``set`` (``in``, ``add``, ``len``, iteration); every ``.add()`` is a durable
+    single-row insert. Add-only: dropping a synced ID would re-pull (and re-bill) that item.
     """
 
     def __init__(
@@ -89,13 +77,8 @@ class SyncSet:
         }
 
     def _maybe_seed(self, legacy_json: Path | None) -> None:
-        """One-time import of the legacy JSON blob — then never read it again.
-
-        Guarded by the ``sync_dedup_seeded`` marker so it runs exactly once per
-        namespace. This is what makes the hard cutover safe: if the table were
-        empty and we skipped this, the first sync would think nothing is synced
-        and re-pull the entire archive.
-        """
+        """One-time import of the legacy JSON blob, guarded by the ``sync_dedup_seeded`` marker
+        so it runs once per namespace; skipping it would re-pull the whole archive."""
         seeded = self._conn.execute(
             "SELECT 1 FROM sync_dedup_seeded WHERE namespace=?", (self.namespace,)
         ).fetchone()
@@ -108,15 +91,15 @@ class SyncSet:
             except (json.JSONDecodeError, OSError):
                 ids = []
         now = _now()
-        self._conn.executemany(
-            "INSERT OR IGNORE INTO sync_dedup(namespace, item_id, synced_at) VALUES (?,?,?)",
-            [(self.namespace, str(i), now) for i in ids],
-        )
-        self._conn.execute(
-            "INSERT OR IGNORE INTO sync_dedup_seeded(namespace, seeded_at) VALUES (?,?)",
-            (self.namespace, now),
-        )
-        self._conn.commit()
+        with write_tx(self._conn, site="dedup.seed"):
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO sync_dedup(namespace, item_id, synced_at) VALUES (?,?,?)",
+                [(self.namespace, str(i), now) for i in ids],
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO sync_dedup_seeded(namespace, seeded_at) VALUES (?,?)",
+                (self.namespace, now),
+            )
 
     def __contains__(self, item_id) -> bool:
         return str(item_id) in self._cache
@@ -131,11 +114,11 @@ class SyncSet:
         sid = str(item_id)
         if sid in self._cache:
             return
-        self._conn.execute(
-            "INSERT OR IGNORE INTO sync_dedup(namespace, item_id, synced_at) VALUES (?,?,?)",
-            (self.namespace, sid, _now()),
-        )
-        self._conn.commit()  # checkpoint per-add — crash-safe, replaces the old per-bookmark file rewrite
+        with write_tx(self._conn, site="dedup.add"):   # durable per add: a crash loses nothing
+            self._conn.execute(
+                "INSERT OR IGNORE INTO sync_dedup(namespace, item_id, synced_at) VALUES (?,?,?)",
+                (self.namespace, sid, _now()),
+            )
         self._cache.add(sid)
 
     def update(self, ids) -> None:
@@ -143,11 +126,11 @@ class SyncSet:
         if not new:
             return
         now = _now()
-        self._conn.executemany(
-            "INSERT OR IGNORE INTO sync_dedup(namespace, item_id, synced_at) VALUES (?,?,?)",
-            [(self.namespace, i, now) for i in new],
-        )
-        self._conn.commit()
+        with write_tx(self._conn, site="dedup.update"):
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO sync_dedup(namespace, item_id, synced_at) VALUES (?,?,?)",
+                [(self.namespace, i, now) for i in new],
+            )
         self._cache.update(new)
 
     def close(self) -> None:

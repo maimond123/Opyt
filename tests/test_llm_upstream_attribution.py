@@ -1,8 +1,8 @@
 """Which UPSTREAM served each call gets RECORDED — the audit trail for `provider.sort`.
 
 Why this needs pinning at all: `sort` (latency-ranked) re-ranks against OpenRouter's live
-measurements, so the upstream it picks legitimately differs run to run (Groq on 2026-07-31,
-SambaNova on 2026-08-01). That makes "routing quietly started choosing something slow, or
+measurements, so the upstream it picks legitimately differs run to run (Groq one day,
+SambaNova the next). That makes "routing quietly started choosing something slow, or
 something that grades badly" a change with NO other symptom — the same shape as the Cloudflare
 failure that billed 70 tokens per call and returned zero parseable verdicts.
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 
 from pipeline import llm_client
+from tests.test_llm_client import _with_json_role
 
 
 class _PassthroughBreaker:
@@ -109,25 +110,12 @@ def test_reset_latency_clears_upstreams_too(monkeypatch):
     assert llm_client.upstream_distribution() == {}
 
 
-def test_run_summary_helper_reports_both_views(monkeypatch):
-    """`llm_run_stats` is what adapters spread into their summary; it must carry both keys, and
-    must never raise — a diagnostic that breaks a run summary is worse than no diagnostic."""
-    from pipeline.kb.ingest_common import llm_run_stats
-    _fake_openrouter(monkeypatch, served_by="SambaNova")
-    llm_client.call("vision", system="", user="hi")
-
-    out = llm_run_stats()
-    assert set(out) == {"llm_call_latency", "llm_upstreams"}
-    assert out["llm_upstreams"]["SambaNova"]["count"] == 1
-    assert out["llm_call_latency"]["vision"]["count"] == 1
-
-
 # ── One RUN, not the process lifetime ────────────────────────────────────────
 # `_LATENCY`/`_UPSTREAM_LATENCY` are append-only module globals and `reset_latency()` is called from
 # tests only, so in the long-lived MCP server the second `add_oracle` of a session reported the
 # FIRST one's calls folded into its own distribution. Percentiles cannot be subtracted, so the run
 # boundary is a marker over the raw samples — the same snapshot/diff shape `ingest_x` already uses
-# for `ocr_cascade.stats_snapshot()`.
+# for `chart_read.stats_snapshot()`.
 
 def test_a_marker_excludes_the_previous_runs_samples(monkeypatch):
     """THE defect. Run 1's calls must not appear in run 2's numbers."""
@@ -166,36 +154,12 @@ def test_a_key_absent_at_mark_time_reads_from_zero(monkeypatch):
 
     mark = llm_client.latency_marker()                       # knows only `vision` / `Groq`
     _fake_openrouter(monkeypatch, served_by="SambaNova", elapsed=2.0)
-    llm_client.call("content_quality", system="", user="hi")  # a role the marker never saw
+    new_role = _with_json_role(monkeypatch, "new_role")
+    llm_client.call(new_role, system="", user="hi")          # a role the marker never saw
 
-    assert llm_client.latency_distribution(mark)["content_quality"]["count"] == 1
+    assert llm_client.latency_distribution(mark)["new_role"]["count"] == 1
     assert llm_client.upstream_distribution(mark)["SambaNova"]["count"] == 1
     assert "vision" not in llm_client.latency_distribution(mark)   # fully consumed by run 1
-
-
-def test_an_empty_marker_degrades_to_the_lifetime_view(monkeypatch):
-    """`llm_run_marker()` returns `{}` when the import fails (fail-safe). That has to read as
-    'no offsets', never as 'this run made no calls' — a diagnostic that silently zeroes is worse
-    than one that over-reports."""
-    _fake_openrouter(monkeypatch, served_by="Groq", elapsed=1.0)
-    llm_client.call("vision", system="", user="hi")
-    assert llm_client.latency_distribution({})["vision"]["count"] == 1
-
-
-def test_run_stats_threads_the_marker_through(monkeypatch):
-    """The adapters call `llm_run_stats(llm0)`; both views must honour the same marker."""
-    from pipeline.kb.ingest_common import llm_run_marker, llm_run_stats
-    _fake_openrouter(monkeypatch, served_by="Groq", elapsed=1.0)
-    llm_client.call("vision", system="", user="hi")
-
-    llm0 = llm_run_marker()
-    _fake_openrouter(monkeypatch, served_by="SambaNova", elapsed=2.0)
-    llm_client.call("vision", system="", user="hi")
-
-    out = llm_run_stats(llm0)
-    assert out["llm_call_latency"]["vision"]["count"] == 1
-    assert set(out["llm_upstreams"]) == {"SambaNova"}
-    assert llm_run_stats()["llm_call_latency"]["vision"]["count"] == 2   # lifetime, unchanged
 
 
 def test_a_role_with_no_new_calls_drops_out_rather_than_reporting_zero(monkeypatch):

@@ -1,21 +1,23 @@
 # OPYT — Claude Code plugin
 
 Bundles the OPYT Claude Code integration into one installable unit: the `Opyt` MCP server and its
-thirteen knowledge tools.
+fifteen knowledge tools.
 
 | | tool | what it does |
 |---|---|---|
 | **read** | `search` | route to the most relevant atoms — returns POINTERS, not content |
 | | `open` | follow a pointer and return the stored raw text (call this before citing anything) |
 | | `aggregate` | counts and coverage over a slice of the store |
-| | `sitting` | read one whole topic end to end, in publication order |
+| | `look` | search X, Substack, arXiv, OpenAlex and GitHub now for a few named things; saves nothing |
 | **grow** | `hopper` | save any URL as an atom — the one manual "keep this" path |
-| | `frontier` | queue of recent papers/repos your standing queries pulled in |
+| | `latest` | what arrived since you last looked, and why each item is there |
+| | `watch` | follow a topic, and be told when something new on it appears |
 | | `oracle` | choose who to trust, from people you already curate |
 | | `add_oracle` | add one person as a trusted source |
 | **share** | `share` | publish your store and mint an invite link |
 | | `accept` | register a knowledge base somebody shared with you |
 | | `unshare` | cut off one reader, or everyone plus the served copy |
+| | `reader_view` | the sources behind an answer on one private page, in full; deleted 90 days after it was last opened |
 | **setup** | `onboard` | set up OPYT on this machine — call this first on a fresh install |
 | | `forget` | remove one atom, or end an Oracle subscription |
 
@@ -45,7 +47,7 @@ ephemeral environment. Nothing to pre-install, no GitHub account, and no SSH key
 
 `opyt@latest`, not a version and not a bare `opyt`. A version pin freezes you on the build you
 installed; a bare requirement freezes you too, because `uvx` reuses its cached environment
-without querying the index. Only `@latest` picks up a published fix — measured 2026-09-14 on
+without querying the index. Only `@latest` picks up a published fix — measured on
 uv 0.12.13 at 226 ms per launch against 36 ms for the other two. Offline it runs the cached
 build instead of failing.
 
@@ -79,7 +81,7 @@ install work?". A fresh user starts with no tracked people; you don't inherit th
 `~/.opyt/opyt.db` is created on demand the first time anything opens the store for writing.
 
 Growing a corpus needs **one** account: OpenRouter, which `onboard` walks you through — a browser
-tab, one click, nothing to paste. It pays for the classifier, the image reads, and the embedder.
+tab, one click, nothing to paste. It pays for the classifier and the image reads.
 The key lands in `~/.opyt/.env`. Never paste one into the chat; `onboard` opens a local page for
 that.
 
@@ -92,11 +94,10 @@ normal browser profiles for X.
 Connect X and your Lists, following and likes become people to screen; connect Substack with
 `onboard(source='substack')` and your subscriptions do the same. Neither is needed: name writers
 yourself with `oracle(action='confirm', add_handles=[...])`, which takes any http URL and not just
-an X handle, or watch research topics with `sitting(action='watchlist', add=[...])`. Answer
+an X handle, or follow a topic with `watch`. Answer
 `onboard(source='skip')` to set it up later; setup finishes either way.
 
-Search needs no key on an empty store. Once atoms exist, the default hybrid mode embeds your query
-through OpenRouter, so it wants that one key too; `mode="bm25"` stays keyless.
+Search needs no key at all: it matches the words of each item, whole, and calls no model.
 
 **(Optional) Install the package** to put the `opyt-keys` credential CLI on your PATH:
 
@@ -109,23 +110,19 @@ The MCP tools work without this — it only lights up the `opyt-keys` CLI.
 ## What runs in the background
 
 A resident process, `opyt-worker`, runs the catch-up rails — keeping your trusted sources
-current, running standing research queries, pulling new bookmarks. Install it once with
-`opyt-install-worker` and macOS starts it at login; it runs whether or not a session is open. Each
+current, running standing research queries, pulling new bookmarks. `onboard` installs it on macOS
+and macOS starts it at login; it runs whether or not a session is open. Each
 rail comes due hourly at most (ten minutes for the Oracle refresh) and decides for itself whether
 there is anything to do, so most passes exit immediately.
 
-A rail becomes active when something gives it work — you consent during `onboard`, you share your
-knowledge base, a sitting emits a standing question. A fresh install schedules nothing.
+A rail becomes active when something gives it work — you connect a platform during `onboard`,
+you confirm an Oracle, you share your knowledge base, you follow a topic. A fresh
+install schedules nothing, so nothing runs and nothing is spent.
 
-Some of those rails spend metered credit. Others read your logged-in browser session. **Each one
-carries its own consent marker, and a fresh install has none**, so on first launch every one of
-them declines and reports what it would need. Consent is per-rail on purpose: opting into one
-loop never opts you into another with a different cost shape.
-
-`onboard` is where you grant them. Its explicit X-connect action opens OPYT's separate persistent
-profile and never scans your normal browser profiles. Measured on a cold install 2026-09-07: all
-eight rails run under the worker and every one exits on its own guard — three for want of consent,
-the rest on an empty store or a model preflight. Nothing is spent.
+Nothing asks first. Connecting X or Substack imports the posts you saved there and keeps them
+current; confirming an Oracle keeps that person current. Some of that spends model credit, and
+some of it reads the session you connected. `onboard`'s X-connect action opens OPYT's separate
+persistent profile and never scans your normal browser profiles.
 
 ## Notes / known edges
 
@@ -133,10 +130,9 @@ the rest on an empty store or a model preflight. Nothing is spent.
   `uvx` re-resolves it against the index on every server start, so a published fix reaches an
   existing install on its next launch with nothing to re-run. (A bare `opyt` would not do this —
   uvx reuses its cached environment for a bare requirement and never checks for newer builds.
-  Offline, `@latest` falls back to the cached copy rather than failing to start.) This file
-  carried an exact pin until 2026-09-14, which meant a published fix reached nobody — and once
-  drifted from `pyproject.toml`, named a version PyPI did not have, failing the install
-  outright, which is exactly what happened between 2026-08-30 and 2026-08-31.
+  Offline, `@latest` falls back to the cached copy rather than failing to start.) An exact pin
+  would mean a published fix reaches nobody, and a pin that drifts from `pyproject.toml` can name
+  a version PyPI does not have, failing the install outright.
 
 - **A pre-release does not gate itself here.** pip and uv skip pre-releases only when a stable
   version also exists. While every published version is a pre-release, a bare `uvx --from opyt opyt-mcp`

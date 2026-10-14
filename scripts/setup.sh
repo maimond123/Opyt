@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
 # scripts/setup.sh
-# Bootstrap a CONTRIBUTOR checkout of OPYT. Run once after cloning the repo.
+# Bootstrap a contributor checkout of OPYT. Run once after cloning the repo.
 # Usage: bash scripts/setup.sh
 #
-# This is NOT the install path for a user. Users run `uvx --from opyt@latest opyt-mcp`,
-# where uv supplies both the interpreter and the package. This script instead assumes a
-# `python3` that ALREADY satisfies requires-python >= 3.10 and does not check it — and a stock
-# macOS `python3` is 3.9.6, as is the one `xcode-select --install` delivers. It also installs
-# with `--config-settings editable_mode=compat`, which forces source builds of dependencies
-# that ship wheels; `cryptography` on an Intel Mac then needs a Rust toolchain and system
-# OpenSSL. Neither hazard reaches a uvx user. Both are on anyone sent down this route.
+# Not the user install path (that is `uvx --from opyt@latest opyt-mcp`). Assumes, without
+# checking, a `python3` >= 3.10; stock macOS ships 3.9. `editable_mode=compat` may force source
+# builds (e.g. `cryptography` on an Intel Mac needs Rust and OpenSSL).
 
 set -euo pipefail
 
@@ -65,4 +61,4 @@ echo "Next steps:"
 echo "  1. Fill in credentials in .env (OPENROUTER_API_KEY + TWITTERAPI_KEY required)"
 echo "  2. Review ~/.opyt/settings.yaml (created from config/settings.example.yaml on first run)"
 echo "  3. Log into x.com in Chrome — bookmarks sync from your own session (no key/OAuth)"
-echo "  4. Test manually: python -m pipeline.kb.bookmark_catchup --once --force"
+echo "  4. Test manually: python -m pipeline.worker.child pipeline.background:run"

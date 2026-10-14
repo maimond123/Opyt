@@ -10,15 +10,24 @@ substitution is the socket, and both installs' homes are kept apart the way two 
 """
 from __future__ import annotations
 
+from pipeline.worker.home import LOCAL_HOME_ID
+
 import re
+import sqlite3
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from opyt_core import config, kb as kb_entry, kb_remote, keys
-from pipeline.kb import peers, push_catchup
-from service import store, uploads
+from opyt_core import keys, service_http
+from pipeline.kb import schema
+from pipeline.retrieval import reads as kb_entry
+from pipeline.retrieval import peers, served
+from pipeline.sharing import account, client, publishing, push_gate
+from pipeline.timeparse import utc_now
+from pipeline.worker.registry import LINE, SCRAPERS
+from service import accounts, db, publications, tokens, uploads
+from tests.kb.test_export import _add
 from tests.opyt_core.conftest import URL
 
 
@@ -42,46 +51,48 @@ def _tools():
 
 @pytest.fixture()
 def owner(publisher, monkeypatch):
-    """The SHARING side: a real store, `share_tools`' transport pointed at the service, and NO
-    service token — so the first `share` has to register, exactly as a new user's does."""
-    import mcp_server.share_tools as st
-
+    """The SHARING side: a real store, the service transport `publisher` already points at the
+    service, and NO service token — so the first `share` has to register, exactly as a new user's
+    does."""
     monkeypatch.delenv("OPYT_SERVICE_TOKEN", raising=False)
     creds = {}
     monkeypatch.setattr("pipeline.credentials.get_credential",
                         lambda service: creds.get("opyt_service"))
+    # An empty value is no token, as the real credential read takes it (`account.drop_token`).
     monkeypatch.setattr(keys, "set_key",
-                        lambda name, value: creds.__setitem__("opyt_service", value))
-
-    def _shim(verb):
-        def call(url, **kw):
-            kw.pop("timeout", None)
-            with publisher.on_service():
-                return verb(url, **kw)
-        return call
-
-    monkeypatch.setattr(st, "requests", SimpleNamespace(
-        get=_shim(publisher.svc.client.get), post=_shim(publisher.svc.client.post)))
-    # `share` only QUEUES the push rail; `run_worker_pass` below stands in for the resident
-    # worker that launches it. Nothing about the rail is stubbed — the queue and the publish are
-    # both real, and the tests below hold them apart so a broken hand-off cannot hide.
+                        lambda name, value: creds.__setitem__("opyt_service", value or None))
+    # `share` only OWES a push and wakes the scrapers process; `run_worker_pass` below stands in
+    # for that process's publishing loop. Nothing about the pass is stubbed — the wake, the owed
+    # marker and the publish are all real, and the tests below hold them apart so a broken
+    # hand-off cannot hide.
     return SimpleNamespace(t=_tools(), publisher=publisher, creds=creds)
 
 
 def _queued_push(home) -> object | None:
-    """The durable push job `share` left behind, as the local worker would find it."""
-    from pipeline.kb.rail_jobs import LOCAL_HOME_ID, RailJobStore
-    return RailJobStore(home / "rail_jobs.db").get(LOCAL_HOME_ID, "push_catchup")
+    """The durable wake `share` left behind (the scrapers process's row), as the local worker
+    would find it."""
+    from pipeline.worker.job_queue import RailJobStore
+    return RailJobStore(home / "rail_jobs.db").get(LOCAL_HOME_ID, SCRAPERS)
+
+
+def _run(src, unit) -> dict:
+    fetched = src.fetch(None, unit, None)
+    src.record(None, unit, fetched)
+    return fetched.result
 
 
 def run_worker_pass(owner) -> dict:
-    """Run the queued rail exactly as `rail_worker.RAILS['push_catchup']` would — no `--force`.
+    """Run the publishing pass the woken scrapers process would: the one its source says is owed
+    now, with no override.
 
-    The command carries no override, so this also proves the gate publishes a first share on its
-    own "never published" branch rather than on a word the tool passed it.
+    The pass carries no override, so this also proves the gate publishes a first share on the
+    push the share owed rather than on a word the tool passed it.
     """
-    assert _queued_push(owner.publisher.home) is not None, "share queued no push job"
-    return push_catchup.run_push_catchup()
+    assert _queued_push(owner.publisher.home) is not None, "share woke nothing"
+    src = publishing.Publications()
+    unit = src.next_unit(None, utc_now())
+    assert unit is not None, "share owed no publishing pass"
+    return _run(src, unit)
 
 
 # ── share ────────────────────────────────────────────────────────────────────────
@@ -108,13 +119,13 @@ def test_the_preview_writes_nothing_and_registers_nothing(owner):
 
     assert owner.creds == {}
     with owner.publisher.on_service():
-        assert store.stored_bytes() == [
-            r for r in store.stored_bytes() if r["owner"] == owner.publisher.svc.owner]
+        assert publications.stored_bytes() == [
+            r for r in publications.stored_bytes() if r["owner"] == owner.publisher.svc.owner]
 
 
 def test_a_first_share_registers_queues_the_push_and_returns_a_link(owner):
-    """The whole ask moment, and nobody opened a shell. The token is PERSISTED, so the push rail
-    can find it whenever the worker gets to it — including with no MCP session open at all."""
+    """The whole ask moment, and nobody opened a shell. The token is PERSISTED, so the publishing
+    pass can find it whenever the worker gets to it — including with no MCP session open at all."""
     out = owner.t.share(confirm=True, as_name="David")
 
     assert out["status"] == "shared"
@@ -123,14 +134,16 @@ def test_a_first_share_registers_queues_the_push_and_returns_a_link(owner):
     assert owner.creds["opyt_service"]
     job = _queued_push(owner.publisher.home)
     assert job.due_at <= time.time() and job.started_at is None
+    assert push_gate.fast_since() is not None      # passes run every five minutes for an hour
     with owner.publisher.on_service():
-        assert store.owner_label(out["owner"]) == "David"
-        # Queued is not published: the export lands when the worker runs the rail, not before.
+        assert tokens.owner_label(out["owner"]) == "David"
+        # Queued is not published: the export lands when the publishing pass runs, not before.
         assert not uploads.export_path(out["owner"]).exists()
 
 
-def test_the_queued_rail_is_what_publishes_the_first_share(owner):
-    """The hand-off end to end. `share` writes a job row; the rail's own gate does the upload."""
+def test_the_owed_pass_is_what_publishes_the_first_share(owner):
+    """The hand-off end to end. `share` owes a push and wakes the process; the pass's own gate does
+    the upload."""
     out = owner.t.share(confirm=True, as_name="David")
 
     assert run_worker_pass(owner)["status"] == "ok"
@@ -139,9 +152,9 @@ def test_the_queued_rail_is_what_publishes_the_first_share(owner):
         assert uploads.export_path(out["owner"]).exists()
 
 
-def test_the_queued_rail_name_is_one_the_worker_can_actually_launch(owner):
+def test_the_woken_job_is_one_the_worker_can_actually_launch(owner):
     """A name outside the registry is a row nothing ever dispatches, and nothing says so."""
-    from pipeline.kb.rail_worker import RAILS
+    from pipeline.worker.registry import RAILS
 
     owner.t.share(confirm=True, as_name="David")
 
@@ -151,10 +164,12 @@ def test_the_queued_rail_name_is_one_the_worker_can_actually_launch(owner):
 def test_a_failed_grant_queues_nothing(owner, monkeypatch):
     """Order: the grant is durable before the push is asked for. A share nobody can accept must
     not leave an upload obligation behind for a reader who was never invited."""
-    import mcp_server.share_tools as st
-
     owner.t.share(confirm=True, as_name="David")
-    monkeypatch.setattr(st, "_call", lambda *a, **kw: {"ok": False, "message": "service down"})
+
+    def down(*a, **kw):
+        raise client.Failed("unreachable", "service down")
+
+    monkeypatch.setattr(client, "grant", down)
 
     assert owner.t.share(confirm=True, for_whom="Leo")["status"] == "grant_failed"
     assert _queued_push(owner.publisher.home).due_at <= time.time()
@@ -191,15 +206,125 @@ def test_an_empty_knowledge_base_says_so_rather_than_sharing_nothing(owner, monk
 
 def test_a_dead_service_is_a_sentence_not_a_raise(owner, monkeypatch):
     """P3 at the tool boundary: a tool call must never raise, whatever the network did."""
-    import mcp_server.share_tools as st
-
     def dead(*a, **kw):
-        raise st.RequestException("connection refused")
+        raise service_http.RequestException("connection refused")
 
-    monkeypatch.setattr(st.requests, "post", dead)
+    monkeypatch.setattr(service_http.requests, "post", dead)
     out = owner.t.share(confirm=True, as_name="David")
     assert out["status"] == "register_failed"
     assert "could not reach" in out["message"]
+
+
+# ── share(to="agent"): a link for the user's own agent ───────────────────────────
+#
+# An agent calls web addresses, not Opyt's tools, so what it does with the link is one plain
+# POST to the service. These hold that the yes is informed (the preview says what an agent may
+# do, and mints nothing) and that the confirm's link buys an agent's key and not a reader's.
+
+def _grants_minted(owner) -> int:
+    with owner.publisher.on_service():
+        conn = db.connect()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM grant_codes").fetchone()[0]
+        finally:
+            conn.close()
+
+
+def _redeem_as_an_agent_would(owner, invite_link: str):
+    """The one call an agent makes with its link: the code after `#`, POSTed to the service."""
+    code = re.search(r"#([A-Za-z0-9]{43})", invite_link).group(1)
+    with owner.publisher.on_service():
+        return owner.publisher.svc.client.post("/v1/redeem", json={"code": code})
+
+
+def test_an_agent_preview_says_what_an_agent_may_do_and_mints_nothing(owner):
+    owner.t.share(confirm=True, as_name="David")
+    before = _grants_minted(owner)
+
+    out = owner.t.share(to="agent", for_whom="Instinct")
+
+    assert out["status"] == "preview"
+    said = " ".join(out["consent"])
+    for may in ("acts as the user", "save links", "remove items", "add people to follow",
+                "invite or cut off readers", "until it is cut off with `unshare`"):
+        assert may in said, may
+    assert "no way to share part" in said            # still the whole library, uploaded
+    assert "Anyone you send a link to" not in said   # the sentence about a person
+    assert _grants_minted(owner) == before
+
+
+def test_a_persons_preview_says_nothing_about_agents(owner):
+    said = " ".join(owner.t.share()["consent"])
+    assert "agent" not in said and "Anyone you send a link to" in said
+
+
+def test_a_persons_preview_hands_the_host_the_question_of_who_it_is_for(owner):
+    """Nothing told the host an agent or the user's own claude.ai needs something else, so a
+    reader's link went to an agent (2026-10-13). Only the default preview asks."""
+    asks = owner.t.share()["who_is_it_for"]
+    assert "to='agent'" in asks and "to='connector'" in asks
+    assert "who_is_it_for" not in owner.t.share(to="agent", for_whom="Instinct")
+
+
+def test_a_confirmed_agent_share_is_a_link_that_buys_an_agent_key_once(owner):
+    first = owner.t.share(confirm=True, as_name="David")
+    out = owner.t.share(confirm=True, for_whom="Instinct", to="agent")
+
+    assert out["status"] == "shared" and out["owner"] == first["owner"]
+    assert out["invite"].startswith("https://useopyt.com/invite#")
+    assert "for their agent" in out["message"]
+    assert f"POST {URL}/v1/redeem" in out["message"]
+
+    got = _redeem_as_an_agent_would(owner, out["invite"]).json()
+    assert got["role"] == "agent" and got["owner"] == first["owner"]
+    with owner.publisher.on_service():
+        row = tokens.resolve_token(got["token"])
+    assert (row["role"], row["label"]) == ("agent", "Instinct")
+    assert _redeem_as_an_agent_would(owner, out["invite"]).status_code == 404
+
+    # The key reads the library once the owed pass has published it.
+    assert run_worker_pass(owner)["status"] == "ok"
+    with owner.publisher.on_service():
+        found = owner.publisher.svc.client.post(
+            f"/v1/kb/{got['owner']}/search", json={"query": "agent"},
+            headers={"Authorization": f"Bearer {got['token']}"})
+    assert found.status_code == 200 and found.json()["hits"]
+
+
+def _line_asked(home) -> object | None:
+    """The line job's row, if anything has made this install hold or ask for its line."""
+    from pipeline.worker.job_queue import RailJobStore
+    return RailJobStore(home / "rail_jobs.db").get(LOCAL_HOME_ID, LINE)
+
+
+def test_an_agent_invite_asks_for_the_line_at_once_and_a_persons_does_not(owner):
+    """An agent acts through the line. A library with no writer looks for one only hourly, so the
+    invite itself has to ask, or the agent's first hour of calls would wait for nothing."""
+    owner.t.share(confirm=True, as_name="David", for_whom="Leo")
+    assert _line_asked(owner.publisher.home) is None
+
+    before = time.time()
+    owner.t.share(confirm=True, for_whom="Instinct", to="agent")
+    assert _line_asked(owner.publisher.home).due_at <= time.time()
+    assert _line_asked(owner.publisher.home).due_at >= before - 1
+
+
+def test_a_persons_invite_from_the_same_install_is_still_a_readers(owner):
+    owner.t.share(confirm=True, as_name="David")
+    owner.t.share(confirm=True, for_whom="Instinct", to="agent")
+
+    got = _redeem_as_an_agent_would(
+        owner, owner.t.share(confirm=True, for_whom="Leo")["invite"]).json()
+    assert "role" not in got
+    with owner.publisher.on_service():
+        assert tokens.resolve_token(got["token"])["role"] == "reader"
+
+
+def test_a_first_share_for_an_agent_still_asks_for_a_name_before_minting(owner):
+    out = owner.t.share(confirm=True, to="agent")
+
+    assert out["status"] == "needs_name"
+    assert owner.creds == {}
 
 
 # ── accept ───────────────────────────────────────────────────────────────────────
@@ -207,30 +332,13 @@ def test_a_dead_service_is_a_sentence_not_a_raise(owner, monkeypatch):
 @pytest.fixture()
 def reader(owner, tmp_path, monkeypatch):
     """The ACCEPTING side: a separate install with its own home and its own peers registry, with
-    `share_tools`' and `kb_remote`'s transports both pointed at the same service."""
-    import mcp_server.share_tools as st
-
+    the same service transport as the owner's, which `publisher` already points at the service."""
     invite = owner.t.share(confirm=True, as_name="David")["invite"]
     run_worker_pass(owner)          # the owner's worker publishes before anyone can read
     reader_home = tmp_path / "reader"
     reader_home.mkdir()
     monkeypatch.setenv("OPYT_HOME", str(reader_home))
-
-    def _shim(verb):
-        def call(url, **kw):
-            kw.pop("timeout", None)
-            with owner.publisher.on_service():
-                return verb(url, **kw)
-        return call
-
-    client = owner.publisher.svc.client
-    monkeypatch.setattr(kb_remote, "requests",
-                        SimpleNamespace(post=_shim(client.post), get=_shim(client.get)))
-    monkeypatch.setattr(st, "requests",
-                        SimpleNamespace(post=_shim(client.post), get=_shim(client.get)))
-    kb_remote._META_CACHE.clear()
     yield SimpleNamespace(t=owner.t, invite=invite, home=reader_home, owner=owner)
-    kb_remote._META_CACHE.clear()
 
 
 @pytest.mark.parametrize("form", ["link", "fragment", "bare"])
@@ -258,8 +366,6 @@ def test_the_accepted_name_is_the_one_that_reads(reader, monkeypatch):
     """The whole point, end to end: the second person's next question draws on the first
     person's corpus, attributed, under a name their own install resolves."""
     out = reader.t.accept(reader.invite)
-    monkeypatch.setattr(kb_remote, "embedder_from_meta",
-                        lambda meta, **kw: reader.owner.publisher.emb)
 
     hits = kb_entry.run_kb_search("agent framework", kb=out["kb"])["hits"]
     assert hits
@@ -318,25 +424,23 @@ def test_a_spent_code_is_a_sentence(reader):
 
 def test_a_malformed_successful_service_body_is_a_failure_envelope(owner, monkeypatch):
     """JSON decoding belongs to the shared transport boundary, not each decorated tool."""
-    import mcp_server.share_tools as st
-
     class _UnreadableResponse:
         status_code = 200
 
         def json(self):
             raise ValueError("not JSON")
 
-    monkeypatch.setattr(st.requests, "post", lambda *args, **kwargs: _UnreadableResponse())
+    monkeypatch.setattr(service_http.requests, "post", lambda *args, **kwargs: _UnreadableResponse())
 
-    res = st._call("post", "https://service.test/v1/register")
-    assert res["ok"] is False
+    with pytest.raises(client.Failed):
+        client.register("https://service.test", None)
     assert owner.t.share(confirm=True, as_name="David")["status"] == "register_failed"
 
 
 @pytest.mark.parametrize(
     ("invite", "endpoint"),
     [
-        ("https://useopyt.com/invite#" + "a" * 43, config.DEFAULT_SERVICE_URL),
+        ("https://useopyt.com/invite#" + "a" * 43, account.DEFAULT_SERVICE_URL),
         ("https://self-hosted.test:8443/invite#" + "a" * 43,
          "https://self-hosted.test:8443"),
         ("https://notuseopyt.com/invite#" + "a" * 43, "https://notuseopyt.com"),
@@ -344,27 +448,25 @@ def test_a_malformed_successful_service_body_is_a_failure_envelope(owner, monkey
 )
 def test_accept_routes_full_invites_by_their_exact_host(reader, monkeypatch, invite, endpoint):
     """A full link names its issuer; only the public host maps to the public API."""
-    import mcp_server.share_tools as st
-
     called = []
 
     def _call(method, url, **kwargs):
         called.append((method, url))
         return {"ok": True, "owner": "owner", "suggested_name": "Owner", "token": "reader"}
 
-    monkeypatch.setattr(st, "_call", _call)
+    monkeypatch.setattr(service_http, "request", _call)
 
     assert reader.t.accept(invite, name="routed")["status"] == "accepted"
     assert called == [("post", f"{endpoint}/v1/redeem")]
 
 
 def test_the_install_id_is_minted_once_and_reused(reader, monkeypatch):
-    """`redeem.get_install_id` — the only thing left in that module, and `accept` is its only
+    """`account.install_id` — moved from `opyt_core/redeem.py`, and `accept` is its only
     caller. The id is minted on first use and REUSED forever after, so the service can count
     distinct installations without an account behind it (TELEMETRY.md: `tokens.install_id`).
     Two accepts on one install must therefore produce two tokens carrying the SAME id.
 
-    It used to reach `get_install_id` through `opyt-redeem`'s `main()`, and moved here on
+    It used to reach the function through `opyt-redeem`'s `main()`, and moved here on
     2026-09-05 when that command was deleted. `accept` is the only path to the function now, and
     this file is where `accept` is tested.
 
@@ -388,8 +490,26 @@ def test_the_install_id_is_minted_once_and_reused(reader, monkeypatch):
     # The routing key from the accept, not `svc.owner`: the `owner` fixture holds NO service
     # token, so its first `share` REGISTERS a new owner rather than reusing the seeded one.
     with reader.owner.publisher.on_service():
-        rows = store.list_tokens(first["owner"])
+        rows = tokens.list_tokens(first["owner"])
     assert len([t for t in rows if t["install_id"] == iid]) == 2
+
+
+def test_accept_refuses_the_reserved_name_without_spending_the_invite(reader):
+    """B3. `kb="me"` is how this install names its own store, so `peers.add` refuses it — but it
+    did so AFTER the redeem had spent the one-time code, and raised instead of answering. The name
+    is decided first now, so the same invite still works."""
+    out = reader.t.accept(reader.invite, name="me")
+    assert out["status"] == "reserved_name"
+
+    assert reader.t.accept(reader.invite, name="david")["status"] == "accepted"
+
+
+def test_an_owner_who_calls_themselves_me_is_registered_under_their_key(owner):
+    """The same collision from the other side: the suggested name is the owner's own label."""
+    invite = owner.t.share(confirm=True, as_name="me")["invite"]
+    out = owner.t.accept(invite)
+    assert out["status"] == "accepted"
+    assert out["kb"] == out["owner"] != "me"
 
 
 def test_something_that_is_not_an_invite_says_so(reader):
@@ -415,10 +535,10 @@ def test_unshare_preview_names_the_reader_count_and_changes_nothing(owner):
     assert out["status"] == "preview"
     assert out["readers"] == 1
     assert "Mia" in out["reader_labels"]
-    assert any("deleted from the service" in c for c in out["consent"])
+    assert any("Everything Opyt's server holds for it is deleted" in c for c in out["consent"])
     with owner.publisher.on_service():
         assert uploads.export_path(
-            store.resolve_token(owner.creds["opyt_service"])["owner"]).exists()
+            tokens.resolve_token(owner.creds["opyt_service"])["owner"]).exists()
 
 
 def test_unshare_confirm_empties_the_token_list_and_deletes_the_copy(owner):
@@ -434,9 +554,81 @@ def test_unshare_confirm_empties_the_token_list_and_deletes_the_copy(owner):
     assert done["status"] == "unshared"
     assert done["readers_revoked"] == 1
     assert done["export_deleted"] is True
+    assert "Google account" in done["message"] and "this computer" in done["message"]
+    assert owner.creds["opyt_service"] is None, "the install still holds its owner token"
     with owner.publisher.on_service():
         assert not uploads.export_path(out["owner"]).exists()
-        assert [t for t in store.list_tokens(out["owner"]) if t["role"] == "reader"] == []
+        assert [t for t in tokens.list_tokens(out["owner"]) if t["role"] == "reader"] == []
+
+
+def test_an_invite_nobody_accepted_dies_with_unshare(owner):
+    """B1. The everyone-preview promises "every invite already sent stops working". A reader
+    token is a row unpublish deletes, but an invite sent and not yet accepted is a code row it
+    used to leave alone — so the invite still redeemed afterwards, and its reader read again the
+    moment the owner re-shared."""
+    owner.t.share(confirm=True, as_name="David")
+    run_worker_pass(owner)
+    pending = owner.t.share(confirm=True, for_whom="Leo")["invite"]
+    assert owner.t.unshare(confirm=True)["status"] == "unshared"
+
+    assert owner.t.accept(pending, name="leo")["status"] == "code_unavailable"
+
+
+def test_re_sharing_after_unshare_publishes_again(owner):
+    """B2, then the deletion. `unshare` deletes the registration with the copy, drops the
+    install's token and clears the watermark, so sharing again starts over: it asks for a name,
+    registers anew, and the share owes the push that publishes it. Without that debt a re-shared
+    knowledge base was never served again and every new reader met "has not arrived yet"."""
+    owner.t.share(confirm=True, as_name="David")
+    assert run_worker_pass(owner)["status"] == "ok"
+    assert owner.t.unshare(confirm=True)["status"] == "unshared"
+
+    assert owner.t.share(confirm=True, for_whom="Leo")["status"] == "needs_name"
+    assert owner.t.share(confirm=True, as_name="David", for_whom="Leo")["status"] == "shared"
+    assert run_worker_pass(owner)["status"] == "ok"
+    with owner.publisher.on_service():
+        assert uploads.export_path(
+            tokens.resolve_token(owner.creds["opyt_service"])["owner"]).exists()
+
+
+def test_an_unshare_before_the_owed_push_cancels_it(owner):
+    """The other half of B2's fix: a share owes a push, and an unshare that lands before the pass
+    runs must not leave that debt behind to re-publish what the owner just withdrew. With the
+    token gone, no pass is due at all, not even the hourly one."""
+    owner.t.share(confirm=True, as_name="David")
+    assert run_worker_pass(owner)["status"] == "ok"
+    owner.t.share(confirm=True, for_whom="Leo")
+    assert owner.t.unshare(confirm=True)["status"] == "unshared"
+
+    src, now = publishing.Publications(), utc_now()
+    assert src.next_unit(None, now) is None, "the cancelled push is still owed"
+    assert src.next_due(None, now) is None
+
+
+# ── share(refresh=True): update the copy now ─────────────────────────────────────
+
+def test_refresh_on_an_install_that_never_shared_says_so(owner):
+    assert owner.t.share(refresh=True)["status"] == "not_shared"
+
+
+def test_refresh_uploads_a_changed_library_at_once_and_nothing_when_unchanged(owner):
+    out = owner.t.share(confirm=True, as_name="David")
+    assert run_worker_pass(owner)["status"] == "ok"
+    assert owner.t.share(refresh=True)["status"] == "no_change"
+
+    conn = schema.connect()
+    _add(conn, "github:refreshed/now", "github", "artifact",
+         "github:refreshed", ["ai-agents"], "a repo saved a moment ago")
+    conn.close()
+    assert owner.t.share(refresh=True)["status"] == "refreshing"
+    assert run_worker_pass(owner)["status"] == "ok"        # due now, not at the next pass
+    with owner.publisher.on_service():
+        path = uploads.export_path(out["owner"])
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        assert conn.execute("SELECT 1 FROM atoms WHERE atom_id = 'github:refreshed/now'").fetchone()
+    finally:
+        conn.close()
 
 
 def test_unshare_on_an_install_that_never_shared_says_so(owner):
@@ -464,7 +656,7 @@ def _grant_and_redeem(owner, label, install):
 
 def _readers(owner, key):
     with owner.publisher.on_service():
-        return [t for t in store.list_tokens(key) if t["role"] == "reader"]
+        return [t for t in tokens.list_tokens(key) if t["role"] == "reader"]
 
 
 def test_unshare_one_reader_leaves_the_copy_and_the_others_alone(owner):
@@ -565,7 +757,7 @@ def test_a_short_string_never_matches_a_hash_prefix(owner):
     out = owner.t.share(confirm=True, as_name="David")
     _grant_and_redeem(owner, "Leo", "leo")
     with owner.publisher.on_service():
-        sha = [t for t in store.list_tokens(out["owner"]) if t["role"] == "reader"][0]["token_sha256"]
+        sha = [t for t in tokens.list_tokens(out["owner"]) if t["role"] == "reader"][0]["token_sha256"]
 
     assert owner.t.unshare(reader=sha[:4], confirm=True)["status"] == "no_such_reader"
     assert owner.t.unshare(reader=sha[:8], confirm=True)["status"] == "reader_revoked"
@@ -578,3 +770,113 @@ def test_revoking_somebody_already_gone_is_not_an_error(owner):
     assert owner.t.unshare(reader="Leo", confirm=True)["status"] == "reader_revoked"
     again = owner.t.unshare(reader="Leo", confirm=True)
     assert again["status"] == "no_such_reader"      # the row is gone, so the name resolves to nobody
+
+
+# ── unshare and an agent: listed with the readers, marked, cut off by name ───────
+
+def _agent(owner, label) -> str:
+    """An agent holding a key: this install mints the agent invite, the agent redeems it."""
+    link = owner.t.share(confirm=True, for_whom=label, to="agent")["invite"]
+    return _redeem_as_an_agent_would(owner, link).json()["token"]
+
+
+def _holds_a_key(owner, token) -> bool:
+    with owner.publisher.on_service():
+        return tokens.resolve_token(token) is not None
+
+
+def test_an_agent_is_listed_marked_and_cut_off_by_name(owner):
+    out = owner.t.share(confirm=True, as_name="David")
+    _grant_and_redeem(owner, "Leo", "leo")
+    agent = _agent(owner, "Instinct")
+
+    miss = owner.t.unshare(reader="nobody by this name")
+    assert miss["status"] == "no_such_reader"
+    assert {r["label"]: r.get("agent", False) for r in miss["readers"]} == {
+        "Leo": False, "Instinct": True}
+
+    pre = owner.t.unshare(reader="instinct")
+    assert pre["status"] == "preview" and pre["scope"] == "one_reader" and pre["agent"] is True
+    assert pre["reader_label"] == "Instinct" and pre["readers_remaining"] == 1
+    assert "can no longer search this knowledge base or change it" in " ".join(pre["consent"])
+    assert _holds_a_key(owner, agent), "a preview revokes nothing"
+
+    done = owner.t.unshare(reader="Instinct", confirm=True)
+    assert done["status"] == "reader_revoked" and done["agent"] is True
+    assert done["readers_remaining"] == 1 and "change it" in done["message"]
+    assert not _holds_a_key(owner, agent)
+    assert [t["label"] for t in _readers(owner, out["owner"])] == ["Leo"]
+    assert owner.t.unshare(reader="Instinct", confirm=True)["status"] == "no_such_reader"
+
+
+def test_a_reader_and_an_agent_with_one_name_refuse_rather_than_pick(owner):
+    """What happens when an agent that read with a reader's key is given an agent's key under
+    the same name: the name picks neither, and the refusal marks which is which."""
+    out = owner.t.share(confirm=True, as_name="David")
+    _grant_and_redeem(owner, "Instinct", "its-reader-key")
+    agent = _agent(owner, "Instinct")
+
+    got = owner.t.unshare(reader="Instinct", confirm=True)
+    assert got["status"] == "ambiguous_reader"
+    assert sorted(r.get("agent", False) for r in got["readers"]) == [False, True]
+    assert _holds_a_key(owner, agent) and len(_readers(owner, out["owner"])) == 1
+
+    its_id = next(r["id"] for r in got["readers"] if r.get("agent"))
+    assert owner.t.unshare(reader=its_id, confirm=True)["status"] == "reader_revoked"
+    assert not _holds_a_key(owner, agent) and len(_readers(owner, out["owner"])) == 1
+
+
+def test_unsharing_everything_counts_an_agent_and_ends_its_key(owner):
+    owner.t.share(confirm=True, as_name="David")
+    run_worker_pass(owner)
+    _grant_and_redeem(owner, "Leo", "leo")
+    agent = _agent(owner, "Instinct")
+
+    pre = owner.t.unshare()
+    assert pre["readers"] == 2 and sorted(pre["reader_labels"]) == ["Instinct", "Leo"]
+
+    done = owner.t.unshare(confirm=True)
+    assert done["status"] == "unshared" and done["readers_revoked"] == 2
+    assert not _holds_a_key(owner, agent)
+
+
+
+# ── the user's own claude.ai and ChatGPT: listed with the readers, disconnected alone ──
+
+def _connect_google(owner, key, sub="google-123"):
+    """A Google account linked to this library, as an approved sign-in leaves it."""
+    with owner.publisher.on_service():
+        conn = db.connect()
+        conn.execute("INSERT INTO accounts (google_sub, owner) VALUES (?, ?)", (sub, key))
+        conn.commit()
+        conn.close()
+
+
+def test_the_google_connection_is_listed_with_the_readers_and_disconnected_alone(owner):
+    out = owner.t.share(confirm=True, as_name="David")
+    _grant_and_redeem(owner, "Leo", "leo")
+    _connect_google(owner, out["owner"])
+
+    everyone = owner.t.unshare()
+    assert [w["id"] for w in everyone["who_has_access"]][-1] == "google"
+    miss = owner.t.unshare(reader="nobody by this name")
+    assert miss["readers"][-1]["id"] == "google" and "reader='google'" in miss["message"]
+
+    pre = owner.t.unshare(reader="google")
+    assert pre["status"] == "preview" and pre["scope"] == "google_account"
+    with owner.publisher.on_service():
+        assert accounts.owner_of("google-123") == out["owner"], "a preview disconnects nothing"
+
+    assert owner.t.unshare(reader="Google", confirm=True)["status"] == "disconnected"
+    with owner.publisher.on_service():
+        assert accounts.owner_of("google-123") is None
+    assert [t["label"] for t in _readers(owner, out["owner"])] == ["Leo"]     # the reader stays
+    assert owner.t.unshare(reader="google", confirm=True)["status"] == "no_such_reader"
+
+
+def test_a_reader_the_user_called_google_is_still_cut_off_by_that_name(owner):
+    out = owner.t.share(confirm=True, as_name="David")
+    _grant_and_redeem(owner, "Google", "g")
+    _connect_google(owner, out["owner"])
+    assert owner.t.unshare(reader="google")["scope"] == "one_reader"
+    assert owner.t.unshare(reader="google-account")["scope"] == "google_account"

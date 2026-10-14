@@ -1,0 +1,389 @@
+/* service/pages/page.css — a page of sources, in the website's look (website/style.css): its
+   tokens, its fonts, its tile, its one brand color. Light is the default; dark only by the toggle,
+   stored under the site's own key, `opyt-theme`. */
+:root {
+  --bg: #f4f4f1;
+  --surface: #ebeae5;
+  --panel: #fafaf8;
+  --text: #161616;
+  --body: #222220;
+  --muted: #5c5c58;
+  --faint: #8b8b86;
+  --accent: #dd3418;
+  --line: #e2e1dc;
+  --card: #ffffff;
+  --shadow-sm: 0 0 0 1px #0000000d, 0 1px 2px #0000000f;
+  --shadow-win: 0 0 0 1px #0000000f, 0 1px 2px -1px #0000000a, 0 4px 6px -1px #0000000f,
+                0 14px 32px #0000000f;
+  --radius: 14px;
+  --nav-bg: #ffffffdb;
+  /* The reading face: the default of the faces in `render._FONTS`. A reader picks another from
+     the bar's font menu; why there is a menu is written beside that list. */
+  --read: "EB Garamond", Garamond, Georgia, serif;
+  --tick: #d6d5cf;
+  --tick-1: #a3a29c;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --display: "Martian Mono", ui-monospace, monospace;
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  --bg: #0b0b0b;
+  --surface: #1f1f1f;
+  --panel: #121212;
+  --text: #ececec;
+  --body: #dcdcda;
+  --muted: #9c9c9c;
+  --faint: #6f6f6f;
+  --accent: #ff5a33;
+  --line: #262626;
+  --card: #151515;
+  --shadow-sm: 0 0 0 1px #ffffff12;
+  --shadow-win: 0 0 0 1px #ffffff14, 0 16px 40px #0000008c;
+  --nav-bg: #151515d1;
+  --tick: #333333;
+  --tick-1: #5c5c5c;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-padding-top: 24px; -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--read);
+  /* The study compared fonts at the same perceived size, not the same point size; this does the
+     same: every face is scaled to one lowercase height, so switching never shrinks the text. */
+  font-size-adjust: ex-height 0.53;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  overflow-wrap: anywhere;
+}
+::selection { background: var(--text); color: var(--bg); }
+a { color: inherit; }
+
+/* ---------- the bar: the site's floating, frosted nav ---------- */
+.bar {
+  position: relative; z-index: 30;
+  display: flex; align-items: center; gap: 18px;
+  width: calc(100% - 40px); max-width: 1100px; margin: 13px auto 0;
+  padding: 10px 14px 10px 16px; border-radius: var(--radius);
+  background: var(--nav-bg); box-shadow: var(--shadow-win);
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  font-size: 13.5px;
+}
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+.tile { width: 28px; height: 28px; display: block; }
+.tile .tile-bg { fill: currentColor; }
+.tile .tile-glyph { stroke: var(--bg); }
+.tile .tile-cursor { fill: var(--accent); }
+.brand .name { font-family: var(--display); font-weight: 700; letter-spacing: 0.02em; }
+.bar .end { margin-left: auto; display: flex; align-items: center; gap: 18px; }
+.expires { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+.theme-btn {
+  font: inherit; font-size: 13px; background: none; border: 0; cursor: pointer;
+  color: var(--muted); padding: 5px 0; display: flex; align-items: center; gap: 7px;
+}
+.theme-btn:hover { color: var(--text); }
+.theme-btn svg { width: 14px; height: 14px; display: block; }
+:root[data-theme="dark"] #theme-btn svg { transform: rotate(180deg); }
+/* the brand's own faces stay at the size they were drawn at */
+.brand .name, .wm-text { font-size-adjust: none; }
+.aa { font-size: 15px; font-weight: 600; color: var(--text); }
+
+/* the font menu */
+.fontpick { position: relative; }
+.menu {
+  position: absolute; right: -8px; top: calc(100% + 12px); z-index: 40; width: 240px;
+  padding: 6px; border-radius: 12px; background: var(--card); box-shadow: var(--shadow-win);
+}
+.menu-note { margin: 6px 10px 8px; font-size: 13px; line-height: 1.45; color: var(--muted); }
+.menu button {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px;
+  border: 0; border-radius: 8px; background: none; color: var(--text); cursor: pointer;
+  font-size: 16px; text-align: left; font-size-adjust: ex-height 0.53;
+}
+.menu button:hover { background: var(--panel); }
+.menu .hint { font: 12px var(--mono); color: var(--faint); font-size-adjust: none; }
+.menu button[aria-checked="true"]::after { content: "✓"; margin-left: auto; color: var(--text); font-size: 14px; }
+
+/* share: the one filled control in the bar */
+.share {
+  display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+  padding: 7px 15px; border: 0; border-radius: 999px;
+  background: var(--text); color: var(--bg); font: 500 13.5px var(--read);
+}
+.share:hover { opacity: 0.88; }
+.share svg { width: 14px; height: 14px; display: block; }
+.toast {
+  position: fixed; left: 50%; bottom: 28px; z-index: 50; max-width: calc(100% - 32px);
+  padding: 12px 18px; border-radius: 12px; background: var(--text); color: var(--bg);
+  font-size: 14.5px; line-height: 1.45; box-shadow: var(--shadow-win);
+  opacity: 0; transform: translate(-50%, 12px); pointer-events: none;
+  transition: opacity 0.2s, transform 0.2s;
+}
+.toast.on { opacity: 1; transform: translate(-50%, 0); }
+
+/* ---------- the head of the page ---------- */
+main { max-width: 1100px; margin: 0 auto; padding: 84px 20px 24px; }
+.hero { padding: 8px 4px 40px; }
+.eyebrow { font-size: 14px; color: var(--muted); margin: 0 0 12px; }
+h1 {
+  font-size: clamp(25px, 3vw, 32px);
+  font-weight: 600;
+  line-height: 1.28;
+  letter-spacing: -0.015em;
+  margin: 0 0 14px;
+  max-width: 40ch;
+  text-wrap: balance;
+}
+.note { font-size: 17.5px; line-height: 1.6; color: var(--muted); max-width: 64ch; margin: 0 0 18px; }
+.meta { font-family: var(--mono); font-size: 12.5px; color: var(--faint); margin: 0; }
+
+/* ---------- contents: a rail of ticks at the side, the list on hover ---------- */
+.panel {
+  padding: 14px 8px 8px; border-radius: 12px; background: var(--card); box-shadow: var(--shadow-win);
+  overflow-y: auto; overscroll-behavior: contain;
+}
+.panel-head {
+  margin: 0 8px 8px; font: 500 11.5px var(--mono); letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text); font-size-adjust: none;
+}
+.panel ol { list-style: none; margin: 0; padding: 0; }
+.panel a {
+  display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 7px;
+  text-decoration: none; color: var(--muted); font-size: 15px; line-height: 1.35;
+}
+.panel a span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.panel a svg { width: 12px; height: 12px; flex: none; fill: currentColor; }
+.panel .l2 a { padding-left: 29px; font-size: 14.5px; color: var(--faint); }
+.panel a:hover { background: var(--panel); color: var(--text); }
+.panel a.on, .panel a.in { color: var(--text); }
+.contents-btn {
+  display: none; align-items: center; gap: 8px; cursor: pointer;
+  position: fixed; right: 16px; bottom: 16px; z-index: 44;
+  padding: 10px 16px; border: 0; border-radius: 999px;
+  background: var(--card); color: var(--text); box-shadow: var(--shadow-win);
+  font: 500 14.5px var(--read);
+}
+.contents-btn svg { width: 15px; height: 15px; display: block; }
+
+/* beside the cards: wide enough for the rail to sit in the margin */
+@media (min-width: 1180px) {
+  .contents {
+    position: fixed; left: 14px; top: 50%; transform: translateY(-50%); z-index: 35;
+    display: flex; align-items: center; gap: 8px; pointer-events: none;
+  }
+  .rail {
+    pointer-events: auto; cursor: pointer; display: flex; flex-direction: column;
+    align-items: flex-end; gap: 9px; padding: 12px 6px; border: 0; background: none;
+  }
+  .tick { display: block; width: 12px; height: 2px; border-radius: 1px; background: var(--tick); transition: background 0.15s; }
+  .tick.l1 { width: 22px; background: var(--tick-1); }
+  .tick.in { background: var(--muted); }
+  .tick.on { background: var(--text); }
+  /* hidden, not removed: a short grace before it folds, so the pointer can cross to it */
+  .panel {
+    pointer-events: auto; width: 300px; max-height: calc(100vh - 64px);
+    visibility: hidden; opacity: 0; transform: translateX(-6px);
+    transition: opacity 0.15s ease 0.2s, transform 0.15s ease 0.2s, visibility 0s linear 0.35s;
+  }
+  /* Keyboard focus holds it open, a mouse click's focus does not: with `:focus-within` the rail
+     kept its focus after a click and the list would not fold. */
+  .contents:hover .panel, .contents.pinned .panel, .contents:has(:focus-visible) .panel {
+    visibility: visible; opacity: 1; transform: none; transition-delay: 0s;
+  }
+  /* just folded by a click: stays folded under the pointer until the pointer leaves */
+  .contents.shut .panel { visibility: hidden; opacity: 0; transition-delay: 0s; }
+}
+/* narrower: a button in the corner opens the same list from the bottom */
+@media (max-width: 1179px) {
+  .contents-btn { display: inline-flex; }
+  .contents, .rail { display: none; }
+  .contents.open { display: block; position: fixed; left: 0; right: 0; bottom: 0; z-index: 45; padding: 0 8px 8px; }
+  .contents.open .panel {
+    max-width: 560px; max-height: 70vh; margin: 0 auto; border-radius: 16px; padding: 16px 8px 8px;
+    box-shadow: 0 0 0 100vmax #00000047, var(--shadow-win);
+  }
+  .panel a { padding: 9px 8px; }
+}
+
+/* ---------- one item, and the answer above them ---------- */
+.item, .answer {
+  background: var(--card); border-radius: 18px; box-shadow: var(--shadow-win);
+  padding: 44px 64px 28px; margin: 0 0 32px;
+}
+.head {
+  display: flex; align-items: center; gap: 10px; margin: 0 0 22px;
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted);
+}
+.head svg { width: 14px; height: 14px; display: block; fill: var(--text); flex: none; }
+.head .idx { margin-left: auto; color: var(--faint); letter-spacing: 0.02em; overflow-wrap: normal; }
+.title {
+  font-size: 29px; line-height: 1.24; letter-spacing: -0.016em; font-weight: 680;
+  margin: 0 0 16px; text-wrap: balance;
+}
+.item-github .title { font-family: var(--mono); font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
+
+.byline {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 9px;
+  margin: 0 0 28px; font-size: 14.5px; color: var(--muted);
+}
+.av {
+  width: 34px; height: 34px; border-radius: 50%; flex: none; margin-right: 3px;
+  display: grid; place-items: center;
+  background: var(--surface); color: var(--text);
+  font-family: var(--mono); font-size: 12.5px; font-weight: 600; letter-spacing: 0.02em;
+}
+.who { color: var(--text); font-weight: 600; }
+.handle { font-family: var(--mono); font-size: 13px; }
+.bit { white-space: nowrap; overflow-wrap: normal; }
+.sep { color: var(--faint); margin-right: 9px; }
+.paper-by { display: block; }
+.authors { margin: 0 0 4px; color: var(--muted); font-size: 15px; line-height: 1.55; }
+.paper-by .when { font-family: var(--mono); font-size: 12.5px; color: var(--faint); }
+.lead { font-size: 18.5px; line-height: 1.55; color: var(--muted); margin: -4px 0 16px; }
+.stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 28px; }
+.chip {
+  font-family: var(--mono); font-size: 12.5px; color: var(--muted);
+  padding: 4px 11px; border-radius: 999px; background: var(--panel); box-shadow: var(--shadow-sm);
+}
+
+/* ---------- reading ---------- */
+.prose { font-size: 19px; line-height: 1.7; color: var(--body); }
+.prose > :first-child { margin-top: 0; }
+.prose p { margin: 0 0 1.1em; }
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  color: var(--text); line-height: 1.3; letter-spacing: -0.01em; font-weight: 650;
+  margin: 1.8em 0 0.6em;
+}
+.prose h1 { font-size: 25px; }
+.prose h2 { font-size: 22px; }
+.prose h3 { font-size: 19px; }
+.prose h4 { font-size: 17px; }
+.prose h2.label, .prose h3.label {
+  font-family: var(--mono); font-size: 12px; font-weight: 500; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--faint); margin: 2em 0 0.4em;
+}
+.prose a {
+  color: var(--text); text-decoration: underline; text-underline-offset: 3px;
+  text-decoration-thickness: 1px; text-decoration-color: color-mix(in srgb, var(--text) 35%, transparent);
+}
+.prose a:hover { text-decoration-color: var(--accent); }
+.prose strong { color: var(--text); font-weight: 650; }
+.prose blockquote {
+  margin: 1.4em 0; padding: 2px 0 2px 22px; border-left: 2px solid var(--line); color: var(--muted);
+}
+.prose ul, .prose ol { padding-left: 1.35em; margin: 0 0 1.1em; }
+.prose li { margin: 0.35em 0; }
+.prose li > p { margin: 0 0 0.4em; }
+.prose hr { border: 0; height: 1px; background: var(--line); margin: 2.2em 0; }
+.prose sup { font-size: 0.68em; line-height: 0; }
+.prose img { max-width: 100%; height: auto; vertical-align: middle; }
+.prose .fig { margin: 1.6em 0; }
+.prose .fig img { display: block; margin: 0 auto; border-radius: 12px; box-shadow: var(--shadow-sm); }
+.prose code {
+  font-family: var(--mono); font-size: 0.84em; background: var(--panel);
+  padding: 0.12em 0.38em; border-radius: 6px; box-shadow: var(--shadow-sm);
+}
+.prose pre {
+  background: var(--panel); box-shadow: var(--shadow-sm); border-radius: 12px;
+  padding: 16px 18px; margin: 1.4em 0; overflow-x: auto; overflow-wrap: normal;
+  font-size: 14px; line-height: 1.6;
+}
+.prose pre code { background: none; box-shadow: none; padding: 0; font-size: inherit; }
+.prose table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 15px; margin: 1.4em 0; }
+.prose th, .prose td { text-align: left; padding: 8px 14px 8px 0; border-bottom: 1px solid var(--line); overflow-wrap: normal; }
+.prose th { color: var(--text); font-weight: 600; }
+
+/* a post reads a size up: it is short, and it was written to be read at a glance */
+.item-x .prose { font-size: 20px; line-height: 1.62; }
+.post + .post { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 24px; }
+
+.media {
+  display: grid; gap: 4px; margin: 0.4em 0 1.3em; border-radius: 14px; overflow: hidden;
+  box-shadow: var(--shadow-sm); background: var(--surface);
+}
+.media.n2, .media.n3, .media.n4 { grid-template-columns: 1fr 1fr; }
+.media.n3 > :first-child { grid-row: span 2; }
+.media img, .media video { display: block; width: 100%; height: 100%; object-fit: cover; margin: 0; border-radius: 0; }
+.media.n1 img, .media.n1 video { height: auto; max-height: 620px; object-fit: contain; background: #000; }
+.media.n2 > *, .media.n3 > *, .media.n4 > * { aspect-ratio: 4 / 3; }
+
+.linkcard {
+  display: block; text-decoration: none !important; margin: 12px 0;
+  padding: 14px 18px; border-radius: 12px; background: var(--panel); box-shadow: var(--shadow-sm);
+  transition: box-shadow 0.15s;
+}
+.linkcard:hover { box-shadow: var(--shadow-win); }
+.lc-host { display: block; font-family: var(--mono); font-size: 12px; color: var(--faint); }
+.lc-title { display: block; font-size: 16px; line-height: 1.4; font-weight: 600; color: var(--text); margin: 3px 0 2px; }
+.lc-desc { display: block; font-size: 14.5px; line-height: 1.5; color: var(--muted); }
+
+.quoted {
+  margin: 1.2em 0; padding: 14px 18px; border-radius: 14px;
+  background: var(--panel); box-shadow: var(--shadow-sm); font-size: 16.5px;
+}
+.quoted .q-by { font-size: 13.5px; color: var(--muted); margin: 0 0 6px; }
+.quoted .q-by strong { font-weight: 500; color: var(--muted); }
+.quoted p:last-child { margin-bottom: 0; }
+
+/* ---------- papers: the abstract, then the paper itself ---------- */
+.abstract {
+  margin: 0 0 22px; padding: 20px 24px; border-radius: 14px;
+  background: var(--panel); box-shadow: var(--shadow-sm);
+}
+.abstract .label, .pdf-tag {
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--faint);
+}
+.abstract .prose { font-size: 16.5px; line-height: 1.68; margin-top: 8px; }
+.abstract .prose p:last-child { margin-bottom: 0; }
+.pdf { border-radius: 14px; overflow: hidden; box-shadow: var(--shadow-sm); background: var(--panel); }
+.pdf-bar {
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); font-size: 13px;
+}
+.pdf-src { font-family: var(--mono); font-size: 12.5px; color: var(--muted); min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.pdf-bar a { margin-left: auto; text-decoration: none; font-weight: 500; white-space: nowrap; }
+.pdf iframe { display: block; width: 100%; height: min(86vh, 1100px); border: 0; background: #525659; }
+.nopdf { color: var(--muted); font-size: 15px; }
+
+/* ---------- the foot of an item ---------- */
+.foot {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 18px;
+  margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line);
+  font-size: 13.5px; color: var(--muted);
+}
+.via, .stat { font-family: var(--mono); font-size: 12.5px; }
+.open { margin-left: auto; text-decoration: none; color: var(--text); font-weight: 550; white-space: nowrap; }
+.open:hover { color: var(--accent); }
+
+/* ---------- colophon ---------- */
+.colophon { max-width: 820px; margin: 0 auto; padding: 40px 24px 0; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.7; }
+.colophon a { color: var(--text); }
+.wordmark { padding: 36px 0 48px; color: var(--text); }
+.wordmark svg { display: block; width: 100%; height: auto; }
+.wm-text {
+  font-family: var(--display); font-weight: 800; fill: none;
+  stroke: var(--faint); stroke-width: 2; stroke-dasharray: 7 6;
+}
+
+/* ---------- a phone ---------- */
+@media (max-width: 640px) {
+  .bar { width: calc(100% - 24px); padding: 9px 10px 9px 12px; }
+  .bar .end { gap: 14px; }
+  .expires, .bar .lbl { display: none; }
+  main { padding: 48px 16px 16px; }
+  .hero { padding: 8px 2px 32px; }
+  .item, .answer { padding: 22px 20px 18px; border-radius: 16px; margin-bottom: 20px; }
+  .title { font-size: 23px; }
+  .item-github .title { font-size: 19px; }
+  .prose { font-size: 17px; line-height: 1.68; }
+  .item-x .prose { font-size: 17.5px; }
+  .abstract { padding: 16px 18px; }
+  .pdf iframe { height: 72vh; }
+  .colophon { padding: 28px 16px 0; }
+}

@@ -1,23 +1,12 @@
 """
 opyt_core/keys.py — manage API keys for a distributed install.
 
-Which keys exist, and what each one buys, is not written here — it is one table:
-`opyt_core/credentials_registry.py`. Read the registry, not this docstring.
-
-Search needs a key unless you ask for BM25. On the atom rail the DEFAULT search mode is
-hybrid, and its semantic arm goes through a HOSTED embedder — so the LLM provider key is required
-to build or query the index. Only `mode="bm25"` is keyless.
-
-Keys live in ~/.opyt/.env — OUTSIDE the repo — which opyt_core loads on import, so a user with no
-repo checkout still resolves them. Values are NEVER printed back; --list reports only set vs
-MISSING, plus whether the key is required or optional.
+Which keys exist is one table: `opyt_core/credentials_registry.py`. Keys live in ~/.opyt/.env,
+outside the repo, which opyt_core loads on import. Values are never printed back.
 
     opyt-keys --list                       # which keys are set, and which ones matter
     opyt-keys --set KEY=VALUE              # run --list first for the exact names
     python -m opyt_core.keys --list        # equivalent without the console script
-
-Key names are not listed here; `--list` prints them from the registry so it never shows a
-retired key.
 """
 from __future__ import annotations
 
@@ -25,33 +14,21 @@ import argparse
 import os
 from pathlib import Path
 
-from .credentials_registry import REGISTRY
-from .credentials_registry import KNOWN as KNOWN          # re-export: the ONE list, derived
-from .paths import opyt_home
+from dotenv import dotenv_values
+
+from opyt_core.credentials_registry import REGISTRY
+from opyt_core.paths import opyt_home, owner_only
 
 
 def env_path() -> Path:
-    """Where the keys file actually is, resolved at CALL time.
-
-    Public for `openrouter_oauth.acquire`, which reports the location back to the CALLER after
-    storing a key. That is a developer-facing status line, and it is the only surface that
-    should name this file: the browser page a user lands on after authorising deliberately
-    names no path at all. `$OPYT_HOME` moves it, so a second spelling of it anywhere is the
-    drift `paths.py` exists to prevent.
-    """
-    return opyt_home() / ".env"  # the one sandbox knob ($OPYT_HOME), via paths.py
+    """Where the keys file is, resolved at call time so `$OPYT_HOME` moves it."""
+    return opyt_home() / ".env"
 
 
 def _read() -> dict[str, str]:
-    p = env_path()
-    out: dict[str, str] = {}
-    if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                out[k.strip()] = v.strip()
-    return out
+    """`.env` as every other reader sees it (python-dotenv). A bare `KEY` line has no value and
+    is not kept."""
+    return {k: v for k, v in dotenv_values(env_path()).items() if v is not None}
 
 
 def set_key(name: str, value: str) -> Path:
@@ -61,10 +38,7 @@ def set_key(name: str, value: str) -> Path:
     cur = _read()
     cur[name] = value
     p.write_text("".join(f"{k}={v}\n" for k, v in cur.items()), encoding="utf-8")
-    try:
-        p.chmod(0o600)
-    except OSError:
-        pass
+    owner_only(p)
     return p
 
 
@@ -82,7 +56,6 @@ def main(argv: list[str] | None = None) -> int:
         description="Set/inspect OPYT API keys in ~/.opyt/.env (values never printed). "
                     "Run --list to see every key OPYT uses and whether it is required.")
     ap.add_argument("--set", metavar="KEY=VALUE", action="append", default=[],
-                    # Example is derived from the registry so it can't go stale.
                     help=f"set a key (repeatable), e.g. {REGISTRY[0].env}=...")
     ap.add_argument("--list", action="store_true", help="show which keys are set (masked)")
     args = ap.parse_args(argv)

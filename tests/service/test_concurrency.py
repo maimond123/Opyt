@@ -9,7 +9,7 @@ first genuinely concurrent request and 200 on any sequential rate — measured a
 uvicorn, not found by the suite.
 
 So this runs a real server in a real process and overlaps real requests. The fix was to let
-`service/store.py` own its connections the way `pipeline/kb/peers.py` does, which removes the
+each `service.db` module own its connections the way `pipeline/retrieval/peers.py` does, which removes the
 handoff rather than permitting it with `check_same_thread=False`.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from service import store
+from service import db, tokens
 
 # The scoped exemption, not a blanket one: this module starts a server on 127.0.0.1 and talks to
 # it, which is the case `loopback` exists for (see tests/conftest.py). A request to a routable
@@ -104,11 +104,11 @@ def test_every_overlapping_read_is_counted_exactly_once(live_server, svc):
     base, _ = live_server
     with ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(lambda i: _search(base, svc.reader_token, i), range(8)))
-    conn = store.connect()
+    conn = db.connect()
     try:
         reads = conn.execute(
             "SELECT COALESCE(SUM(n), 0) FROM usage_daily WHERE owner = ? AND reader = ?",
-            (svc.owner, store.token_hash(svc.reader_token)),
+            (svc.owner, tokens.token_hash(svc.reader_token)),
         ).fetchone()[0]
     finally:
         conn.close()

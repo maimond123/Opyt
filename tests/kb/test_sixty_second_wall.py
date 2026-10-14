@@ -1,21 +1,18 @@
 """The 60-second wall — what a host may say when a call comes back as an error.
 
-MEASURED 2026-09-14, one full onboarding run through Claude Desktop: nine
-`oracle(action='ingest')` calls, SIX killed at the client's wall. Each died holding the only thing
-the user was meant to hear — `presentation`, `partial_note`, the whole §G vocabulary — so the model
-received exactly one fact, `Error: Request timed out`, and used it as a universal explanation for
-three things that were not timeouts at all. Four retries fired off the back of that; none helped.
-Design record: docs/plans/2026-09-14-sixty-second-wall.md §B, §C.
+In one full onboarding run through Claude Desktop, six of nine `oracle(action='ingest')` calls
+were killed at the client's wall. Each died holding the only thing the user was meant to hear —
+`presentation`, `partial_note` — so the model received exactly one fact, `Error: Request timed
+out`, and used it as a universal explanation for things that were not timeouts at all. Four
+retries fired off the back of that; none helped.
 
-⚠️ THESE RULES CANNOT LIVE IN A TOOL RETURN, which is the whole asymmetry of §B: the return is
-precisely what a truncated call destroys. A tool DESCRIPTION is delivered at tool-list time and is
-still in context at the one moment it is needed — when the call comes back as an error.
+These rules cannot live in a tool return: the return is precisely what a truncated call
+destroys. A tool description is delivered at tool-list time and is still in context at the one
+moment it is needed — when the call comes back as an error.
 
-The §A half of that plan (a foreground time budget) was built, measured on a second live run, and
-REVERTED — it did not reliably beat the wall, because R4 keeps a blog archive running to
-completion once started and one archive measured most of sixty seconds on its own. See
-`2026-09-14-sixty-second-wall-landed.md`. What survived is this, and the payload bound in
-`tests/kb/test_screen.py`.
+A foreground time budget did not reliably beat the wall, because a blog archive runs to
+completion once started and one archive took most of sixty seconds on its own. What holds is the
+description wording tested here, and the payload bound in `tests/kb/test_screen.py`.
 """
 from __future__ import annotations
 
@@ -26,7 +23,7 @@ def _oracle_tool_doc() -> str:
     captured: dict = {}
 
     class _FakeMCP:
-        def tool(self):
+        def tool(self, **kw):
             def _wrap(fn):
                 captured.setdefault(fn.__name__, fn.__doc__ or "")
                 return fn
@@ -46,11 +43,10 @@ def test_the_no_retry_rule_lives_in_the_tool_description():
 
 
 def test_the_rule_forbids_a_SMALLER_retry_and_not_just_the_same_one():
-    """⚠️ THE WORDING IS THE FIX. The first version said "do not call it again", and on
-    2026-09-14 20:05:53 a model read that as being about the SAME call, reasoned "I\'ll run the
-    pull one person at a time to stay under the time limit", and retried. Calls to this server
-    serialize, so the smaller second call waits out the first and then times out having done
-    less — measured at 125s, twice. Fewer calls, never smaller ones."""
+    """The wording is the fix. "Do not call it again" gets read as being about the same call: a
+    model reasoned "I\'ll run the pull one person at a time to stay under the time limit", and
+    retried. Calls to this server serialize, so the smaller second call waits out the first and
+    then times out having done less — measured at 125s, twice. Fewer calls, never smaller ones."""
     doc = _oracle_tool_doc()
 
     assert "NOT a smaller one" in doc

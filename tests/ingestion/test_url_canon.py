@@ -2,7 +2,7 @@
 
 import pytest
 
-from pipeline.ingestion.url_canon import canonical_identity as ci
+from pipeline.platforms.url_canon import canonical_identity as ci
 
 
 @pytest.mark.parametrize("url,expected", [

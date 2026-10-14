@@ -2,14 +2,15 @@
 `discover_profile` path — the de-X-rooting entry point.
 
 The probe parses the PUBLIC profile payload (`/api/v1/user/{h}/public_profile`) into
-(profile_info, sources, identity_targets); the end-to-end path threads that through the
-platform-agnostic trust contract so a Substack-rooted person's declared accounts reach T1
-with no X in the root set. Both mock the network — no live Substack call.
+(profile_info, sources, identity_targets); the end-to-end path judges them, so a
+Substack-rooted person's declared accounts are theirs with no X in the root set. Both mock the
+network — no live Substack call.
 """
 
-import importlib
 
-dp = importlib.import_module("pipeline.ingestion.discover_profile")  # bypass __init__ shadow
+from pipeline.oracles.discovery import backlink
+from pipeline.oracles.discovery import probes
+from pipeline.oracles.discovery import profile as dp
 
 
 class _Resp:
@@ -25,7 +26,7 @@ class _Resp:
 _PAYLOAD = {
     "name": "The Pragmatic Engineer",
     "bio": "Writing about big tech and startups.",
-    # Live shape (verified 2026-07-21): user-level subdomainUrl is null; the publication lives
+    # Live shape (verified): user-level subdomainUrl is null; the publication lives
     # in primaryPublication. Substack keeps {subdomain}.substack.com live behind the custom domain.
     "subdomainUrl": None,
     "primaryPublication": {"subdomain": "pragmaticengineer",
@@ -49,14 +50,14 @@ def _mock_get(monkeypatch, payload=_PAYLOAD, status=200):
         if "public_profile" in url:
             return _Resp(status, payload)
         return _Resp(404, {})
-    monkeypatch.setattr(dp.requests, "get", fake)
+    monkeypatch.setattr(probes.requests, "get", fake)
 
 
 # ── The probe: payload → (profile_info, sources, identity_targets) ────────────
 
 def test_probe_parses_declared_links_and_root(monkeypatch):
     _mock_get(monkeypatch)
-    info, sources, targets = dp._probe_substack_profile("pragmaticengineer")
+    info, sources, targets = probes.probe_substack_profile("pragmaticengineer")
     ci = dp.canonical_identity
 
     assert info["display_name"] == "The Pragmatic Engineer"
@@ -86,14 +87,14 @@ def test_probe_parses_declared_links_and_root(monkeypatch):
 def test_probe_without_primary_publication_keeps_the_seed_publication(monkeypatch):
     # The publication seed remains the root when its author has no primaryPublication field.
     _mock_get(monkeypatch, payload={"name": "Someone", "twitterAccount": {}, "userLinks": []})
-    info, _sources, _targets = dp._probe_substack_profile("someone")
+    info, _sources, _targets = probes.probe_substack_profile("someone")
     assert info["root_url"] == "https://someone.substack.com"
     assert dp.canonical_identity(info["root_url"]) == "someone.substack.com"
 
 
 def test_probe_failsafe_on_non_200(monkeypatch):
     _mock_get(monkeypatch, payload={}, status=404)
-    info, sources, targets = dp._probe_substack_profile("nobody")
+    info, sources, targets = probes.probe_substack_profile("nobody")
     assert info["display_name"] == "" and sources == [] and targets == []
 
 
@@ -106,8 +107,8 @@ def test_resolve_publication_slug_to_different_author(monkeypatch):
         if "ranked" in url:
             return _Resp(200, [{"handle": "alicewriter"}])
         return _Resp(200, {"name": "Alice", "primaryPublication": None})
-    monkeypatch.setattr(dp.requests, "get", get)
-    info, sources, _ = dp._probe_substack_profile("newsletter")
+    monkeypatch.setattr(probes.requests, "get", get)
+    info, sources, _ = probes.probe_substack_profile("newsletter")
     assert calls == [
         "https://newsletter.substack.com/api/v1/publication/users/ranked?public=true",
         "https://substack.com/api/v1/user/alicewriter/public_profile",
@@ -116,19 +117,26 @@ def test_resolve_publication_slug_to_different_author(monkeypatch):
     assert [s.url for s in sources] == [info["root_url"]]
 
 
-def test_resolve_slug_from_custom_domain_host(monkeypatch):
-    # A custom-domain HOST/URL resolves to its primary author's slug via ranked-users.
-    monkeypatch.setattr(dp.requests, "get",
-                        lambda url, **k: _Resp(200, [{"handle": "owner"}, {"handle": "coauthor"}])
-                        if "ranked" in url else _Resp(404, {}))
-    assert dp._resolve_substack_user_slug("https://newsletter.foo.com") == "owner"
-    assert dp._resolve_substack_user_slug("newsletter.foo.com") == "owner"   # bare host too
+def test_a_custom_domain_resolves_to_its_owner(monkeypatch):
+    # A custom-domain HOST/URL resolves to its top-ranked author's public profile.
+    calls = []
+    def get(url, **k):
+        calls.append(url)
+        if "ranked" in url:
+            return _Resp(200, [{"handle": "owner"}, {"handle": "coauthor"}])
+        return _Resp(200, {"name": "Owner"})
+    monkeypatch.setattr(probes.requests, "get", get)
+    for seed in ("https://newsletter.foo.com", "newsletter.foo.com"):    # bare host too
+        calls.clear()
+        data, _final = backlink.substack_profile(seed)
+        assert data == {"name": "Owner"}
+        assert calls[-1] == "https://substack.com/api/v1/user/owner/public_profile"
 
 
 def test_resolve_slug_failsafe(monkeypatch):
-    monkeypatch.setattr(dp.requests, "get", lambda *a, **k: _Resp(404, {}))
-    assert dp._resolve_substack_user_slug("newsletter.foo.com") is None
-    assert dp._resolve_substack_user_slug("") is None
+    monkeypatch.setattr(probes.requests, "get", lambda *a, **k: _Resp(404, {}))
+    assert backlink.substack_profile("newsletter.foo.com") == (None, None)
+    assert backlink.substack_profile("") == (None, None)
 
 
 def test_probe_resolves_custom_domain_to_user_slug(monkeypatch):
@@ -144,9 +152,9 @@ def test_probe_resolves_custom_domain_to_user_slug(monkeypatch):
                                "twitterAccount": {"screen_name": "foobar_x", "is_connected_account": True},
                                "userLinks": []})
         return _Resp(404, {})
-    monkeypatch.setattr(dp.requests, "get", fake)
+    monkeypatch.setattr(probes.requests, "get", fake)
 
-    info, sources, targets = dp._probe_substack_profile("newsletter.foo.com")
+    info, sources, targets = probes.probe_substack_profile("newsletter.foo.com")
     ci = dp.canonical_identity
     assert info["display_name"] == "Foo Bar"
     assert info["root_url"] == "https://foobar.substack.com"          # from the RESOLVED slug's pub
@@ -154,32 +162,20 @@ def test_probe_resolves_custom_domain_to_user_slug(monkeypatch):
     assert ("substack", ci("https://foobar.substack.com")) in {(s.source_type, ci(s.url)) for s in sources}
 
 
-# ── End-to-end: discover_profile(seed_type="substack") reaches T1 with no X ───
+# ── End-to-end: discover_profile(seed_type="substack") with no X ───
 
-class _Cfg:
-    def __init__(self, tmp_path):
-        self._tmp = tmp_path
-
-    def state_file(self, name):
-        return self._tmp / f"{name}.json"
-
-
-def test_discover_substack_seed_trusts_declared_accounts(monkeypatch, tmp_path):
+def test_discover_substack_seed_trusts_declared_accounts(monkeypatch):
     _mock_get(monkeypatch)
-    monkeypatch.setattr(dp, "_probe_github", lambda username: [])   # no convention GitHub guess
     ci = dp.canonical_identity
 
-    # skip_edge_fetch → no landing fetch / hub expansion; skip_trust_cache_write → no cache
-    # write. Purely: identity edges → Rule 5 → T1.
-    result = dp.discover_profile(
-        "pragmaticengineer", seed_type="substack", config=_Cfg(tmp_path),
-        skip_edge_fetch=True, skip_trust_cache_write=True)
+    # skip_edge_fetch → nothing read: what the root declares is theirs.
+    result = dp.discover_profile("pragmaticengineer", seed_type="substack", skip_edge_fetch=True)
 
-    trusted = {ci(s["url"]) for s in result["sources"] if (s.get("trust") or {}).get("trusted")}
-    assert ci("https://pragmaticengineer.substack.com") in trusted    # the Substack root (Rule 1)
-    assert ci("https://x.com/GergelyOrosz") in trusted                 # declared X (Rule 5), no X root
-    assert ci("https://pragmaticengineer.com") in trusted             # declared site (Rule 5)
+    sure = {ci(v["url"]) for v in result["verdicts"] if v["verdict"] == "sure"}
+    assert result["root_id"] == ci("https://pragmaticengineer.substack.com")   # the root itself
+    assert ci("https://x.com/GergelyOrosz") in sure                    # declared X, no X root
+    assert ci("https://pragmaticengineer.com") in sure                # declared site
 
-    # The discovered X carries source_type `x` so the footprint caller can pull its timeline.
-    x_srcs = [s for s in result["sources"] if s["source_type"] == "x"]
-    assert len(x_srcs) == 1 and (x_srcs[0].get("trust") or {}).get("trusted")
+    # The discovered X carries source_type `x` so register can pull its timeline.
+    x_verdicts = [v for v in result["verdicts"] if v["source_type"] == "x"]
+    assert len(x_verdicts) == 1 and x_verdicts[0]["verdict"] == "sure"

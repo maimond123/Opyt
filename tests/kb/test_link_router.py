@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import requests
 
-from pipeline.kb import link_router as lr, schema
+from pipeline.kb import link_mint, link_router as lr, schema
 
 
 class _Resp:
@@ -32,17 +32,17 @@ class _Resp:
 def _no_openalex(monkeypatch):
     """Silence the SECOND source. `classify_link_deep` now falls through to OpenAlex whenever the
     page itself said nothing, so a test about the PAGE has to state what the index said too."""
-    from pipeline.kb import ingest_papers
-    monkeypatch.setattr(ingest_papers, "_openalex_doi_by_url", lambda url: None)
+    from pipeline.platforms.papers import lookup as paper_lookup
+    monkeypatch.setattr(paper_lookup, "openalex_doi_by_url", lambda url: None)
 
 
 def _openalex_says(monkeypatch, doi, seen=None):
-    from pipeline.kb import ingest_papers
+    from pipeline.platforms.papers import lookup as paper_lookup
     def _f(url):
         if seen is not None:
             seen.append(url)
         return doi
-    monkeypatch.setattr(ingest_papers, "_openalex_doi_by_url", _f)
+    monkeypatch.setattr(paper_lookup, "openalex_doi_by_url", _f)
 
 
 def _stub_get(monkeypatch, resp_or_exc):
@@ -71,8 +71,8 @@ def test_citation_doi_meta_rewrites_to_doi_org(monkeypatch):
 def test_other_citation_meta_confirms_paper_without_a_mint_url(monkeypatch):
     """Scholarly markup, no DOI, and an index that does not know the page either — the ONE state
     in which a `paper` with no mintable id is still the right answer, because `article` would file
-    a paper as a blog post. `_no_openalex` is load-bearing since 2026-09-16: the index is asked
-    first now, so a test about the PAGE has to say what the index said."""
+    a paper as a blog post. `_no_openalex` is load-bearing: the index is asked
+    first, so a test about the PAGE has to say what the index said."""
     html = b'<html><head><meta name="citation_title" content="Some Paper"></head></html>'
     _stub_get(monkeypatch, _Resp(headers={"Content-Type": "text/html"}, chunks=[html]))
     _no_openalex(monkeypatch)
@@ -81,8 +81,7 @@ def test_other_citation_meta_confirms_paper_without_a_mint_url(monkeypatch):
 
 
 def test_scholarly_markup_asks_the_index_before_settling_for_a_nameless_paper(monkeypatch):
-    """The ordering fix. A page carrying `citation_*` but no DOI used to return `paper` outright,
-    which skipped the only source that could NAME it — 8 of the 124 refused urls in the Set A+B
+    """A page carrying `citation_*` but no DOI must not return `paper` outright, which would skip the only source that could NAME it — 8 of the 124 refused urls in the Set A+B
     sweeps, `repositorio.unal.edu.co/handle/unal/81443` (ResNet) among them."""
     html = b'<html><head><meta name="citation_author" content="K He"></head></html>'
     _stub_get(monkeypatch, _Resp(headers={"Content-Type": "text/html"}, chunks=[html]))
@@ -124,7 +123,7 @@ def test_oversized_page_without_a_citation_tag_gives_up(monkeypatch):
 
 # ── the second source: what OpenAlex records at a url the page will not show us ──────────────
 #
-# Measured 2026-09-11 over 250 pasted urls: 96 were refused by everything above, and 22 of the 37
+# Measured over 250 pasted urls: 96 were refused by everything above, and 22 of the 37
 # the probe could not crack answered 4xx to BOTH our User-Agent and a browser's. Those pages were
 # never going to be read. Asking the index recovers 59 of the 96.
 
@@ -162,9 +161,9 @@ def test_the_page_still_outranks_the_index(monkeypatch):
 def test_a_successful_non_article_response_costs_no_index_call(monkeypatch):
     """A 200 that hands back a PNG is a real answer — there is no article here — unlike a 4xx,
     which is a refusal. Believing the former is what keeps this from asking about every image."""
-    from pipeline.kb import ingest_papers
+    from pipeline.platforms.papers import lookup as paper_lookup
     _stub_get(monkeypatch, _Resp(headers={"Content-Type": "image/png"}))
-    monkeypatch.setattr(ingest_papers, "_openalex_doi_by_url",
+    monkeypatch.setattr(paper_lookup, "openalex_doi_by_url",
                         lambda url: pytest.fail("a 200 non-article must not spend a lookup"))
     assert lr.classify_link_deep("https://example.com/photo.png") is None
 
@@ -196,7 +195,7 @@ def test_a_lookalike_host_is_not_the_provider():
 
 
 def test_a_port_or_uppercase_host_does_not_defeat_the_sniff():
-    """`.hostname` normalizes case and strips the port; the old `.netloc` test carried both."""
+    """`.hostname` normalizes case and strips the port; `.netloc` would carry both."""
     assert lr.classify_link("https://GitHub.COM/o/r") == "github"
     assert lr.classify_link("http://arxiv.org:8080/abs/1") == "paper"
 
@@ -211,9 +210,9 @@ def test_a_port_or_uppercase_host_does_not_defeat_the_sniff():
     "https://pmc.ncbi.nlm.nih.gov/articles/PMC8371605/",
 ])
 def test_the_hosts_that_name_a_paper_without_a_doi_in_the_url(url):
-    """Added 2026-09-11. Each of these was routed to the ARTICLE catch-all, and each answers 403
+    """Each of these would be routed to the article catch-all, and each answers 403
     to a server fetch (browser User-Agent included, measured), so `classify_link_deep` could not
-    rescue them either — they were simply lost. Same justification as arXiv and PubMed: the url
+    rescue them either. Same justification as arXiv and PubMed: the url
     names the paper, it just does not spell the name as a DOI."""
     assert lr.classify_link(url) == "paper"
 
@@ -229,6 +228,19 @@ def test_a_partly_papers_host_only_routes_its_papers_path(url):
     entry would route all of it to the paper adapter — the same class of mis-route `_is_host`
     prevents at the host level, one level further down the url."""
     assert lr.classify_link(url) is None
+
+
+@pytest.mark.parametrize("url, kind", [
+    ("https://eprint.iacr.org/2025/2041", "paper"),
+    ("https://eprint.iacr.org/2025/2041.pdf", "paper"),
+    ("https://eccc.weizmann.ac.il/report/2026/237/", "paper"),
+    ("https://eprint.iacr.org/days/7", None),
+    ("https://eccc.weizmann.ac.il/author/345", None),
+])
+def test_a_report_archive_routes_only_its_reports(url, kind):
+    """IACR ePrint and ECCC reports carry no DOI; `ingest_papers` keys them on the report page.
+    The archives' other pages (recent reports, an author page) are not papers."""
+    assert lr.classify_link(url) == kind
 
 
 def test_a_pdf_anywhere_is_still_a_paper():
@@ -261,12 +273,11 @@ def conn(kb_home, tmp_path):
 
 # ── mint_artifact: the urls whose id is not in the string ───────────────────────
 #
-# THE GAP THIS CLOSES. Every test above asks what a url CLASSIFIES as; none asked whether the
-# thing it classifies as can actually be stored. Between 2026-08-13 and 2026-09-16 the answer for
-# PubMed was no — `mint_artifact` bailed on any paper without a url-derivable id, so a headline
-# advertised host returned `failed` for a month, then four more url classes were added to the same
-# dead path, and 3612 green tests said nothing. A classification test cannot catch that; only a
-# test that follows the url to the adapter can.
+# Every test above asks what a url CLASSIFIES as; none asked whether the
+# thing it classifies as can actually be stored. The answer for
+# PubMed was once no — `mint_artifact` bailed on any paper without a url-derivable id, so an
+# advertised host returned `failed` while every classification test stayed green. A classification
+# test cannot catch that; only a test that follows the url to the adapter can.
 
 class _RecordingPapers:
     """Stand-in for `ingest_papers` inside `mint_artifact` — records what reached the adapter."""
@@ -286,15 +297,15 @@ class _RecordingPapers:
         return {"paperId": "DOI:10.1056/nejmoa2002032",
                 "externalIds": {"DOI": "10.1056/nejmoa2002032"}, "title": "T"}
 
-    def atomize_paper(self, conn, embedder, paper, **kw):
+    def atomize_paper(self, conn, paper, **kw):
         self.atomize_calls.append(paper)
         return self.atom_id
 
 
 @pytest.fixture()
 def _papers(monkeypatch):
-    """Swap the adapter for a recorder. Patched on the MODULE `mint_artifact` imports from, since
-    it imports inside the function body."""
+    """Swap the adapter for a recorder. Patched on the MODULE `mint_artifact` imports, since it
+    calls through the module attribute."""
     rec = _RecordingPapers()
     from pipeline.kb import ingest_papers
     for name in ("paper_from_url", "atomize_paper"):
@@ -317,8 +328,8 @@ def test_a_paper_whose_id_needs_a_lookup_still_reaches_the_adapter(conn, _papers
     `predicted_atom_id` returns None for all of these BY DESIGN — the id is knowable, just not
     from the string, and the free already-present pre-check may not pay a round trip to find out.
     That null must not be read as "not a paper"."""
-    assert lr.predicted_atom_id(url, "paper") is None, "premise: the id is not in the string"
-    res = lr.mint_artifact(conn, None, url, "paper", entry_mode="user-saved")
+    assert link_mint.predicted_atom_id(url, "paper") is None, "premise: the id is not in the string"
+    res = link_mint.mint_artifact(conn, url, "paper", entry_mode="user-saved")
     assert _papers.from_url_calls == [url], "the adapter was never reached"
     assert res["status"] == "minted"
     # The id the ADAPTER resolved, not the null the url predicted. Returning None here would make
@@ -334,7 +345,7 @@ def test_a_second_save_of_that_paper_reports_present_and_promotes(conn, _papers)
     schema.upsert_atom(conn, {"atom_id": "paper:DOI:10.1056/nejmoa2002032",
                               "source_type": "paper", "entry_mode": "frontier",
                               "raw_hash": "h0"})
-    res = lr.mint_artifact(conn, None, url, "paper", entry_mode="user-saved")
+    res = link_mint.mint_artifact(conn, url, "paper", entry_mode="user-saved")
     assert res["status"] == "present"
     assert res["atom_id"] == "paper:DOI:10.1056/nejmoa2002032"
     assert _papers.atomize_calls == [], "an already-stored paper must not be re-minted"
@@ -349,13 +360,13 @@ def test_a_junk_paper_url_spends_no_request(conn, monkeypatch):
     Dropping the bail means an unparseable `paper` url now reaches `paper_from_url` — which is
     fine only because that function recognises no lookup form here, so it returns None before any
     network call. If a resolver ever fires on an arbitrary url, this fails."""
-    from pipeline.kb import ingest_papers
+    from pipeline.platforms.papers import lookup as paper_lookup
     calls = []
-    monkeypatch.setattr(ingest_papers, "_looked_up_doi",
+    monkeypatch.setattr(paper_lookup, "looked_up_doi",
                         lambda u: calls.append(u) or None)
     url = "https://example.com/some/page"          # NOT a .pdf — that parses, and never bailed
-    assert lr.predicted_atom_id(url, "paper") is None
-    res = lr.mint_artifact(conn, None, url, "paper")
+    assert link_mint.predicted_atom_id(url, "paper") is None
+    res = link_mint.mint_artifact(conn, url, "paper")
     assert res == {"status": "failed", "atom_id": None, "used_prefetch": False}
     assert calls == [url], "one pure-string check, no request"
 
@@ -367,5 +378,64 @@ def test_github_still_bails_without_a_derivable_id(conn, monkeypatch):
     called = []
     monkeypatch.setattr(ingest_github, "github_atom_from_url",
                         lambda *a, **k: called.append(a) or None)
-    assert lr.mint_artifact(conn, None, "https://github.com/", "github")["status"] == "failed"
+    assert link_mint.mint_artifact(conn, "https://github.com/", "github")["status"] == "failed"
     assert called == []
+
+
+# ── reference_kind: what an ORACLE's link becomes ──────────────────────
+
+@pytest.mark.parametrize("url,kind", [
+    ("https://github.com/ggerganov/llama.cpp", "github"),
+    ("https://arxiv.org/abs/2401.00001", "paper"),
+    ("https://carol.substack.com/p/a-post", "substack"),
+    ("https://x.com/bob/status/123", "x"),
+    ("https://mobile.twitter.com/bob/status/123?s=20", "x"),
+    ("https://www.nytimes.com/2026/01/05/a-story.html", "article"),
+    ("https://gist.github.com/bob/0123abcd", None),           # excluded — not "github"
+    ("https://gist.githubusercontent.com/bob/0123/raw/x.py", None),
+    ("https://chatgpt.com/share/abc", None),
+    ("https://youtu.be/abc", None),
+    ("https://open.spotify.com/episode/abc", None),
+    ("https://x.com/bob", None),                              # a profile: a JS shell
+    ("https://x.com/i/article/1234567890", None),             # an X Article: no post id
+    ("not a url", None),
+])
+def test_reference_kind(url, kind):
+    assert lr.reference_kind(url) == kind
+
+
+# ── link-only shapes: the post already carries the URL and its X card ──────────
+
+@pytest.mark.parametrize("url", [
+    "https://supermemory.ai", "https://www.planetscale.com/", "http://arxiv.org/",
+    "https://carol.substack.com/", "https://stripe.com/?ref=x",
+    "https://vercel.com/careers", "https://www.ycombinator.com/apply",
+    "https://cruxevals.com/careers/senior-researcher-july-2026",
+    "https://wajo.ai/join",
+    "https://job-boards.greenhouse.io/anthropic/jobs/5119468008",
+    "https://www.eventbrite.com/e/sarah-paine-tickets-1442724340339",
+    "https://luma.com/build-agents?tk=PAZB5F", "https://forms.gle/abc",
+    "https://docs.google.com/forms/d/e/1FAIp/viewform",
+    "https://tickets.joinshowup.io/event/n-a-5isff7", "https://sso.apa.org/apasso/idm/login",
+])
+def test_a_link_only_shape_becomes_nothing(url):
+    assert lr.reference_kind(url) is None
+
+
+@pytest.mark.parametrize("url,kind", [
+    # `is_nav_path`'s segments are real article paths on someone else's site.
+    ("https://www.mountsinai.org/about/newsroom/2026/skin-cells", "article"),
+    ("https://www.investopedia.com/terms/s/spotmarket.asp", "article"),
+    ("https://carol.substack.com/p/joining-forces", "substack"),        # whole segments only
+    ("https://docs.google.com/document/d/abc/edit", "article"),
+    ("https://arxiv.org/abs/2401.00001", "paper"),
+    ("https://acme-journal.example/download?id=123", "article"),     # a PDF behind /download
+])
+def test_a_document_shape_is_still_fetched(url, kind):
+    assert lr.reference_kind(url) == kind
+
+
+def test_reference_kind_leaves_the_keep_gates_classifier_alone():
+    """`classify_link` still answers the narrower keep-gate question — a gist there is unchanged."""
+    assert lr.classify_link("https://gist.github.com/bob/0123abcd") == "github"
+    assert lr.classify_link("https://www.nytimes.com/x") is None

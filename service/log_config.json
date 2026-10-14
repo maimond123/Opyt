@@ -1,6 +1,14 @@
 {
   "version": 1,
   "disable_existing_loggers": false,
+  "filters": {
+    "no_client_addr": {
+      "()": "service.log_filters.NoClientAddr"
+    },
+    "no_tokens_in_paths": {
+      "()": "service.log_filters.NoTokensInPaths"
+    }
+  },
   "formatters": {
     "default": {
       "()": "uvicorn.logging.DefaultFormatter",
@@ -26,17 +34,28 @@
   },
   "loggers": {
     "uvicorn": {
-      "handlers": ["default"],
+      "handlers": [
+        "default"
+      ],
       "level": "INFO",
       "propagate": false
     },
     "uvicorn.error": {
-      "level": "INFO"
+      "level": "INFO",
+      "filters": [
+        "no_client_addr",
+        "no_tokens_in_paths"
+      ]
     },
     "uvicorn.access": {
-      "handlers": ["access"],
+      "handlers": [
+        "access"
+      ],
       "level": "INFO",
-      "propagate": false
+      "propagate": false,
+      "filters": [
+        "no_tokens_in_paths"
+      ]
     }
   }
 }

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pipeline.ingestion import cdp
+from pipeline.platforms.browser import cdp
 
 
 def test_launch_removes_previous_devtools_endpoint_before_starting(monkeypatch, tmp_path):

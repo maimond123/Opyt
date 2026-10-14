@@ -1,0 +1,120 @@
+{
+  "data": {
+    "search_by_raw_query": {
+      "search_timeline": {
+        "timeline": {
+          "instructions": [
+            {
+              "type": "TimelineAddEntries",
+              "entries": [
+                {
+                  "entryId": "tweet-2108556992570638761",
+                  "sortIndex": "2108556992570638761",
+                  "content": {
+                    "__typename": "TimelineTimelineItem",
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "__typename": "TimelineTweet",
+                      "itemType": "TimelineTweet",
+                      "tweetDisplayType": "Tweet",
+                      "highlights": {"textHighlights": [{"startIndex": 14, "endIndex": 21}]},
+                      "tweet_results": {
+                        "result": {
+                          "__typename": "Tweet",
+                          "rest_id": "2108556992570638761",
+                          "core": {"user_results": {"result": {
+                            "__typename": "User",
+                            "rest_id": "1571082563720470528",
+                            "core": {"created_at": "Sat Sep 17 08:47:20 +0000 2022",
+                                     "name": "Fixture Lab", "screen_name": "fixturelab"},
+                            "legacy": {}
+                          }}},
+                          "legacy": {
+                            "id_str": "2108556992570638761",
+                            "conversation_id_str": "2108556992570638761",
+                            "created_at": "Fri Oct 09 13:55:36 +0000 2026",
+                            "full_text": "I ran a quick Boltz-2 prediction of a known inhibitor &amp; it lands in the pocket",
+                            "favorite_count": 46,
+                            "reply_count": 3,
+                            "is_quote_status": false,
+                            "lang": "en",
+                            "entities": {"hashtags": [], "urls": [], "user_mentions": []}
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "entryId": "relevanceprompt-0",
+                  "sortIndex": "2108556992570638760",
+                  "content": {
+                    "__typename": "TimelineTimelineItem",
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "__typename": "TimelinePrompt",
+                      "content": {"confirmation": "Thanks. Search results will improve."}
+                    }
+                  }
+                },
+                {
+                  "entryId": "tweet-2107926730329534743",
+                  "sortIndex": "2107926730329534743",
+                  "content": {
+                    "__typename": "TimelineTimelineItem",
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "__typename": "TimelineTweet",
+                      "itemType": "TimelineTweet",
+                      "tweetDisplayType": "Tweet",
+                      "tweet_results": {
+                        "result": {
+                          "__typename": "TweetWithVisibilityResults",
+                          "tweet": {
+                            "rest_id": "2107926730329534743",
+                            "core": {"user_results": {"result": {
+                              "__typename": "User",
+                              "rest_id": "99",
+                              "core": {"name": "Second Author", "screen_name": "second"},
+                              "legacy": {}
+                            }}},
+                            "legacy": {
+                              "id_str": "2107926730329534743",
+                              "conversation_id_str": "2107926730329534743",
+                              "created_at": "Wed Oct 07 20:11:10 +0000 2026",
+                              "full_text": "Biasing conformational sampling in AlphaFold 3 and Boltz-2",
+                              "favorite_count": 12,
+                              "reply_count": 0,
+                              "is_quote_status": false,
+                              "lang": "en",
+                              "entities": {"hashtags": [], "urls": [], "user_mentions": []}
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "entryId": "cursor-top-9223372036854775807",
+                  "sortIndex": "9223372036854775807",
+                  "content": {"__typename": "TimelineTimelineCursor",
+                              "entryType": "TimelineTimelineCursor",
+                              "cursorType": "Top", "value": "DAACCgACHUe6"}
+                },
+                {
+                  "entryId": "cursor-bottom-0",
+                  "sortIndex": "0",
+                  "content": {"__typename": "TimelineTimelineCursor",
+                              "entryType": "TimelineTimelineCursor",
+                              "cursorType": "Bottom", "value": "DAACCgACHUe7"}
+                }
+              ]
+            }
+          ],
+          "responseObjects": {"feedbackActions": []}
+        }
+      }
+    }
+  }
+}

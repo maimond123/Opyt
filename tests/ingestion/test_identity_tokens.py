@@ -1,14 +1,14 @@
 """The identity-token rule that replaced two host rules on the blog path.
 
 Both admission gates asked "is this the person's own thing?" and answered with a HOST rule, so an
-author's work on any other host was invisible. Measured on karpathy.ai, 2026-09-09: the host rule
+author's work on any other host was invisible. Measured on karpathy.ai: the host rule
 kept 3 of his 55 own links.
 """
 from __future__ import annotations
 
 import pytest
 
-from pipeline.ingestion.identity_tokens import (host_carries_token, tokens_for, url_carries_token)
+from pipeline.platforms.identity_tokens import (host_carries_token, tokens_for, url_carries_token)
 
 
 _TOKENS = tokens_for("https://karpathy.ai/", "Andrej Karpathy")

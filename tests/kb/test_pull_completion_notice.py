@@ -1,120 +1,143 @@
-"""The rider — how a user who walked away ever learns their pull landed.
+"""The rider — how a user who walked away ever learns what landed.
 
-⚠️ OPYT CANNOT PUSH, AND THAT IS THE PREMISE. An MCP server speaks when it is called and never
-otherwise. `push_catchup` publishes the SERVED copy of the knowledge base and notifies nobody;
-`needs_attention` is a flag that needs a tool call to carry it. That is the whole inventory,
-checked 2026-09-14. So a pull that finished while the conversation was closed rides back on
-whatever the user does next — including `search`, which has nothing to do with Oracles.
+OPYT cannot push, and that is the premise. An MCP server speaks when it is called and never
+otherwise. The publishing pass publishes the served copy of the knowledge base and notifies nobody;
+`needs_attention` is a flag that needs a tool call to carry it. So what landed while the conversation was closed rides back on whatever the
+user does next — including `search`, which has nothing to do with Oracles.
+
+The rider reads the milestones: each pick's newest posts, archives, how
+far back X reaches, and what is stuck, each said once. There is no run and no "complete".
 """
 from __future__ import annotations
 
 import pytest
 
-from mcp_server import atoms_tools, oracle_tools
-from pipeline.kb import pull_runs
-
-
-PICKS = [{"canonical_id": "c:a", "name": "Andrej"},
-         {"canonical_id": "c:d", "name": "Dean"},
-         {"canonical_id": "c:s", "name": "Soren"}]
+from pipeline.worker import liveness
+from pipeline.timeparse import utc_now
+from pipeline.worker.quota_loop import loop_state
+from tests import mcp_session
+from pipeline.oracles import roster
+from pipeline.oracles import registry
+from pipeline.oracles import asks
+from pipeline.oracles import windows
+from pipeline.oracles import told
+from pipeline.oracles import progress
+from pipeline.kb import schema
+from pipeline.oracles.sources import scraper_tables
 
 
 @pytest.fixture()
 def conn(kb_home):
-    c = pull_runs.connect()
+    c = schema.connect()
+    registry.init_state_schema(c)
+    scraper_tables.init_schema(c)
     yield c
     c.close()
 
 
-def _finished(conn, *, reached=3):
-    run_id = pull_runs.open_run(conn, kind="ingest", picks=PICKS)
-    for pick in PICKS[:reached]:
-        pull_runs.finish_oracle(conn, run_id, pick["canonical_id"], {"atoms_added": 10})
-    pull_runs.close_run(conn, run_id)
-    return run_id
+@pytest.fixture(autouse=True)
+def _worker_unknown(monkeypatch):
+    monkeypatch.setattr(liveness, "repair_or_report_cached",
+                        lambda **kw: {"ok": None, "status": "unknown"})
 
 
-def test_a_running_pull_is_not_announced(conn):
-    """There is nothing to tell them yet, and a notice would be a completion claim."""
-    pull_runs.open_run(conn, kind="ingest", picks=PICKS)
-    assert pull_runs.completion_notice(conn) is None
+def _pick(conn, name, *, pulled=True, asked=True):
+    """A confirmed Oracle with one X pair, its first page done when `pulled`, and an ask on
+    record (discovery done, nothing beyond X) when `asked`."""
+    cid = f"x:user:{name.lower()}"
+    roster.upsert_oracle(conn, cid, name=name)
+    registry.upsert_source(conn, registry.SourceRow(cid, "x", name.lower()))
+    if pulled:
+        conn.execute("UPDATE oracle_sources SET last_pulled_at=? WHERE canonical_id=?",
+                     (utc_now().isoformat(), cid))
+    if asked:
+        asks.record_ask(conn, cid, web_from=windows.ALL_TIME)
+        conn.execute("UPDATE oracle_asks SET discovered_at=? WHERE canonical_id=?",
+                     (utc_now().isoformat(), cid))
+    conn.commit()
+    return cid
 
 
-def test_a_finished_pull_is_announced_with_counts(conn):
-    _finished(conn)
-    notice = pull_runs.completion_notice(conn)
-    assert notice["status"] == "complete"
-    assert notice["writers"] == 3 and notice["atoms"] == 30
+def test_nothing_reached_is_not_announced(conn):
+    """There is nothing to tell them yet."""
+    cid = _pick(conn, "Andrej", pulled=False)
+    registry.upsert_source(conn, registry.SourceRow(cid, "substack", "https://andrej.substack.com"))
+    assert told.completion_notice(conn) is None
+
+
+def test_a_reached_milestone_is_announced_in_plain_words(conn):
+    _pick(conn, "Andrej")
+    notice = told.completion_notice(conn)
+    assert {(e["name"], e["milestone"]) for e in notice["milestones"]} == {
+        ("Andrej", "newest_posts"), ("Andrej", "archives")}
+    assert "The newest X posts from Andrej are in." in notice["message"]
+    assert "status" not in notice and "complete" not in notice["message"]
 
 
 def test_it_fires_exactly_once(conn):
     """Un-stamped it would ride on every call forever and become furniture — the same argument
     `screen` makes for omitting `omitted: 0`."""
-    _finished(conn)
-    assert pull_runs.completion_notice(conn) is not None
-    assert pull_runs.completion_notice(conn) is None
+    _pick(conn, "Andrej")
+    assert told.completion_notice(conn) is not None
+    assert told.completion_notice(conn) is None
 
 
-def test_a_stopped_pull_names_who_is_still_owed_and_is_never_called_a_failure(conn):
-    """The likely cause is that the user quit the app. What landed is durable, so the honest
-    offer is to finish it."""
-    _finished(conn, reached=1)
-    notice = pull_runs.completion_notice(conn)
-
-    assert notice["status"] == "stopped"
-    assert notice["unreached"] == ["Dean", "Soren"]
-    assert "picks up where this stopped" in notice["message"]
-    assert "do NOT call it a failure" in notice["message"]
+def test_a_milestone_is_told_once_briefly_not_made_the_subject(conn):
+    """They asked for something else. A writer landing is a clause, not a turn."""
+    _pick(conn, "Andrej")
+    message = told.completion_notice(conn)["message"]
+    assert "don't make it the subject of the turn" in message
+    assert "Never explain how it works" in message
 
 
-def test_a_completion_is_told_once_briefly_not_made_the_subject(conn):
-    """They asked for something else. A pull landing is a clause, not a turn."""
-    _finished(conn)
-    assert "Do not make it the subject of the turn" in pull_runs.completion_notice(conn)["message"]
+def test_what_is_stuck_is_said_with_what_the_user_can_do(conn):
+    _pick(conn, "Dean", pulled=False)
+    loop_state.set_state("x:UserOriginalsTimeline", "paused", cause="x_session")
+    notice = told.completion_notice(conn)
+    stuck = next(e for e in notice["milestones"] if e["milestone"] == "stuck")
+    assert stuck["step"] == "onboard(source='x')"
+    assert "X needs reconnecting before more of Dean's posts can come in." in notice["message"]
 
 
-def test_it_carries_the_run_id_rather_than_a_presentation(conn):
-    """Counts and names here; the full report is one `progress` call away. Building prose in the
-    row store would put a second opinion about an ingest outcome where the rows live."""
-    run_id = _finished(conn)
-    notice = pull_runs.completion_notice(conn)
-    assert notice["run_id"] == run_id
-    assert "presentation" not in notice
+def test_oracles_from_before_the_scrapers_are_not_announced_at_the_cutover(conn):
+    """Every Oracle already in would otherwise be news at once on the first call."""
+    _pick(conn, "Andrej", asked=False)
+    assert told.completion_notice(conn) is None
 
 
-# ── the four surfaces that carry it ────────────────────────────────────────────
+# ── the surfaces that carry it ────────────────────────────────────────────────
 
-def test_search_carries_it(conn, kb_home, monkeypatch):
+def test_search_carries_it(conn):
     """A notice about Oracles on a tool that has nothing to do with them — because it is the
     thing a returning user is most likely to reach for."""
-    _finished(conn)
-    out: dict = {"hits": [], "notices": []}
-    atoms_tools._attach_pull_notice(out)
-
-    codes = [n["code"] for n in out["notices"]]
-    assert "pull_finished" in codes
+    _pick(conn, "Andrej")
+    out = mcp_session.session().call("search", "anything")
+    assert "pull_finished" in [n["code"] for n in out["notices"]]
 
 
-def test_the_screen_surface_carries_it(conn, kb_home):
-    _finished(conn)
-    out = oracle_tools._screen(conn, floor=15, limit=40)
-    assert out["pull_finished"]["writers"] == 3
+def test_the_screen_surface_carries_it(conn):
+    _pick(conn, "Andrej")
+    out = mcp_session.session().call("oracle", action="screen")
+    assert out["pull_finished"]["milestones"][0]["name"] == "Andrej"
 
 
 def test_progress_spends_the_notice_so_it_is_not_told_twice(conn, monkeypatch):
-    """A host just handed the whole report will tell the user. Letting the rider announce the
-    same completion again on their next `search` would have OPYT report one event twice."""
-    monkeypatch.setattr(oracle_tools, "PROGRESS_WAIT_SECONDS", 0.0)
-    _finished(conn)
+    """A host just handed the milestones will tell the user. Letting the rider announce them
+    again on their next `search` would have OPYT report one event twice."""
+    monkeypatch.setattr(progress, "PROGRESS_WAIT_SECONDS", 0.0)
+    _pick(conn, "Andrej")
+    assert progress.progress(conn)["picks"][0]["newest_posts"] is True
+    assert told.completion_notice(conn) is None
 
-    assert oracle_tools._progress(conn)["status"] == "complete"
-    assert pull_runs.completion_notice(conn) is None
 
+def test_an_unreadable_store_contributes_nothing_and_breaks_nothing(kb_home, monkeypatch):
+    """A courtesy on somebody else's answer must never be able to break it: the answer with a
+    broken notice is exactly the answer with none."""
 
-def test_an_unreadable_store_contributes_nothing_and_breaks_nothing(monkeypatch):
-    """A courtesy on somebody else's answer must never be able to break it."""
-    from pipeline.kb import pull_runs as pr
-    monkeypatch.setattr(pr, "completion_notice", lambda *a, **k: 1 / 0)
-    out: dict = {"hits": []}
-    atoms_tools._attach_pull_notice(out)
-    assert out == {"hits": []}
+    search = mcp_session.session().tools()["search"]
+    monkeypatch.setattr(told, "completion_notice", lambda *a, **k: 1 / 0)
+    broken = search("anything")
+
+    monkeypatch.setattr(told, "completion_notice", lambda *a, **k: None)
+    assert broken == search("anything")
+

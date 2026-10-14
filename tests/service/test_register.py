@@ -13,8 +13,8 @@ other job, guarding the upload against a second owner token for one name.
 """
 from __future__ import annotations
 
-from pipeline.kb import peers
-from service import store, uploads
+from pipeline.retrieval import peers
+from service import db, tokens, uploads
 
 
 def _register(client, label=None):
@@ -60,7 +60,7 @@ def test_two_registrations_are_two_knowledge_bases(svc):
     a, b = _register(svc.client, "Alex"), _register(svc.client, "Alex")
 
     assert a["owner"] != b["owner"] and a["token"] != b["token"]
-    assert store.owner_label(a["owner"]) == store.owner_label(b["owner"]) == "Alex"
+    assert tokens.owner_label(a["owner"]) == tokens.owner_label(b["owner"]) == "Alex"
 
 
 def test_a_key_collision_retries_instead_of_failing(svc, monkeypatch):
@@ -69,7 +69,7 @@ def test_a_key_collision_retries_instead_of_failing(svc, monkeypatch):
     key is one that is already claimed, and the caller must never learn that happened."""
     taken = _register(svc.client)["owner"]
     keys = iter([taken, "aabbccddeeff"])
-    monkeypatch.setattr(store.secrets, "token_hex", lambda n: next(keys))
+    monkeypatch.setattr(tokens.secrets, "token_hex", lambda n: next(keys))
 
     assert _register(svc.client)["owner"] == "aabbccddeeff"
 
@@ -89,11 +89,11 @@ def test_the_claim_still_guards_the_upload(svc):
     `owner` unique, and a pre-claims database can already hold two owner tokens for one name — so
     agreeing strings are not enough, and `claim_holder` is what stops the second token replacing
     the first one's served file."""
-    conn = store.connect()
+    conn = db.connect()
     try:
-        second = store.mint_token("interloper", "owner")
+        second = tokens.mint_token("interloper", "owner")
         conn.execute("UPDATE tokens SET owner = ? WHERE token_sha256 = ?",
-                     (svc.owner, store.token_hash(second)))
+                     (svc.owner, tokens.token_hash(second)))
         conn.commit()
     finally:
         conn.close()
@@ -117,12 +117,12 @@ def _granted_but_unpublished(svc):
 
 
 def test_every_read_endpoint_answers_a_missing_export_the_same_way(svc):
-    """One boundary check, four endpoints. Before `_served` existed, only `meta` 404'd: `search`,
-    `open` and `aggregate` returned 200 carrying the LOCAL entry point's answer, which is written
-    for a person at their own install."""
+    """One boundary check, four endpoints. Before `serving.served` existed, only the (since
+    deleted) `meta` route 404'd: `search`, `open` and `aggregate` returned 200 carrying the LOCAL
+    entry point's answer, which is written for a person at their own install."""
     owner, hdr = _granted_but_unpublished(svc)
 
-    one = svc.client.get(f"/v1/kb/{owner}/meta", headers=hdr)
+    one = svc.client.get(f"/v1/kb/{owner}/feed", headers=hdr)
     assert one.status_code == 404
     for path, body in (("search", {"query": "x"}), ("open", {"atom_id": "a"}),
                        ("aggregate", {"scope": None})):
@@ -133,7 +133,7 @@ def test_every_read_endpoint_answers_a_missing_export_the_same_way(svc):
 
 
 def test_a_reader_never_learns_what_else_this_service_serves(svc):
-    """The leak `_served` closes, and self-service is what made it matter: the local entry
+    """The leak `serving.served` closes, and self-service is what made it matter: the local entry
     point's sentence for an unreadable `kb=` NAMES every knowledge base registered on the box —
     which here is every published routing key — and tells the caller to omit `kb` and search their
     own, which a reader of a served export cannot do. Harmless prose locally, the server's

@@ -2,19 +2,18 @@
 
 The two halves do different jobs and BOTH are needed. `ignore` is a snapshot we maintain by hand;
 `sort` is a policy OpenRouter re-evaluates live. Proof that the deny-list alone is insufficient
-(2026-07-31, 6 calls per arm, interleaved): banning DeepInfra moved the tail to AkashML (p50 2.28 s,
+(6 calls per arm, interleaved): banning DeepInfra moved the tail to AkashML (p50 2.28 s,
 max 10.49 s) while a speed sort collapsed it outright (p50 0.79 s, max 1.20 s). Slowness was
 never a property of one provider — it was a property of not selecting on speed at all.
 
-WHICH speed sort changed on 2026-09-15, when the classify roles moved to gpt-oss-120b:
-re-measured three arms x 6 calls on content_quality-size payloads, sort:"latency" (p50 1.45 s,
+WHICH speed sort was chosen after the classify roles moved to gpt-oss-120b:
+measured three arms x 6 calls on content_quality-size payloads, sort:"latency" (p50 1.45 s,
 spread 1.4x, ~half throughput's cost) beat sort:"throughput" (p50 1.19 s, spread 13.7x) on
-cost-consistency and sort:"price" (p50 14.60 s) outright. See
-docs/plans/2026-09-15-cheaper-classify-models-and-latency-sort.md.
+cost-consistency and sort:"price" (p50 14.60 s) outright.
 
 Two rules the tests below pin, because both fail SILENTLY:
-  - the sort must yield to a caller's explicit `order` (embed's Nebius-over-SiliconFlow preference
-    is about fp8 precision, which a speed ranking has no view on);
+  - the sort must yield to a caller's explicit `order` (an order states a preference, such as
+    precision, that a speed ranking has no view on);
   - the sort must not clobber `require_parameters` or `ignore`, the same merge hazard the deny-list
     had.
 
@@ -24,19 +23,19 @@ Why this file exists (the evidence, so a future reader does not re-derive it):
 
   DeepInfra — denied for LATENCY. Reproduced on two models a week apart, so it is a property of the
   provider, not one bad afternoon:
-    2026-07-22  qwen/qwen3-embedding-8b   71–93 s on 5/5 calls, 99.99 % uptime claimed
-    2026-07-29  meta-llama/llama-3.3-70b  8.4–23.7 s on 10/10 calls, while every other upstream
+    qwen/qwen3-embedding-8b               71–93 s on 5/5 calls, 99.99 % uptime claimed
+    meta-llama/llama-3.3-70b              8.4–23.7 s on 10/10 calls, while every other upstream
                                           answered the identical prompt in under 2.9 s
 
-  Cloudflare — denied for CORRECTNESS, which is the more dangerous failure. 2026-07-29,
+  Cloudflare — denied for CORRECTNESS, which is the more dangerous failure. On
   llama-3.3-70b, 8/8 calls: `finish_reason: "tool_calls"` with `message.content == ""` while billing
-  70 completion tokens. `llm_client` reads message.content, so the batch looks like an empty answer,
-  `content_gate._parse_verdicts("")` returns {}, and the page degrades to keep-all — ungraded
-  boilerplate enters the KB, paid for, with no error raised. It also defeats `require_parameters`.
+  70 completion tokens. `llm_client` reads message.content, so the batch looks like an empty answer
+  and the caller parses nothing — paid for, with no error raised. It also defeats
+  `require_parameters`.
 
-The 2026-07-22 fix used `provider.order` + `allow_fallbacks: true` and its comment claimed DeepInfra
+An earlier fix used `provider.order` + `allow_fallbacks: true` and its comment claimed DeepInfra
 was "excluded". `order` only RANKS; a fallback could still land there. The hard exclusion is `ignore`,
-and these tests pin that it is present on both OpenRouter surfaces (chat + embeddings).
+and these tests pin that it is present on the OpenRouter chat surface (there is no embeddings surface).
 
 The load-bearing test is `test_json_mode_require_parameters_survives`: the chat path already set
 `body["provider"] = {"require_parameters": True}`, so a deny-list that ASSIGNS instead of MERGING
@@ -46,11 +45,11 @@ return to the malformed-verdict bug `require_parameters` was added to fix.
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
 from opyt_core import config as core_config
 from pipeline import llm_client
+from tests.test_llm_client import _with_json_role
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
@@ -105,7 +104,7 @@ def captured_chat(monkeypatch):
 
 def test_default_denies_known_broken_upstreams():
     """DeepInfra is denied for LATENCY, Cloudflare for CORRECTNESS (returns finish_reason
-    tool_calls with empty message.content while billing tokens — 8/8 calls, 2026-07-29)."""
+    tool_calls with empty message.content while billing tokens — 8/8 calls)."""
     deny = core_config.openrouter_deny_upstreams()
     assert "DeepInfra" in deny
     assert "Cloudflare" in deny
@@ -117,7 +116,7 @@ def test_merge_adds_ignore_to_empty_prefs():
 
 
 def test_merge_preserves_caller_keys():
-    """An `order` preference and `allow_fallbacks` must survive — embed relies on both to pick
+    """An `order` preference and `allow_fallbacks` must survive — the (since deleted) embed path relied on both to pick
     Nebius (full precision, 4x cheaper) over SiliconFlow (fp8)."""
     out = core_config.merge_provider_routing(
         {"order": ["Nebius", "SiliconFlow"], "allow_fallbacks": True})
@@ -150,8 +149,8 @@ def test_sort_defaults_to_latency():
 
 def test_sort_yields_to_an_explicit_order():
     """THE Fork-1 guard. An `order` from the call site states a preference the sort cannot see:
-    embed's order picks Nebius over SiliconFlow for full precision, and a speed ranking would
-    happily choose the fp8 upstream — writing quantized vectors into a full-precision index, which
+    the (since deleted) embed path's order picked Nebius over SiliconFlow for full precision, and
+    a speed ranking would happily choose the fp8 upstream — writing quantized vectors into a full-precision index, which
     degrades similarity with no error raised anywhere."""
     out = core_config.merge_provider_routing({"order": ["Nebius", "SiliconFlow"]})
     assert "sort" not in out, "sort overrode an explicit precision preference"
@@ -242,11 +241,11 @@ def test_chat_request_routes_on_deny_and_sort(captured_chat):
     assert prefs["sort"] == "latency"
 
 
-def test_json_mode_require_parameters_survives(captured_chat):
-    """THE regression guard. `content_quality` sets response_format=json_object, which sets
+def test_json_mode_require_parameters_survives(captured_chat, monkeypatch):
+    """THE regression guard. A role that sets response_format=json_object sets
     require_parameters. All three keys must coexist — a routing merge that replaced the dict would
     drop the JSON-mode guarantee with no error and no log line."""
-    llm_client.call("content_quality", system="s", user="u")
+    llm_client.call(_with_json_role(monkeypatch), system="s", user="u")
     prefs = captured_chat["body"]["provider"]
     assert prefs["require_parameters"] is True, "JSON-mode guarantee was clobbered by routing"
     assert "DeepInfra" in prefs["ignore"]
@@ -262,81 +261,3 @@ def test_chat_omits_provider_block_when_routing_disabled(captured_chat, monkeypa
                         lambda: {"openrouter": {"deny_upstreams": [], "sort": None}})
     llm_client.call("vision", system="", user="hi")
     assert "provider" not in captured_chat["body"]
-
-
-# ── surface 2: embeddings (kb.embed) ─────────────────────────────────────────────
-
-
-def test_embed_request_denies_deepinfra(monkeypatch):
-    """The embed path had `order` but no `ignore`, so a fallback could still reach DeepInfra. The
-    order preference must survive alongside the new hard exclusion."""
-    from pipeline.kb import embed as embed_mod
-
-    seen: dict = {}
-
-    def fake_post(req, timeout):
-        seen["body"] = __import__("json").loads(req.data.decode())
-        n = len(seen["body"]["input"])
-        return {"data": [{"embedding": [0.1, 0.2, 0.3], "index": i} for i in range(n)]}
-
-    monkeypatch.setattr(embed_mod, "_http_post_json", fake_post)
-    monkeypatch.setattr("pipeline.credentials.get_credential", lambda _p: "test-key")
-
-    emb = embed_mod.HostedEmbedder(dict(embed_mod._DEFAULTS), use_breaker=False)
-    emb._dim = 3
-    emb._embed_batch(["hello"])
-
-    prefs = seen["body"]["provider"]
-    assert "DeepInfra" in prefs["ignore"], "embeddings could still fall back to DeepInfra"
-    assert prefs["order"] == ["Nebius", "SiliconFlow"], "order preference must survive the merge"
-    assert prefs["allow_fallbacks"] is True
-    # The Fork-1 rule, asserted on the real surface it protects: a speed sort here could pick
-    # SiliconFlow (fp8, 4x price) over Nebius while Nebius is healthy, quietly mixing quantized
-    # vectors into a full-precision index.
-    assert "sort" not in prefs, "sort leaked onto the embedding surface"
-
-
-def test_embed_denylist_survives_a_settings_override(monkeypatch):
-    """A user override of `embeddings.provider_routing` replaces the whole routing block. The
-    deny-list is merged at REQUEST time so an override cannot silently drop the guard."""
-    from pipeline.kb import embed as embed_mod
-
-    seen: dict = {}
-
-    def fake_post(req, timeout):
-        seen["body"] = __import__("json").loads(req.data.decode())
-        return {"data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}]}
-
-    monkeypatch.setattr(embed_mod, "_http_post_json", fake_post)
-    monkeypatch.setattr("pipeline.credentials.get_credential", lambda _p: "test-key")
-
-    cfg = dict(embed_mod._DEFAULTS)
-    cfg["provider_routing"] = {"order": ["SomethingElse"]}      # user wiped the original block
-    emb = embed_mod.HostedEmbedder(cfg, use_breaker=False)
-    emb._dim = 3
-    emb._embed_batch(["hello"])
-
-    assert "DeepInfra" in seen["body"]["provider"]["ignore"]
-    assert seen["body"]["provider"]["order"] == ["SomethingElse"]
-
-
-def test_embed_vectors_still_returned(monkeypatch):
-    """Sanity: the routing change must not disturb the vector assembly contract."""
-    from pipeline.kb import embed as embed_mod
-
-    def fake_post(req, timeout):
-        body = __import__("json").loads(req.data.decode())
-        return {"data": [{"embedding": [1.0, 2.0, 3.0], "index": i}
-                         for i in range(len(body["input"]))]}
-
-    monkeypatch.setattr(embed_mod, "_http_post_json", fake_post)
-    monkeypatch.setattr("pipeline.credentials.get_credential", lambda _p: "test-key")
-
-    emb = embed_mod.HostedEmbedder(dict(embed_mod._DEFAULTS), use_breaker=False)
-    emb._dim = 3
-    out = emb._embed_batch(["a", "b"])
-    assert len(out) == 2
-    # _embed_batch L2-normalizes, so compare against the unit vector, not the raw payload.
-    expected = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    assert np.allclose(out[0], expected / np.linalg.norm(expected))
-    assert np.isclose(np.linalg.norm(out[0]), 1.0)

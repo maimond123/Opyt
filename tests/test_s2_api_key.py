@@ -14,7 +14,8 @@ import pytest
 
 from opyt_core import keys as core_keys
 from pipeline import credentials
-from pipeline.kb import ingest_papers as ip
+from pipeline.platforms.papers import pdf as paper_pdf
+from pipeline.platforms.papers import lookup as paper_lookup
 
 
 @pytest.fixture()
@@ -69,7 +70,7 @@ def test_the_atom_kb_s2_fetch_sends_the_key(monkeypatch, with_key):
     import requests
     monkeypatch.setattr(requests, "get", _get)
 
-    ip._fetch_s2_paper("arXiv:1706.03762")
+    paper_lookup.fetch_s2_paper("arXiv:1706.03762")
     assert "semanticscholar.org" in seen["url"]
     assert seen["headers"].get("x-api-key") == "s2-test-key"
 
@@ -103,7 +104,7 @@ def test_pdf_download_never_carries_the_s2_key(monkeypatch, with_key):
     import requests
     monkeypatch.setattr(requests, "get", _get)
 
-    ip._download_pdf("https://some-random-blog.example.com/paper.pdf")
+    paper_pdf._download_pdf("https://some-random-blog.example.com/paper.pdf")
     assert "x-api-key" not in seen["headers"], (
         f"S2 credential leaked to {seen['url']} — PDF downloads must use _PDF_UA")
 
@@ -111,8 +112,8 @@ def test_pdf_download_never_carries_the_s2_key(monkeypatch, with_key):
 def test_pdf_headers_and_s2_headers_are_not_the_same_object(with_key):
     """Structural half of the guard above: if one dict served both, any future key added to it
     would leak by construction and no behavioural test would necessarily catch it."""
-    assert "x-api-key" not in ip._PDF_UA
-    assert ip._PDF_UA is not credentials.s2_headers()
+    assert "x-api-key" not in paper_pdf._PDF_UA
+    assert paper_pdf._PDF_UA is not credentials.s2_headers()
 
 
 # ── registered so onboarding can offer it ────────────────────────────────────────
@@ -120,41 +121,7 @@ def test_s2_key_is_registered_everywhere_onboarding_looks():
     """A key the user can set but no surface mentions is a key nobody sets. All three registries
     have to know about it: the service map, `opyt-keys --list`, and the .env template."""
     assert credentials.SERVICES["semanticscholar"] == "S2_API_KEY"
-    assert "S2_API_KEY" in core_keys.KNOWN
+    assert "S2_API_KEY" in core_keys.status()          # what `opyt-keys --list` prints
 
 
-# The preflight test (both optional keys warn with their signup URL) was deleted 2026-08-29 with
-# its subject: `lifecycle.check_prerequisites` had no production caller (`retired-lifecycle-
-# preflight` guard). Signup-URL rendering is pinned registry-side by
-# `credential-metadata-lives-in-the-registry`.
-
-
-# ── validation ───────────────────────────────────────────────────────────────────
-def test_a_429_during_validation_is_not_reported_as_a_bad_key(monkeypatch):
-    """An anonymous burst produces 429 too, so a 429 cannot distinguish a bad key from a busy
-    moment. Calling it invalid sends the user to regenerate a perfectly good key."""
-    class _Resp:
-        status_code = 429
-
-    import requests
-    monkeypatch.setattr(requests, "get", lambda *a, **kw: _Resp())
-
-    ok, msg = credentials.validate_credential("semanticscholar", "s2-test-key")
-    assert ok is True
-    assert "does NOT mean it is invalid" in msg
-
-
-@pytest.mark.parametrize("status,expect_ok", [(200, True), (401, False), (403, False), (500, False)])
-def test_validation_maps_status_to_verdict(monkeypatch, status, expect_ok):
-    class _Resp:
-        status_code = None
-
-        def json(self):
-            return {"title": "Attention is All you Need"}
-
-    _Resp.status_code = status
-    import requests
-    monkeypatch.setattr(requests, "get", lambda *a, **kw: _Resp())
-
-    ok, _ = credentials.validate_credential("semanticscholar", "s2-test-key")
-    assert ok is expect_ok
+# Signup-URL rendering is pinned registry-side by `credential-metadata-lives-in-the-registry`.

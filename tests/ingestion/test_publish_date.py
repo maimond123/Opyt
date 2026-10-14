@@ -1,20 +1,20 @@
 """_publish_date — the blog CREATION-date extractor. Pure, offline (htmldate parses passed HTML,
 no network). Locks: (1) prefer the PUBLISH date over a later 'modified' date, (2) mine a
 date embedded in the URL path when the page carries none, (3) empty string when nothing is found,
-and (4) — added 2026-08-13 — the page's OWN asserted publish date OUTRANKS anything htmldate
+and (4) the page's OWN asserted publish date OUTRANKS anything htmldate
 infers, because on real pages htmldate loses the tag and substitutes a footer copyright year."""
 from __future__ import annotations
 
 from datetime import date, timedelta
 
-from pipeline.ingestion.sources.blog import _asserted_publish_dates, _publish_date
+from pipeline.platforms.web.article import _asserted_publish_dates, _publish_date
 
 # The shape that caused the bug: a real publish date in the head, a LATER year in the footer.
 _FOOTER_2026 = "<footer><span>&copy; 2026 Example Inc</span></footer>"
 
 
 def test_an_asserted_date_beats_a_footer_copyright_year():
-    """THE regression guard. LIVE-MEASURED 2026-08-13 on letta.com/blog/sleep-time-compute: the
+    """The regression guard. Measured live on letta.com/blog/sleep-time-compute: the
     page declared `article:published_time = 2025-04-21`, and htmldate's full-document parse
     returned 2026-01-01 — the footer's "© 2026" via its free-text extensive search. The same
     document parsed HEAD-ONLY returned 2025-04-21, so the tag was always fine and readable; the

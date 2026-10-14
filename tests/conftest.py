@@ -1,16 +1,16 @@
 """Repo-wide test guards.
 
-WHY THIS EXISTS (2026-08-02). Migrating the X/long-form image paths off `describe_image` onto the
+Why this exists: migrating the X/long-form image paths off `describe_image` onto the
 OCR cascade broke the seam nine test files were faking. Those tests patched
 `pipeline.processing.describe_images.describe_image` (both since deleted — the cascade lives at
-`pipeline.ocr_cascade` now); the cascade calls `pipeline.llm_client.call`,
+`pipeline.chart_read` now); the cascade calls `pipeline.llm_client.call`,
 so the patches stopped intercepting and the tests fell through to REAL HTTP against fake URLs
 (`https://pbs/0.jpg`) — where they HUNG rather than failed. A hang is the worst possible signal: it
 looks like a slow suite, it can spend real money, and it names neither the test nor the reason.
 
 So a unit test that reaches `llm_client.call` now fails LOUDLY and says what to patch. This is the
 same rule the pipeline itself follows — a failure must be visible at the moment it happens, never
-degrade into something indistinguishable from working (CLAUDE.md fail-safe; cf. the 2026-08-01 OCR
+degrade into something indistinguishable from working (the fail-safe rule; cf. an earlier OCR
 outage, silent for weeks because a missing transcript looks exactly like a post with no images).
 
 Tests that genuinely want the network mark themselves:
@@ -26,7 +26,7 @@ body, after this autouse fixture, so its patch takes precedence; only a test tha
 socket trips. Both backends (anthropic and openrouter) funnel through `_http_json` → `urlopen`, so
 one seam covers every provider.
 
-TWO seams, not one (2026-08-02). The first version guarded ONLY `urlopen`, and the pipeline also
+Two seams, not one. The first version guarded only `urlopen`, and the pipeline also
 speaks `requests` — `ingest_papers._download_pdf`, the scrapers, the GitHub API. A new test calling
 the real `atomize_paper` sailed straight through and spent 44 SECONDS pulling a PDF for a fake arXiv
 id. Exactly the failure this file exists to prevent, one transport over: a guard that covers most of
@@ -37,20 +37,30 @@ whoever-fakes-the-network-wins rule for tests that stub `requests.get` in their 
 from __future__ import annotations
 
 import subprocess
+import sys
 import urllib.request
 
 import pytest
 
 
-def reset_atoms_session() -> None:
-    """Reset atom-tool process state between tests without a production-only seam."""
-    from mcp_server import atoms_tools
+@pytest.fixture(autouse=True)
+def _fresh_mcp_session():
+    """Every test leaves no MCP session open: a test that opened a client session through
+    `tests/mcp_session.py` has it closed here, so a test can hold one across calls the way a host
+    holds one across a conversation."""
+    yield
+    if "tests.mcp_session" in sys.modules:
+        sys.modules["tests.mcp_session"].close_all()
 
-    atoms_tools._SEARCHES = 0
-    atoms_tools._FRONTIER_NOTICED = False
-    atoms_tools._THIN_OFFERED = False
-    atoms_tools._OPENED.clear()
-    atoms_tools._RECENT.clear()
+
+@pytest.fixture(autouse=True)
+def _a_keyed_install(monkeypatch):
+    """Every test runs as an install that holds an OpenRouter key, unless it removes it. A key is
+    what turns models on (`credentials.model_access`), and `opyt_core` loads `~/.opyt/.env` at
+    import, so without this a test's answer would depend on whether the developer running it has
+    a key of their own. The value is fake: the network guard below stops any real call. A test of
+    the free tier deletes it (`monkeypatch.delenv("OPENROUTER_API_KEY")`)."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
 
 
 @pytest.fixture(autouse=True)
@@ -68,14 +78,14 @@ def _model_routing_cache_never_resolves_to_the_real_store(tmp_path_factory, monk
 
 
 @pytest.fixture(autouse=True)
-def _ocr_resolution_pinned(monkeypatch):
-    """`read_image` resolves its model through the network-backed catalog on first use — a seam
-    the nine files faking `llm_client.call` never patch, so unpinned it trips the network guard
-    below. Pin the primary per test; a test exercising resolution calls
+def _chart_model_pinned(monkeypatch):
+    """`read_image` checks its model against the network-backed catalog on first use — a seam
+    the files faking `llm_client.call` never patch, so unpinned it trips the network guard
+    below. Pin the model per test; a test exercising the check calls
     `_reset_stage_for_tests()` (which clears the pin) and patches
-    `model_routing.resolve_ocr_model` itself."""
-    from pipeline import ocr_cascade
-    monkeypatch.setattr(ocr_cascade, "_RESOLVED", ocr_cascade.OCR_MODEL)
+    `model_routing.chart_model_unroutable` itself."""
+    from pipeline import chart_read
+    monkeypatch.setattr(chart_read, "_RESOLVED", chart_read.CHART_MODEL)
 
 
 @pytest.fixture(autouse=True)
@@ -84,28 +94,29 @@ def _rail_preflight_pinned_open(monkeypatch):
     a network-backed catalog check — a seam the rail tests (which fake locks, budgets, and
     ingesters) never patch. Pinned OPEN per test. The rails bind the name at import
     (`from ... import models_unroutable`), so the pin must land on each rail module, not on
-    `rail_runtime`; `tests/kb/test_rail_gate.py` reaches the real function through `rail_runtime`,
-    which stays unpinned for exactly that reason.
+    `model_routing`; `tests/kb/test_rail_gate.py` reaches the real function through
+    `model_routing`, which stays unpinned for exactly that reason.
 
-    `frontier_execute` and `curation_catchup` are absent because neither calls a model at all.
-    `frontier_execute`'s preflight came off with its ceiling on 2026-09-04; `curation_catchup`'s
-    came off on 2026-09-05, once its collectors were traced and none reached an LLM. Both stay
-    LABELLED rails, so a future paid change puts them back on this list —
-    `test_a_free_rail_is_labelled_but_gets_NO_ceiling` is what fails if one grows a preflight."""
-    from pipeline.kb import (bookmark_catchup, frontier_admit, oracle_refresh, probe_catchup,
-                             sitting_scheduler, substack_saved_catchup)
-    for mod in (bookmark_catchup, frontier_admit, oracle_refresh, probe_catchup,
-                sitting_scheduler, substack_saved_catchup):
-        monkeypatch.setattr(mod, "models_unroutable", lambda rail: None)
+    Frontier's searches and admissions run in the scrapers process (`background`) and
+    publishing, under its gate."""
+    from pipeline import background
+    monkeypatch.setattr(background, "models_unroutable", lambda rail: None)
+
+
+@pytest.fixture(autouse=True)
+def _robots_txt_pinned_absent(monkeypatch):
+    """Every web read asks its origin's robots.txt first (`robots.check`, from
+    `host_access.request`): a network read the tests that fake a page never patch, so unpinned
+    it trips the network guard below. Pinned to "this site has no robots.txt", with an empty
+    cache per test; `tests/test_robots.py` patches `robots._read` itself."""
+    from pipeline import robots
+    monkeypatch.setattr(robots, "_read", lambda origin, user_agent: robots.ALLOW_ALL)
+    monkeypatch.setattr(robots, "_CACHE", {})
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "live_llm: test intentionally issues a real (paid) network call")
-    config.addinivalue_line(
-        "markers", "real_gate: drive the real content_gate (opts out of the keep-all stub)")
-    config.addinivalue_line(
-        "markers", "real_triage: drive the real url triage (opts out of the approve-all stub)")
     config.addinivalue_line(
         "markers", "loopback: test talks to a server IT STARTED on 127.0.0.1/::1 (never the net)")
 
@@ -158,7 +169,7 @@ def _block_live_network(request, monkeypatch):
         pytest.fail(
             f"LIVE NETWORK CALL from a unit test — {url}{where}\n"
             f"Something reached a real socket through an unpatched seam. Patch the collaborator "
-            f"the code ACTUALLY calls (e.g. `ocr_cascade.read_image` for image reads — see the "
+            f"the code ACTUALLY calls (e.g. `chart_read.read_image` for image reads — see the "
             f"`ocr` fixture in tests/kb/conftest.py), or mark the test @pytest.mark.live_llm if "
             f"the call is intended.", pytrace=False)
 
@@ -180,41 +191,21 @@ def _never_the_real_data_home(monkeypatch, tmp_path_factory):
     opt-in, so it only held for tests that asked for it. Everything else resolved `opyt_home()`
     to the live store.
 
-    Found on 2026-09-14 by looking: `pull_runs` and `pull_run_oracles` existed in the real
+    Found by looking: `pull_runs` and `pull_run_oracles` existed in the real
     `~/.opyt/opyt.db`, created by a suite run. DDL only and zero rows, so nothing was corrupted —
     but a test that can CREATE a table there can write one, and the next thing to reach for that
     store was a "completely new user" onboarding run, which would have found it pre-seeded.
 
     The reachable path was new and ordinary: `search` and `aggregate` now carry a completion
-    notice, `_attach_pull_notice` opens the store to look for one, and no fixture stood between
-    that and the user's home. Nothing about it was exotic, which is the point — this is the same
-    class of guard as the network block and the LaunchAgent block: the side effect ESCAPES the
-    test process, so it has to be stopped at the boundary rather than per-test.
+    notice, the rider flow (`mcp_server/riders.py`) opens the store to look for one, and no
+    fixture stood between that and the user's home. Nothing about it was exotic, which is the
+    point — this is the same class of guard as the network block and the LaunchAgent block: the
+    side effect ESCAPES the test process, so it has to be stopped at the boundary rather than
+    per-test.
 
     Session-scoped tmp dir per test, and a test that wants its own (`kb_home`, the service
     conftest's two homes) simply sets it again afterwards — a later `monkeypatch.setenv` wins."""
     monkeypatch.setenv("OPYT_HOME", str(tmp_path_factory.mktemp("opyt-home")))
-
-
-@pytest.fixture(autouse=True)
-def _pulls_run_inline(monkeypatch):
-    """No test may leave a real Oracle pull running on a thread.
-
-    Same class of guard as the network block and the LaunchAgent block above, and for the same
-    reason: the side effect ESCAPES the test. Since `oracle(action='ingest')` stopped waiting for
-    its own pull, `_ingest` spawns `_run_pull` on a daemon thread — which outlives the test that
-    started it, wakes up after monkeypatching has been torn down, and then calls the REAL
-    `_ingest_oracle` against the REAL network with whatever `$OPYT_HOME` the next test has set.
-
-    Inline is also what makes the existing assertions meaningful. `_ingest` reports a FINISHED run
-    when the record is already closed by the time it returns, which under this seam is always —
-    so a test that drives `_ingest` still gets the full report and is testing the pull rather
-    than the announcement. The handful of tests that are about the announcement itself replace
-    this fixture with a no-op spawn.
-
-    Same shape and the same one job as `onboard_tools._spawn`'s seam."""
-    from mcp_server import oracle_tools
-    monkeypatch.setattr(oracle_tools, "_spawn", lambda target: target() and None)
 
 
 @pytest.fixture(autouse=True)
@@ -225,9 +216,10 @@ def _no_resident_service(monkeypatch, tmp_path_factory):
     ⚠️ IT LEAVES THE MACHINE CHANGED, WHICH IS WORSE THAN A HANG. `install_worker.install()` writes
     `~/Library/LaunchAgents/com.useopyt.worker.plist` and `launchctl bootstrap`s it — a real,
     resident, KeepAlive process on whoever ran `pytest`, outliving the suite, the checkout and the
-    reboot. It became reachable from a unit test the moment consent started installing the worker
-    (`onboard_tools._follow_consent_with_a_worker`): eight `test_onboard_tool` cases walked
-    straight into it, and nothing about a green suite would have said so.
+    reboot. It became reachable from a unit test the moment consent started installing the worker:
+    eight `test_onboard_tool` cases walked straight into it, and nothing about a
+    green suite would have said so. Every `onboard` call past the model-provider step reaches it
+    now (`pipeline/onboarding/worker_check.ensure`).
 
     GUARDED AT THE BOUNDARY, NOT AT THE FUNCTION, which is this file's own rule — "the guard sits
     at `urlopen`, the ACTUAL network boundary". Blocking `install()` itself would break the tests
@@ -239,10 +231,18 @@ def _no_resident_service(monkeypatch, tmp_path_factory):
     `status()` is left ALONE on purpose. It only reads, every caller is fail-safe against it, and
     stubbing it would hide the one question the product must ask before it promises that work
     continues on its own.
+
+    And no test waits for a beat. `repair_or_report` gives a just-installed worker a few seconds
+    to beat, and under the stubbed `launchctl` above nothing ever will — so every `onboard` call
+    would sleep the full wait. A test about the wait sets its own patience.
     """
     from opyt_core import install_worker
+    from pipeline.worker import liveness
 
     agents = tmp_path_factory.mktemp("launch-agents")
     monkeypatch.setattr(install_worker, "PLIST_PATH", agents / "com.useopyt.worker.plist")
     monkeypatch.setattr(install_worker, "_launchctl",
                         lambda *a: subprocess.CompletedProcess(list(a), 0, "", ""))
+    monkeypatch.setattr(liveness, "REPORT_PATIENCE", 0.0)
+    # A fresh cache per test: an answer cached under one test's stubs must not reach the next.
+    monkeypatch.setattr(liveness, "_REPORT_CACHE", {})

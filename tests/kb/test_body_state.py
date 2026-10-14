@@ -37,18 +37,13 @@ def test_unknown_values_raise(state, basis):
         body_fields(state, basis)
 
 
-# The verdict->state mapper `body_from_verdict` was deleted 2026-08-28: every adapter calls the
-# sibling `body_fields` directly and nothing ever called it. Its tests went with it.
-
 # ── the retry set ─────────────────────────────────────────────────────────────────
 def _put(conn, atom_id: str, payload: dict) -> None:
     schema.upsert_atom(conn, {"atom_id": atom_id, "source_type": "substack", "payload": payload})
 
 
 def test_load_body_pending_selects_only_pending(kb_home):
-    """Only a blocked fetch (`pending`) earns a retry — `absent` and `complete` never re-fetch.
-    (A legacy `body_pending` boolean arm was read here too until 2026-08-29; deleted after its
-    removal condition — zero legacy-key atoms on any store the old writer touched — was met.)"""
+    """Only a blocked fetch (`pending`) earns a retry — `absent` and `complete` never re-fetch."""
     conn = schema.connect()
     _put(conn, "substack:new", body_fields(BODY_PENDING, BASIS_OBSERVED))
     _put(conn, "substack:done", body_fields(BODY_COMPLETE, BASIS_STATED))
@@ -67,8 +62,8 @@ def test_rewriting_as_complete_clears_pending(kb_home):
 
 
 # ── the universality property ─────────────────────────────────────────────────────
-_ADAPTERS = ("ingest_x", "ingest_x_footprint", "ingest_substack", "ingest_curation",
-             "ingest_blog", "ingest_github", "ingest_papers")
+_ADAPTERS = ("kb/ingest_x", "kb/ingest_x_footprint", "kb/ingest_substack",
+             "kb/ingest_blog", "kb/ingest_github", "kb/ingest_papers", "curation/substack_saved")
 
 
 def _payload_dicts(path: Path) -> list[ast.Dict]:
@@ -87,8 +82,7 @@ def _payload_dicts(path: Path) -> list[ast.Dict]:
 
 def _writes_body_fields(payload: ast.Dict) -> bool:
     """True if this payload literal contributes both keys — either spelled out, or splatted from a
-    `body_fields(...)` call (`**` shows up as a None key). The alternative spelling this used to
-    accept, `body_from_verdict`, was deleted 2026-08-28 having never been an adapter's route."""
+    `body_fields(...)` call (`**` shows up as a None key). Adapters do not route through a verdict->state mapper."""
     keys = {k.value for k in payload.keys
             if isinstance(k, ast.Constant) and isinstance(k.value, str)}
     if {"body_state", "body_basis"} <= keys:
@@ -100,10 +94,10 @@ def test_every_adapter_writes_both_keys():
     """THE load-bearing test. Every atom of every source must carry the completeness contract —
     a constant is an assertion, an absence is unfalsifiable. A new adapter that forgets fails
     here instead of quietly leaving a blind spot months later."""
-    kb = Path(__file__).resolve().parents[2] / "pipeline" / "kb"
+    pipeline = Path(__file__).resolve().parents[2] / "pipeline"
     inspected, missing = 0, []
     for name in _ADAPTERS:
-        for payload in _payload_dicts(kb / f"{name}.py"):
+        for payload in _payload_dicts(pipeline / f"{name}.py"):
             inspected += 1
             if not _writes_body_fields(payload):
                 missing.append(name)

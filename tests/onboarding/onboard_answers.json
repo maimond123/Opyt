@@ -1,0 +1,503 @@
+{
+ "connect_substack_local": {
+  "answers": [
+   {
+    "status": "awaiting_login",
+    "phase": "sources",
+    "source": "substack",
+    "message": "Opyt login — Chrome just opened at https://substack.com/sign-in, on a profile OPYT owns — the user's own windows and logins are untouched. Tell the user to log in there, then call `onboard` again."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "login.start:https://substack.com/sign-in"
+  ],
+  "markers": []
+ },
+ "connect_while_done": {
+  "answers": [
+   {
+    "status": "awaiting_login",
+    "phase": "sources",
+    "source": "substack",
+    "message": "Opyt login — Chrome just opened at https://substack.com/sign-in, on a profile OPYT owns — the user's own windows and logins are untouched. Tell the user to log in there, then call `onboard` again."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "login.start:https://substack.com/sign-in"
+  ],
+  "markers": []
+ },
+ "connect_x_local": {
+  "answers": [
+   {
+    "status": "awaiting_login",
+    "phase": "sources",
+    "source": "x",
+    "message": "Opyt login — Chrome just opened at https://x.com/login, on a profile OPYT owns — the user's own windows and logins are untouched. Tell the user to log in there, then call `onboard` again."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "login.start:https://x.com/login"
+  ],
+  "markers": []
+ },
+ "connect_x_local_refused": {
+  "answers": [
+   {
+    "status": "needs_login",
+    "phase": "sources",
+    "source": "x",
+    "message": "No Chrome on this machine."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "login.start:https://x.com/login"
+  ],
+  "markers": []
+ },
+ "curation_both_connected_worker_down": {
+  "answers": [
+   {
+    "status": "in_progress",
+    "phase": "curation",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Every setup question is answered. The people this user already follows are not ready to choose from yet: do not call `screen` yet; they will be read as soon as OPYT's background worker is running again. The helper is switched off. Turn it back on in Login Items. Meanwhile these all work now:\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`.",
+    "curation": {
+     "status": "queued",
+     "host_note": "The people this user already follows are not ready to choose from yet. Do not wait for them, do not mention it as a step, and do not call `screen` in this same turn."
+    },
+    "backlog_queued": [
+     "substack_saved_import",
+     "bookmarks_import"
+    ],
+    "worker_problem": {
+     "status": "disabled",
+     "cause": "The helper is switched off.",
+     "step": "Turn it back on in Login Items.",
+     "detail": {
+      "plist": "x.plist"
+     },
+     "message": "Nothing the user asks for will run until this is fixed, and nothing is lost meanwhile — the work waits. Do NOT say anything is importing, pulling or updating. Tell them `cause` in one plain sentence and give them `step`, if there is one. Name no file and no process."
+    }
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "request_now:scrapers",
+   "request_now:scrapers",
+   "request_now:scrapers"
+  ],
+  "markers": []
+ },
+ "curation_queue_refused": {
+  "answers": [
+   {
+    "status": "in_progress",
+    "phase": "curation",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Every setup question is answered. The people this user already follows are not ready to choose from yet: do not call `screen` yet; call `onboard` again in a few minutes and it says who is ready. Meanwhile these all work now:\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there.\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`.",
+    "curation": {
+     "status": "not_queued"
+    }
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "request_now:scrapers",
+   "request_now:scrapers"
+  ],
+  "markers": []
+ },
+ "curation_substack_not_ready": {
+  "answers": [
+   {
+    "status": "awaiting_login",
+    "phase": "sources",
+    "source": "substack",
+    "message": "The Substack window isn't signed in yet — I checked, and the session doesn't answer an authenticated request. Finish signing in inside Opyt's window; it can take a few seconds to register after you log in. Then tell me you're done and I'll check again. Nothing was pulled, so nothing is half-done."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "curation_x_connected": {
+  "answers": [
+   {
+    "status": "in_progress",
+    "phase": "curation",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Every setup question is answered. The people this user already follows are not ready to choose from yet: do not call `screen` yet; call `onboard` again in a few minutes and it says who is ready. Meanwhile these all work now:\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there.\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`.",
+    "curation": {
+     "status": "queued",
+     "host_note": "The people this user already follows are not ready to choose from yet. Do not wait for them, do not mention it as a step, and do not call `screen` in this same turn."
+    },
+    "backlog_queued": [
+     "bookmarks_import"
+    ]
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "request_now:scrapers",
+   "request_now:scrapers"
+  ],
+  "markers": []
+ },
+ "done_an_oracle_named": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete. Nothing is collected automatically, because no source with automatic discovery is connected — that is the expected state for a blog, newsletter or research user, not a failure.\n\nEvery way to give OPYT something to read stays available:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there.\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "done_blind_store": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete, but OPYT has nothing to read and no signal to guess from — no session, nobody named, nothing watched.\n\nSo ask the user directly. ONE question, two ways to answer it:\n• **What topics are you into?** — lead with this; it is the easier question to answer. Then YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read. The user should have material to explore before anything else gets set up.\n• **Or: who do you already read?** — names, in plain words. YOU web-search for each person's site, X handle, ORCID or OpenAlex page and pass the URL you find. Never ask the user for a link or an identifier — the finding is your job, not theirs. A user with no names is not stuck: the topics route above does the finding, and its survey's recurring authors are the people to bring back as candidates to confirm.\n\nThe login roots stay open too:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": [
+   "onboard_sources_skipped"
+  ]
+ },
+ "done_blind_store_with_a_watch": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete, and the topics the user follows are watching for new papers and repos — but the store itself holds no material yet: nothing to search, nothing to read.\n\nSo ask the user directly. ONE question, two ways to answer it:\n• **What topics are you into?** — lead with this; it is the easier question to answer. Then YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read. The user should have material to explore before anything else gets set up.\n• **Or: who do you already read?** — names, in plain words. YOU web-search for each person's site, X handle, ORCID or OpenAlex page and pass the URL you find. Never ask the user for a link or an identifier — the finding is your job, not theirs. A user with no names is not stuck: the topics route above does the finding, and its survey's recurring authors are the people to bring back as candidates to confirm.\n\nThe login roots stay open too:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "done_blind_store_x_connected_elsewhere": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete, but the collectors found nobody to screen. That usually means the connected session went stale — reconnect with `onboard(source='substack')` — or that this account follows and subscribes to nobody yet.\n\nEither way, these all work now:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`.",
+    "backlog_queued": [
+     "substack_saved_import"
+    ]
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "request_now:scrapers"
+  ],
+  "markers": [
+   "onboard_sources_skipped"
+  ]
+ },
+ "done_found_nobody": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete, but the collectors found nobody to screen. That usually means the connected session went stale — reconnect with `onboard(source='x')` or `onboard(source='substack')` — or that this account follows and subscribes to nobody yet.\n\nEither way, these all work now:\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`.",
+    "backlog_queued": [
+     "substack_saved_import",
+     "bookmarks_import"
+    ]
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "request_now:scrapers",
+   "request_now:scrapers"
+  ],
+  "markers": []
+ },
+ "done_people_to_choose": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 7,
+    "next_tool": "oracle",
+    "message": "Setup is complete. 7 people are ready for the user to choose from.\n\nNext: call `oracle` to pick who to trust. Confirming someone returns at once: their posts are pulled in the background, and `oracle(action='progress')` shows what has landed so far. Starting with a few people means each one's history fills in sooner; more can be added any time.\n\nStill open, and they stay open:\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there.\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`.",
+    "backlog_queued": [
+     "bookmarks_import"
+    ]
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "request_now:scrapers"
+  ],
+  "markers": []
+ },
+ "done_skipped_atoms_unreadable": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete. Nothing is collected automatically, because no source with automatic discovery is connected — that is the expected state for a blog, newsletter or research user, not a failure.\n\nEvery way to give OPYT something to read stays available:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there.\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": [
+   "onboard_sources_skipped"
+  ]
+ },
+ "done_skipped_with_atoms": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete. Nothing is collected automatically, because no source with automatic discovery is connected — that is the expected state for a blog, newsletter or research user, not a failure.\n\nEvery way to give OPYT something to read stays available:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there.\n• **Topics they are into** — the user names interests and YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read.\n• **Anyone, by name** — the user gives a name in plain words; YOU web-search for their site, X handle, ORCID or OpenAlex page and pass what you find to `oracle(action='confirm', add_handles=['https://…'])`. Never ask the user for a URL or an id.\n\nLast, SAY this line as written: \"Want Opyt in claude.ai, ChatGPT or on your phone too? Say 'connect Opyt to Google'.\" If they say it, call `share(to='connector')`."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": [
+   "onboard_sources_skipped"
+  ]
+ },
+ "linux_unsupported": {
+  "answers": [
+   {
+    "status": "unsupported_platform",
+    "phase": "unsupported",
+    "message": "OPYT's local install runs on macOS only for now: everything it collects runs in a background helper, and that helper ships for macOS alone. Tell the user that plainly. If they have a Mac, set OPYT up there (useopyt.com); its library can then be read from claude.ai or ChatGPT on any computer through the Opyt connector. Nothing was set up here."
+   }
+  ],
+  "effects": [],
+  "markers": []
+ },
+ "linux_with_a_running_worker": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete, but OPYT has nothing to read and no signal to guess from — no session, nobody named, nothing watched.\n\nSo ask the user directly. ONE question, two ways to answer it:\n• **What topics are you into?** — lead with this; it is the easier question to answer. Then YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read. The user should have material to explore before anything else gets set up.\n• **Or: who do you already read?** — names, in plain words. YOU web-search for each person's site, X handle, ORCID or OpenAlex page and pass the URL you find. Never ask the user for a link or an identifier — the finding is your job, not theirs. A user with no names is not stuck: the topics route above does the finding, and its survey's recurring authors are the people to bring back as candidates to confirm.\n\nThe login roots stay open too:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": [
+   "onboard_sources_skipped"
+  ]
+ },
+ "source_blog": {
+  "answers": [
+   {
+    "status": "needs_name",
+    "phase": "sources",
+    "source": "blog",
+    "message": "Ask which site — a blog, a newsletter, or a personal site — then `oracle(action='confirm', add_handles=['https://…'])` with the URL. Any http home works with no per-host setup: the adapter tries sitemap, then RSS/Atom, then a hub crawl.\n⚠️ A PLATFORM profile is not a personal site. A GitHub, LinkedIn or Medium-author URL is refused, and the refusal names the shape that would work instead — usually the person's X @handle, which `add_handles` also takes bare.\nA NAME works here too: if the user names a person rather than a site, web-search for that person's blog or newsletter yourself and confirm the URL you find — do not send them off to fetch it."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "source_bogus": {
+  "answers": [
+   {
+    "status": "error",
+    "phase": "sources",
+    "message": "`source='twitter'` is not one of x | substack | research | blog | skip. Nothing was opened."
+   }
+  ],
+  "effects": [],
+  "markers": []
+ },
+ "source_research": {
+  "answers": [
+   {
+    "status": "needs_name",
+    "phase": "sources",
+    "source": "research",
+    "message": "Ask which — a person, or a subject. They produce different things:\n• **A researcher** — `oracle(action='confirm', add_handles=['https://orcid.org/0000-…'])`. An OpenAlex author page (https://openalex.org/A…) works too, and is the one to reach for when they have no ORCID. OPYT resolves either to their publication record and pulls the papers as atoms; abstracts are free, so the whole back catalogue is the default window. An academic URL OPYT cannot pull work by (Semantic Scholar, Google Scholar, DBLP, ResearchGate) is refused by name, with the shape that would have worked.\n  ⚠️ A bare NAME does not resolve and must not be passed — OpenAlex returns 16 people for \"Frances Arnold\". But finding the URL is YOUR job, not the user's: take the name they give, web-search \"<name> ORCID\" or \"<name> openalex\" yourself, and pass the page you find. If the name is ambiguous, ask the user to pick between the real candidates (\"the Caltech chemist?\") — never send them off to fetch an identifier.\n• **A subject** — interests, not commitments (NO onboarding surface sets up a topic to follow, this root included — a user typing what they are into is not asking for one, whatever word they clicked to get here). Fill the store instead. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read. You may mention ONCE that OPYT can also follow a subject for them later, after they have read some of what is now in the store — and leave it at that."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "source_skip": {
+  "answers": [
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete, but OPYT has nothing to read and no signal to guess from — no session, nobody named, nothing watched.\n\nSo ask the user directly. ONE question, two ways to answer it:\n• **What topics are you into?** — lead with this; it is the easier question to answer. Then YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read. The user should have material to explore before anything else gets set up.\n• **Or: who do you already read?** — names, in plain words. YOU web-search for each person's site, X handle, ORCID or OpenAlex page and pass the URL you find. Never ask the user for a link or an identifier — the finding is your job, not theirs. A user with no names is not stuck: the topics route above does the finding, and its survey's recurring authors are the people to bring back as candidates to confirm.\n\nThe login roots stay open too:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there."
+   },
+   {
+    "status": "ok",
+    "phase": "done",
+    "candidates": 0,
+    "next_tool": "oracle",
+    "message": "Setup is complete, but OPYT has nothing to read and no signal to guess from — no session, nobody named, nothing watched.\n\nSo ask the user directly. ONE question, two ways to answer it:\n• **What topics are you into?** — lead with this; it is the easier question to answer. Then YOU fill the store. Pull the one to three NAMES out of what they said — the compound, scaffold, target, model, dataset, benchmark or program they are really asking about — and call `look` with them: `look(names=[…], sources=['openalex', 'arxiv'], days=1825)`, adding `'github'` to the sources when a name is a tool, model or dataset. That searches the papers themselves, with their abstracts, rather than the web; past 90 days OpenAlex answers with the most-cited work, which is what a landscape needs. Do NOT ask the user how far back to look: five years is the window, and you tell them afterwards in one line that you can go further back. SHOW them the strong finds, each with its `cite` link, and save the ones they pick (`hopper`) — nothing enters the store without their say-so. Recurring authors are people to offer: confirm the accepted ones with `oracle(action='confirm', add_handles=['https://…'])`. Web-search the landscape yourself only for a subject you can pull no name out of. Following a topic is NOT an onboarding move: it comes later, once there is material the user has actually read. The user should have material to explore before anything else gets set up.\n• **Or: who do you already read?** — names, in plain words. YOU web-search for each person's site, X handle, ORCID or OpenAlex page and pass the URL you find. Never ask the user for a link or an identifier — the finding is your job, not theirs. A user with no names is not stuck: the topics route above does the finding, and its survey's recurring authors are the people to bring back as candidates to confirm.\n\nThe login roots stay open too:\n• **X** — `onboard(source='x')`, which finds people from your Lists, following and likes, and imports your bookmarks.\n• **Substack** — `onboard(source='substack')`, which finds the writers you follow and the newsletters you subscribe to, and imports the posts you saved there."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report",
+   "liveness.repair_or_report"
+  ],
+  "markers": [
+   "onboard_sources_skipped"
+  ]
+ },
+ "sources_menu": {
+  "answers": [
+   {
+    "status": "needs_source",
+    "phase": "sources",
+    "answers": [
+     "x",
+     "substack",
+     "research",
+     "blog",
+     "skip"
+    ],
+    "message": "OPYT has nothing to read yet. Ask the user which ONE of these to start with, and pass that single word as `source=`.\n\n⚠️ ASK FOR ONE, not several. Two of the roots send the user out of the conversation to sign in, so a multi-pick becomes a queue you have to carry across that — and a root you forget to come back to is one the user was promised. Nothing is lost by taking one: no root is ever closed, and when setup finishes OPYT names every root this home has not connected.\n\nThe first two discover people for the user; the last two are for naming what they already know.\n\n1. **X** — `onboard(source='x')`. OPYT opens its own browser profile at x.com; the user logs in there, and their own windows and logins are untouched. Their Lists, following and likes become candidates to screen without anyone typing a name, and the posts they bookmarked there are imported.\n2. **Substack** — `onboard(source='substack')`. Same shape: OPYT opens its own browser profile at Substack's sign-in; the user logs in there (Substack emails them a code), and the writers they follow and the newsletters they subscribe to become candidates, and the posts they saved there are imported.\n3. **Research** — `onboard(source='research')`. A researcher's whole publication record, or a subject to build the store around. OPYT asks which and hands you the call.\n4. **A blog, newsletter or personal site** — `onboard(source='blog')`. Any http home, no per-host setup.\n5. **Nothing yet** — `onboard(source='skip')`. Setup continues and this question is not asked again; any of the four above still works later."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "sources_menu_with_a_profile": {
+  "answers": [
+   {
+    "status": "needs_source",
+    "phase": "sources",
+    "answers": [
+     "x",
+     "substack",
+     "research",
+     "blog",
+     "skip"
+    ],
+    "message": "OPYT has nothing to read yet. Ask the user which ONE of these to start with, and pass that single word as `source=`.\n\n⚠️ ASK FOR ONE, not several. Two of the roots send the user out of the conversation to sign in, so a multi-pick becomes a queue you have to carry across that — and a root you forget to come back to is one the user was promised. Nothing is lost by taking one: no root is ever closed, and when setup finishes OPYT names every root this home has not connected.\n\nThe first two discover people for the user; the last two are for naming what they already know.\n\n1. **X** — `onboard(source='x')`. OPYT opens its own browser profile at x.com; the user logs in there, and their own windows and logins are untouched. Their Lists, following and likes become candidates to screen without anyone typing a name, and the posts they bookmarked there are imported.\n2. **Substack** — `onboard(source='substack')`. Same shape: OPYT opens its own browser profile at Substack's sign-in; the user logs in there (Substack emails them a code), and the writers they follow and the newsletters they subscribe to become candidates, and the posts they saved there are imported.\n3. **Research** — `onboard(source='research')`. A researcher's whole publication record, or a subject to build the store around. OPYT asks which and hands you the call.\n4. **A blog, newsletter or personal site** — `onboard(source='blog')`. Any http home, no per-host setup.\n5. **Nothing yet** — `onboard(source='skip')`. Setup continues and this question is not asked again; any of the four above still works later.\n\n⚠️ OPYT's login profile already exists but holds no session it can use. If the user has just logged in, call `onboard` again — it will pick the session up. Otherwise pick a source below."
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "sources_menu_worker_down": {
+  "answers": [
+   {
+    "status": "needs_source",
+    "phase": "sources",
+    "answers": [
+     "x",
+     "substack",
+     "research",
+     "blog",
+     "skip"
+    ],
+    "message": "OPYT has nothing to read yet. Ask the user which ONE of these to start with, and pass that single word as `source=`.\n\n⚠️ ASK FOR ONE, not several. Two of the roots send the user out of the conversation to sign in, so a multi-pick becomes a queue you have to carry across that — and a root you forget to come back to is one the user was promised. Nothing is lost by taking one: no root is ever closed, and when setup finishes OPYT names every root this home has not connected.\n\nThe first two discover people for the user; the last two are for naming what they already know.\n\n1. **X** — `onboard(source='x')`. OPYT opens its own browser profile at x.com; the user logs in there, and their own windows and logins are untouched. Their Lists, following and likes become candidates to screen without anyone typing a name, and the posts they bookmarked there are imported.\n2. **Substack** — `onboard(source='substack')`. Same shape: OPYT opens its own browser profile at Substack's sign-in; the user logs in there (Substack emails them a code), and the writers they follow and the newsletters they subscribe to become candidates, and the posts they saved there are imported.\n3. **Research** — `onboard(source='research')`. A researcher's whole publication record, or a subject to build the store around. OPYT asks which and hands you the call.\n4. **A blog, newsletter or personal site** — `onboard(source='blog')`. Any http home, no per-host setup.\n5. **Nothing yet** — `onboard(source='skip')`. Setup continues and this question is not asked again; any of the four above still works later.",
+    "worker_problem": {
+     "status": "disabled",
+     "cause": "The helper is switched off.",
+     "step": "Turn it back on in Login Items.",
+     "detail": {
+      "plist": "x.plist"
+     },
+     "message": "Nothing the user asks for will run until this is fixed, and nothing is lost meanwhile — the work waits. Do NOT say anything is importing, pulling or updating. Tell them `cause` in one plain sentence and give them `step`, if there is one. Name no file and no process."
+    }
+   }
+  ],
+  "effects": [
+   "liveness.repair_or_report"
+  ],
+  "markers": []
+ },
+ "start_bogus_refused": {
+  "answers": [
+   {
+    "status": "error",
+    "phase": "done",
+    "message": "`start='bogus'` is not one of `github`, `openalex`. Nothing was opened."
+   }
+  ],
+  "effects": [],
+  "markers": []
+ },
+ "start_github_before_its_app_exists": {
+  "answers": [
+   {
+    "status": "error",
+    "phase": "sources",
+    "step": "github",
+    "message": "GitHub sign-in is not available in this version of Opyt yet. Say so in one sentence. Nothing was changed."
+   }
+  ],
+  "effects": [],
+  "markers": []
+ },
+ "start_openrouter_refused": {
+  "answers": [
+   {
+    "status": "error",
+    "phase": "done",
+    "message": "`start='openrouter'` is not one of `github`, `openalex`. Nothing was opened."
+   }
+  ],
+  "effects": [],
+  "markers": []
+ },
+ "start_trial_refused": {
+  "answers": [
+   {
+    "status": "error",
+    "phase": "done",
+    "message": "`start='trial'` is not one of `github`, `openalex`. Nothing was opened."
+   }
+  ],
+  "effects": [],
+  "markers": []
+ }
+}

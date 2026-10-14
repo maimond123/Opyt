@@ -19,18 +19,18 @@ _URL = "https://simonwillison.net/2024/01/scaling-agents"
 # ── the cascade ordering + precision labels ──────────────────────────────────
 
 def test_htmldate_wins_over_everything():
-    feed = {fp._canon_post_url(_URL): "2020-05-05"}
+    feed = {fp.canon_post_url(_URL): "2020-05-05"}
     assert fp._resolve_post_date("2024-01-15", _URL, "2019-09-09", feed) == ("2024-01-15", "day")
 
 
 def test_feed_used_when_htmldate_empty():
-    feed = {fp._canon_post_url(_URL): "2020-05-05"}
+    feed = {fp.canon_post_url(_URL): "2020-05-05"}
     assert fp._resolve_post_date("", _URL, "", feed) == ("2020-05-05", "day")
 
 
 def test_feed_outranks_lastmod():
     """A feed pubDate is a real PUBLISH date; lastmod is a MODIFICATION time — feed must win."""
-    feed = {fp._canon_post_url(_URL): "2020-05-05"}
+    feed = {fp.canon_post_url(_URL): "2020-05-05"}
     assert fp._resolve_post_date("", _URL, "2019-09-09", feed) == ("2020-05-05", "day")
 
 
@@ -54,7 +54,7 @@ def test_feed_map_matches_across_utm_and_trailing_slash(monkeypatch):
     fake.parse = lambda u: _Feed()
     monkeypatch.setitem(sys.modules, "feedparser", fake)
     m = fp._feed_date_map("https://simonwillison.net")
-    assert m.get(fp._canon_post_url(_URL)) == "2020-05-05"       # clean sitemap url finds it
+    assert m.get(fp.canon_post_url(_URL)) == "2020-05-05"       # clean sitemap url finds it
 
 
 def test_feed_map_empty_when_no_feed(monkeypatch):

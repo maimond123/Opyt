@@ -1,12 +1,12 @@
 """The frozen proof that the free GraphQL path returns what twitterapi.io returned.
 
-This is the evidence the cutover rested on, made permanent. On 2026-08-30 the same account and the
+This is the evidence the cutover rested on, made permanent. The same account and the
 same window were pulled through both paths and compared across eight fields: 0 mismatches over 52
 shared tweets. That measurement was only reproducible while the paid path still existed, so it was
 frozen before the deletion — the RAW `UserTweets` result nodes on one side, and the eight-field
 probe of twitterapi.io's answer for the same tweets on the other.
 
-The test replays the raw nodes through `x_graphql_core.normalize` and asserts they reproduce the
+The test replays the raw nodes through `x.records.normalize_tweet` and asserts they reproduce the
 recorded answers. Nothing here imports twitterapi.io, and nothing touches the network: the
 expectations are frozen values, so this keeps working after the vendor is gone. What it defends is
 the live risk, which is not the vendor — it is `_normalize` quietly dropping a field that only a
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.ingestion import x_graphql_core as xg
+import pipeline.platforms.x.records as x_records
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "x" / "twitterapi_parity.json"
 
@@ -54,7 +54,7 @@ def test_every_field_matches_what_twitterapi_returned(frozen):
     this ever fails on `likes` alone, the fixture is stale, not the code."""
     mismatches = []
     for tid, node in sorted(frozen["graphql_raw"].items()):
-        norm = xg.normalize(node)
+        norm = x_records.normalize_tweet(node)
         assert norm and str(norm.get("id")) == tid, f"{tid}: _normalize returned nothing usable"
         got, want = _probe(norm), frozen["twitterapi_expected"][tid]
         for field in frozen["fields"]:
@@ -89,7 +89,7 @@ def test_an_x_article_renders_a_real_body_not_a_teaser(frozen):
     satisfied by the stub; only rendering it shows there is nothing inside."""
     from pipeline.ingestion.x_render import _article_shape, _render_article
 
-    articles = [xg.normalize(n) for tid, n in frozen["graphql_raw"].items()
+    articles = [x_records.normalize_tweet(n) for tid, n in frozen["graphql_raw"].items()
                 if frozen["twitterapi_expected"][tid]["article"]]
     assert articles, "fixture lost its X Article"
     for a in articles:

@@ -1,11 +1,10 @@
 """
 tests/ingestion/test_browser_cookies.py
 
-Offline tests for the generalized multi-browser cookie reader. No live browser: we
-stub `installed_backends`, the Chromium row-presence probe and `_read_one`, so the
-resolution logic (browser/profile override, auto-pick, ambiguity) and the failure
-classification (launch vs keychain vs FDA vs not-logged-in → actionable remediation)
-are exercised deterministically.
+Offline tests for the managed-session cookie reader. No live browser: we stub
+`installed_backends`, the Chromium row-presence probe and `_read_one`, so the managed
+selection (one, several, none) and the failure classification (launch vs other vs
+not-connected → actionable remediation) are exercised deterministically.
 
 Two things this module exists to pin:
   1. the fix for "can't tell not-logged-in from permission denied" — the failure-kind →
@@ -23,19 +22,21 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.ingestion import browser_cookies as bc, cdp
+from pipeline.platforms.browser import cdp, cookies as bc
 from pipeline.ingestion.utils import SyncAuthError
 
 
 @pytest.fixture(autouse=True)
 def isolated_opyt_home(tmp_path, monkeypatch):
-    """Sandbox $OPYT_HOME so config resolution (cookie_browser → settings.yaml) can't
-    pick up the dev machine's real config, and clear the browser override env. It also
-    keeps `opyt_session_backends()` empty, so no real guided-login profile leaks in."""
+    """Sandbox $OPYT_HOME so the dev machine's real config can't leak in, and clear the
+    retired browser override env. It also keeps `opyt_session_backends()` empty, so no real
+    guided-login profile leaks in."""
     home = tmp_path / "opyt_home"
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("OPYT_HOME", str(home))
     monkeypatch.delenv("OPYT_BROWSER", raising=False)
+    monkeypatch.delenv("OPYT_COOKIES_X", raising=False)
+    monkeypatch.delenv("OPYT_COOKIES_SUBSTACK", raising=False)
 
 
 def _backend(key):
@@ -47,17 +48,16 @@ def _stub_reads(monkeypatch, *, installed, reads):
 
     `installed` = list of backend keys present. `reads` maps (browser, profile) →
     either a cookies dict (success) or an Exception (blocked). A (browser, profile)
-    absent from `reads` reads as logged-out. Chromium backends are given one fake
-    profile "Default"; delegated backends (Arc/Firefox/Safari) read at profile=None.
+    absent from `reads` reads as logged-out. Each backend is given one fake profile
+    "Default".
 
     Chromium cookie paths are synthetic (`/stub/<browser>/Default/Cookies`) so nothing
     can touch this machine's real cookie stores."""
     backs = [bc.backend_for(k) for k in installed]
-    by_base = {b.base: b.key for b in backs if b.base is not None}
+    by_base = {b.base: b.key for b in backs}
     monkeypatch.setattr(bc, "installed_backends", lambda: backs)
     monkeypatch.setattr(bc, "_chromium_cookie_files", lambda base: [
         ("Default", Path(f"/stub/{by_base[base]}/Default/Cookies"))])
-    monkeypatch.setattr(bc, "_chromium_profile_labels", lambda base: {"Default": "Default"})
 
     def fake_present(cookie_file, domains, name):
         val = reads.get((Path(cookie_file).parts[2], "Default"))
@@ -66,8 +66,7 @@ def _stub_reads(monkeypatch, *, installed, reads):
         return isinstance(val, dict) and bool(val.get(name))
 
     def fake_read_one(backend, domains, *, cookie_file=None):
-        profile = "Default" if backend.base is not None else None
-        val = reads.get((backend.key, profile))
+        val = reads.get((backend.key, "Default"))
         if isinstance(val, Exception):
             return {}, val
         if isinstance(val, dict):
@@ -85,27 +84,11 @@ def test_build_cookie_header_unchanged():
     assert bc.build_cookie_header({}) == ""
 
 
-# ── Auto-pick a lone candidate ───────────────────────────────────────────────────
-
-def test_auto_picks_lone_candidate(monkeypatch):
-    _stub_reads(monkeypatch, installed=["chrome", "safari"],
-                reads={("chrome", "Default"): {"sessionKey": "tok", "x": "y"}})
-    got = bc.read_cookies(["claude.ai"], "sessionKey", source="claude")
-    assert got == {"sessionKey": "tok", "x": "y"}
-
-
-def test_no_candidate_not_logged_in(monkeypatch):
-    _stub_reads(monkeypatch, installed=["chrome"], reads={})
-    with pytest.raises(SyncAuthError) as ei:
-        bc.read_cookies(["claude.ai"], "sessionKey", source="claude")
-    assert "No claude login" in str(ei.value)
-
-
 # ── Detection never decrypts; the chosen profile is read exactly once ────────────
 
 def test_detection_does_not_decrypt(monkeypatch):
     """⚠️ THE POINT OF THE CHANGE. Scanning must not call the decrypting read for a
-    Chromium profile — that read launches a browser, and the browser_cookie3 read it
+    Chromium profile — that read launches a browser, and the Python-side decryption it
     replaced is what raised the macOS Keychain dialog."""
     _stub_reads(monkeypatch, installed=["chrome"],
                 reads={("chrome", "Default"): {"sessionKey": "tok"}})
@@ -118,99 +101,6 @@ def test_detection_does_not_decrypt(monkeypatch):
     assert [c["profile"] for c in candidates] == ["Default"]
     assert reads == []                      # nothing decrypted just to detect
     assert "cookies" not in candidates[0]   # discovery hands back no session secrets
-
-
-def test_only_the_chosen_profile_is_read(monkeypatch):
-    """Eight logged-in Chromium profiles must still cost ONE decrypting read."""
-    backs = [bc.backend_for("chrome")]
-    monkeypatch.setattr(bc, "installed_backends", lambda: backs)
-    monkeypatch.setattr(bc, "_chromium_cookie_files", lambda base: [
-        (f"Profile {i}", Path(f"/stub/chrome/Profile {i}/Cookies")) for i in range(8)])
-    monkeypatch.setattr(bc, "_chromium_profile_labels", lambda base: {})
-    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda cf, d, n: True)
-    reads = []
-    monkeypatch.setattr(bc, "_read_one", lambda b, d, *, cookie_file=None: (
-        reads.append(cookie_file) or ({"auth_token": "t"}, None)))
-    got = bc.read_cookies(["x.com"], "auth_token", profile="Profile 5", source="X")
-    assert got == {"auth_token": "t"}
-    assert reads == [Path("/stub/chrome/Profile 5/Cookies")]
-
-
-def test_read_back_empty_is_not_reported_as_logged_out(monkeypatch):
-    """Detection saw the row and the read returned nothing. Returning {} would send an
-    empty Cookie header and 401 far from here; "not logged in" would be a lie."""
-    _stub_reads(monkeypatch, installed=["chrome"],
-                reads={("chrome", "Default"): {"sessionKey": "tok"}})
-    monkeypatch.setattr(bc, "_read_one", lambda b, d, *, cookie_file=None: ({}, None))
-    with pytest.raises(SyncAuthError) as ei:
-        bc.read_cookies(["claude.ai"], "sessionKey", source="claude")
-    assert "returned nothing" in str(ei.value)
-
-
-# ── OPYT_BROWSER override wins ────────────────────────────────────────────────────
-
-def test_browser_override_wins(monkeypatch):
-    monkeypatch.setenv("OPYT_BROWSER", "brave")
-    _stub_reads(monkeypatch, installed=["chrome", "brave"],
-                reads={("chrome", "Default"): {"sessionKey": "chrometok"},
-                       ("brave", "Default"): {"sessionKey": "bravetok"}})
-    got = bc.read_cookies(["claude.ai"], "sessionKey", source="claude")
-    assert got == {"sessionKey": "bravetok"}
-
-
-def test_override_scan_skips_other_browsers(monkeypatch):
-    """With an override, list_logged_in is told to scan ONLY that browser — so we never
-    touch (and never launch) the others."""
-    monkeypatch.setenv("OPYT_BROWSER", "chrome")
-    scanned = {}
-
-    real_list = bc.list_logged_in
-
-    def spy(domains, auth_cookie, *, browsers=None):
-        scanned["browsers"] = browsers
-        return real_list(domains, auth_cookie, browsers=browsers)
-
-    _stub_reads(monkeypatch, installed=["chrome", "brave"],
-                reads={("chrome", "Default"): {"sessionKey": "t"}})
-    monkeypatch.setattr(bc, "list_logged_in", spy)
-    bc.read_cookies(["claude.ai"], "sessionKey", source="claude")
-    assert scanned["browsers"] == ["chrome"]
-
-
-# ── Priority-first: first browser with a session wins; the rest aren't touched ───
-
-def test_priority_first_prefers_higher_and_stops(monkeypatch):
-    """Chrome and Brave both logged in → Chrome (higher priority) wins and Brave is
-    never even probed."""
-    probed = []
-    _stub_reads(monkeypatch, installed=["chrome", "brave"],
-                reads={("chrome", "Default"): {"auth_token": "chrome"},
-                       ("brave", "Default"): {"auth_token": "brave"}})
-    inner = bc._chromium_has_cookie
-    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda cf, d, n: (
-        probed.append(Path(cf).parts[2]) or inner(cf, d, n)))
-    got = bc.read_cookies(["x.com"], "auth_token", source="X")
-    assert got == {"auth_token": "chrome"}
-    assert probed == ["chrome"]
-
-
-# ── Multiple PROFILES in the winning browser → ambiguity error that LISTS them ───
-
-def test_multiple_profiles_raises_listing(monkeypatch):
-    backs = [bc.backend_for("chrome")]
-    monkeypatch.setattr(bc, "installed_backends", lambda: backs)
-    monkeypatch.setattr(bc, "_chromium_cookie_files", lambda base: [
-        ("Default", Path("/stub/chrome/Default/Cookies")),
-        ("Profile 1", Path("/stub/chrome/Profile 1/Cookies")),
-    ])
-    monkeypatch.setattr(bc, "_chromium_profile_labels",
-                        lambda base: {"Default": "Personal", "Profile 1": "Work"})
-    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda cf, d, n: True)
-    with pytest.raises(SyncAuthError) as ei:
-        bc.read_cookies(["x.com"], "auth_token", source="X")
-    msg = str(ei.value)
-    assert "Multiple" in msg and "chrome/Default" in msg and "chrome/Profile 1" in msg
-    assert "$OPYT_BROWSER" in msg
 
 
 # ── The exact-domain rule (both forms) ───────────────────────────────────────────
@@ -279,82 +169,7 @@ def test_presence_probe_reads_rows_not_values(tmp_path):
     assert bc._chromium_has_cookie(db, ["adgrx.com"], "auth_token") is False
 
 
-# ── Failure classification → actionable remediation ──────────────────────────────
-
-def test_browser_launch_failure_is_not_reported_as_logged_out(monkeypatch):
-    """A session Opyt found but could not decrypt because the browser would not start is
-    NOT 'log in somewhere'. Telling the user to log in again would be a dead end."""
-    _stub_reads(monkeypatch, installed=["chrome"],
-                reads={("chrome", "Default"): {"sessionKey": "tok"}})
-    monkeypatch.setattr(bc, "_read_one", lambda b, d, *, cookie_file=None: (
-        {}, cdp.CDPError("browser exited (code 1) before opening DevTools")))
-    with pytest.raises(SyncAuthError) as ei:
-        bc.read_cookies(["claude.ai"], "sessionKey", source="claude")
-    msg = str(ei.value)
-    assert "could not start Chrome" in msg and "/Applications" in msg
-
-
-def test_keychain_denied_remediation(monkeypatch):
-    """Arc is the surviving Keychain backend — browser_cookie3 asks macOS for its Safe
-    Storage key, which the transplant read never does."""
-    err = Exception("Could not decrypt: user canceled keychain access")
-    _stub_reads(monkeypatch, installed=["arc"], reads={("arc", None): err})
-    with pytest.raises(SyncAuthError) as ei:
-        bc.read_cookies(["claude.ai"], "sessionKey", source="claude")
-    msg = str(ei.value)
-    assert "Keychain" in msg and ("Allow" in msg or "Always Allow" in msg)
-
-
-def test_fda_needed_remediation(monkeypatch):
-    err = PermissionError("Operation not permitted")
-    _stub_reads(monkeypatch, installed=["safari"],
-                reads={("safari", None): err})
-    with pytest.raises(SyncAuthError) as ei:
-        bc.read_cookies(["substack.com"], "substack.sid", source="substack")
-    msg = str(ei.value)
-    assert "Full Disk Access" in msg
-
-
-def test_blocked_read_is_not_mistaken_for_logged_out(monkeypatch):
-    """The whole point: a blocked read must NOT collapse to the generic 'not logged in'
-    — even when another browser is simply logged out."""
-    err = PermissionError("Operation not permitted")
-    _stub_reads(monkeypatch, installed=["safari", "chrome"],
-                reads={("safari", None): err})  # chrome logged out, safari blocked
-    with pytest.raises(SyncAuthError) as ei:
-        bc.read_cookies(["substack.com"], "substack.sid", source="substack")
-    assert "Full Disk Access" in str(ei.value)
-
-
-def test_classify_prefers_backend_consent():
-    assert bc._classify_failure(_backend("safari"), PermissionError("x")) == "fda_needed"
-    assert bc._classify_failure(_backend("arc"),
-                                Exception("keychain error")) == "keychain_denied"
-    assert bc._classify_failure(_backend("arc"), Exception("weird")) == "other"
-    # A transplant read classifies by TYPE — no Keychain is involved to deny.
-    assert bc._classify_failure(_backend("chrome"), cdp.CDPError("boom")) == "browser_launch"
-    assert bc._classify_failure(_backend("chrome"),
-                                Exception("keychain error")) == "other"
-
-
-# ── settings.yaml cookies.browser knob resolves ──────────────────────────────────
-
-def test_settings_browser_knob(monkeypatch, tmp_path):
-    cfg = tmp_path / "settings.yaml"
-    cfg.write_text("vault:\n  vault_path: /tmp/v\ncookies:\n  browser: edge\n")
-    monkeypatch.setenv("OPYT_CONFIG", str(cfg))
-    monkeypatch.delenv("OPYT_BROWSER", raising=False)
-    from opyt_core.config import cookie_browser
-    assert cookie_browser() == "edge"
-    # env overrides settings
-    monkeypatch.setenv("OPYT_BROWSER", "brave")
-    assert cookie_browser() == "brave"
-    # 'auto' means None
-    monkeypatch.setenv("OPYT_BROWSER", "auto")
-    assert cookie_browser() is None
-
-
-# ── OPYT's own login profiles (created by guided_login) ──────────────────────────
+# ── OPYT's own login profiles (created by guided login) ──────────────────────────
 
 def _managed_session(backend: str) -> None:
     profile = bc.opyt_session_root() / backend / "Default"
@@ -429,3 +244,153 @@ def test_a_browser_opyt_cannot_launch_is_not_offered(monkeypatch):
     dropping it beats surfacing a candidate whose read is guaranteed to fail."""
     monkeypatch.setattr(bc.BrowserBackend, "app_path", lambda self: None)
     assert [b.key for b in bc.installed_backends() if b.base is not None] == []
+
+
+# ── Managed-session failure paths ────────────────────────────────────────────────
+# Pinned on `read_opyt_cookies` so the failure copy survives the retirement of the generic
+# reader, whose tests above are the only other place these paths run.
+
+def _managed_only(monkeypatch, *backends: str) -> None:
+    for b in backends:
+        _managed_session(b)
+    monkeypatch.setattr(bc, "installed_backends", lambda: bc.opyt_session_backends())
+
+
+def test_read_opyt_cookies_reports_a_launch_failure_as_one(monkeypatch):
+    _managed_only(monkeypatch, "chrome")
+    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda *_: True)
+    monkeypatch.setattr(bc, "_read_one", lambda _b, _d, **_: (
+        {}, cdp.CDPError("browser exited (code 1) before opening DevTools")))
+    with pytest.raises(SyncAuthError) as ei:
+        bc.read_opyt_cookies(["x.com"], "auth_token", source="X")
+    msg = str(ei.value)
+    assert "could not start Opyt login — Chrome" in msg and "/Applications" in msg
+
+
+def test_read_opyt_cookies_read_back_empty_is_not_logged_out(monkeypatch):
+    _managed_only(monkeypatch, "chrome")
+    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda *_: True)
+    monkeypatch.setattr(bc, "_read_one", lambda _b, _d, **_: ({}, None))
+    with pytest.raises(SyncAuthError) as ei:
+        bc.read_opyt_cookies(["x.com"], "auth_token", source="X")
+    assert "chrome@opyt/Default" in str(ei.value) and "returned nothing" in str(ei.value)
+
+
+def test_read_opyt_cookies_reads_only_the_managed_cookie_file(monkeypatch):
+    _managed_only(monkeypatch, "chrome")
+    monkeypatch.setattr(bc, "_chromium_has_cookie", lambda *_: True)
+    reads = []
+    monkeypatch.setattr(bc, "_read_one", lambda _b, _d, *, cookie_file=None: (
+        reads.append(cookie_file) or ({"auth_token": "t"}, None)))
+    assert bc.read_opyt_cookies("x.com", "auth_token", source="X") == {"auth_token": "t"}
+    assert reads == [bc.opyt_session_root() / "chrome" / "Default" / "Cookies"]
+
+
+def test_read_opyt_cookies_blocked_probe_gives_its_remediation(monkeypatch):
+    """A probe that raised is a failure, not a logged-out session: the user is told which
+    session could not be read, then sent to onboard, the only way to repair a managed one."""
+    _managed_only(monkeypatch, "chrome")
+
+    def blocked(*_):
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr(bc, "_chromium_has_cookie", blocked)
+    with pytest.raises(SyncAuthError) as ei:
+        bc.read_opyt_cookies(["x.com"], "auth_token", source="X")
+    msg = str(ei.value)
+    assert msg.startswith("Couldn't read your Opyt login — Chrome session for X.")
+    assert "onboard(source='x')" in msg
+
+
+def test_read_opyt_cookies_surfaces_the_most_actionable_failure(monkeypatch):
+    """Two blocked managed profiles: the launch failure outranks the unclassified one."""
+    _managed_only(monkeypatch, "brave", "chrome")
+
+    def probe(cookie_file, _domains, _name):
+        if Path(cookie_file).parts[-3] == "chrome":
+            raise cdp.CDPError("browser exited")
+        raise RuntimeError("weird")
+
+    monkeypatch.setattr(bc, "_chromium_has_cookie", probe)
+    with pytest.raises(SyncAuthError) as ei:
+        bc.read_opyt_cookies(["x.com"], "auth_token", source="X")
+    assert "could not start Opyt login — Chrome" in str(ei.value)
+
+
+def test_a_chromium_read_failure_is_classified_by_type():
+    assert bc._classify_failure(cdp.CDPError("boom")) == "browser_launch"
+    assert bc._classify_failure(Exception("keychain error")) == "other"
+    assert bc._classify_failure(PermissionError("x")) == "other"
+
+
+# ── choose_managed_candidate: one row per case ───────────────────────────────────
+
+def _candidate(browser):
+    return {"browser": browser, "profile": "Default", "label": browser,
+            "backend": _backend("chrome"), "cookie_file": Path("/stub/Cookies")}
+
+
+def test_choose_managed_candidate_uses_the_one_candidate():
+    one = _candidate("chrome@opyt")
+    assert bc.choose_managed_candidate([one], [], "X") is one
+
+
+def test_choose_managed_candidate_refuses_several():
+    with pytest.raises(SyncAuthError, match="Multiple OPYT-managed X sessions"):
+        bc.choose_managed_candidate([_candidate("chrome@opyt"), _candidate("brave@opyt")], [], "X")
+
+
+def test_choose_managed_candidate_none_with_failures_gives_the_worst_remediation():
+    failures = [{"browser": "brave", "profile": "Default", "backend": _backend("brave"),
+                 "kind": "other", "detail": ""},
+                {"browser": "chrome", "profile": "Default", "backend": _backend("chrome"),
+                 "kind": "browser_launch", "detail": ""}]
+    with pytest.raises(SyncAuthError, match="could not start Chrome"):
+        bc.choose_managed_candidate([], failures, "X")
+
+
+def test_choose_managed_candidate_none_without_failures_says_connect():
+    with pytest.raises(SyncAuthError, match=r"onboard\(source='x'\)"):
+        bc.choose_managed_candidate([], [], "X")
+
+
+def test_remediation_for_an_unclassified_failure_points_at_onboard_not_a_browser_list():
+    """Reads are managed-only: logging into a browser of the user's own fixes nothing."""
+    msg = bc.remediation("other", None, "X")
+    assert "onboard(source='x')" in msg
+    assert "Chrome/Brave" not in msg and "supported browser" not in msg
+
+
+# ── A session handed in through the environment ──────────────────────────────────────────────
+
+def _no_profile_scan(monkeypatch):
+    def refuse():
+        raise AssertionError("a profile was scanned although the environment holds the session")
+    monkeypatch.setattr(bc, "installed_backends", refuse)
+    monkeypatch.setattr(bc, "opyt_session_backends", refuse)
+
+
+def test_an_environment_session_is_read_without_scanning_a_profile(monkeypatch):
+    monkeypatch.setenv("OPYT_COOKIES_X", " auth_token=aaa ; ct0=bbb ")
+    _no_profile_scan(monkeypatch)
+    assert bc.read_opyt_cookies(["x.com", "twitter.com"], "auth_token", source="X") == {
+        "auth_token": "aaa", "ct0": "bbb"}
+    candidates, failures = bc.list_opyt_logged_in(["x.com", "twitter.com"], "auth_token")
+    assert len(candidates) == 1 and failures == []
+
+
+def test_the_site_name_picks_the_variable(monkeypatch):
+    monkeypatch.setenv("OPYT_COOKIES_SUBSTACK", "substack.sid=s1")
+    _no_profile_scan(monkeypatch)
+    assert bc.read_opyt_cookies("substack.com", "substack.sid", source="substack") == {
+        "substack.sid": "s1"}
+
+
+def test_an_environment_session_without_its_auth_cookie_is_refused(monkeypatch):
+    """A half-pasted session is not connected, and reading it says why instead of sending a
+    Cookie header that 401s later."""
+    monkeypatch.setenv("OPYT_COOKIES_X", "ct0=bbb")
+    _no_profile_scan(monkeypatch)
+    assert bc.list_opyt_logged_in(["x.com"], "auth_token") == ([], [])
+    with pytest.raises(SyncAuthError, match="no auth_token cookie"):
+        bc.read_opyt_cookies(["x.com"], "auth_token", source="X")

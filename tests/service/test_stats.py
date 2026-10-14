@@ -1,22 +1,22 @@
 """The public stats page — the roll-up, and nobody's name.
 
-Ruled 2026-08-26: the metrics surface is a PUBLIC aggregate page, not an operator dashboard. One
+The metrics surface is a PUBLIC aggregate page, not an operator dashboard. One
 page is both the transparency mechanism (a reader can check what the totals say against what
 `TELEMETRY.md` claims is collected) and the record of whether anyone used this. That is why these
 tests assert two things at once — that the numbers are real, and that no identity survives the
 roll-up.
 
-NARROWED 2026-09-01 by R5a, in exactly one place. Self-service publishing removed the human who
+Narrowed in exactly one place. Self-service publishing removed the human who
 used to know how much each owner stored, so `/v1/stats` now carries one per-knowledge-base list:
-routing key, bytes, and the date it was first published. That is not a retreat from the ruling —
-R4 made the routing key an ASSIGNED address rather than a name anybody chose, and the list
+routing key, bytes, and the date it was first published. That is not a retreat — the
+routing key is an ASSIGNED address rather than a name anybody chose, and the list
 carries no label, no reader and no traffic. The HTML page still shows totals only.
 """
 from __future__ import annotations
 
 import json
 
-from service import store
+from service import db, tokens, usage
 from tests.service.conftest import LABEL
 
 SENTINEL_OWNER = "zzz-owner-sentinel"
@@ -39,7 +39,7 @@ def test_stats_reflects_usage(svc):
 
     svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"}, headers=svc.reader_hdr)
     svc.client.post(f"/v1/kb/{svc.owner}/search",
-                    json={"query": "zzz-nothing-matches-this-zzz", "mode": "bm25"},
+                    json={"query": "zzz-nothing-matches-this-zzz"},
                     headers=svc.reader_hdr)
     svc.client.post(f"/v1/kb/{svc.owner}/aggregate", json={}, headers=svc.reader_hdr)
 
@@ -61,12 +61,12 @@ def test_stats_leaks_no_identity(svc):
     how an owner names their readers so they can revoke them, and how an owner names themselves.
     A routing key is not — see `test_the_page_shows_totals_only`, which pins the one place a key
     is published and why."""
-    token = store.mint_token(SENTINEL_OWNER, "reader", label=SENTINEL_LABEL)
-    store.record_usage(SENTINEL_OWNER, store.token_hash(token), "search")
+    token = tokens.mint_token(SENTINEL_OWNER, "reader", label=SENTINEL_LABEL)
+    usage.record_usage(SENTINEL_OWNER, tokens.token_hash(token), "search")
     svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"}, headers=svc.reader_hdr)
 
-    hashes = {store.token_hash(token), store.token_hash(svc.reader_token),
-              store.token_hash(svc.owner_token)}
+    hashes = {tokens.token_hash(token), tokens.token_hash(svc.reader_token),
+              tokens.token_hash(svc.owner_token)}
 
     js, page = svc.client.get("/v1/stats"), svc.client.get("/stats")
     assert js.status_code == 200 and page.status_code == 200
@@ -95,20 +95,17 @@ def test_the_page_shows_totals_only_and_the_key_rides_the_json(svc):
     assert svc.owner not in svc.client.get("/stats").text
 
 
-def test_unpublishing_stops_counting_the_bytes_but_keeps_the_start_date(svc):
-    """A stored-bytes number that only ever climbs is not a disk-usage number. The row survives
-    because `first_published_at` is the fact that cannot be recovered — a directory listing never
-    had it, and it is what pricing would be built on."""
-    before = next(r for r in svc.client.get("/v1/stats").json()["stored_bytes_by_kb"]
-                  if r["owner"] == svc.owner)
+def test_a_deleted_library_leaves_the_stats(svc):
+    """Unpublishing deletes the library's publication row with everything else held for it
+    (`deletion.py`), so it drops out of the per-library list and its bytes out of the total."""
+    assert any(r["owner"] == svc.owner
+               for r in svc.client.get("/v1/stats").json()["stored_bytes_by_kb"])
 
     svc.client.post("/v1/unpublish", headers=svc.owner_hdr)
 
     js = svc.client.get("/v1/stats").json()
-    after = next(r for r in js["stored_bytes_by_kb"] if r["owner"] == svc.owner)
-    assert after["bytes"] == 0
-    assert js["stored_bytes_total"] == 0
-    assert after["owner_since"] == before["owner_since"]
+    assert all(r["owner"] != svc.owner for r in js["stored_bytes_by_kb"])
+    assert js["stored_bytes_total"] == 0 and js["reads_total"] == 0
 
 
 def test_a_second_upload_moves_the_last_date_and_not_the_first(svc):
@@ -116,7 +113,7 @@ def test_a_second_upload_moves_the_last_date_and_not_the_first(svc):
     copy of it on the second push, which is every push after the first."""
     before = next(r for r in svc.client.get("/v1/stats").json()["stored_bytes_by_kb"]
                   if r["owner"] == svc.owner)
-    conn = store.connect()
+    conn = db.connect()
     try:
         conn.execute("UPDATE owner_uploads SET first_published_at = '2020-01-01 00:00:00', "
                      "last_published_at = '2020-01-01 00:00:00' WHERE owner = ?", (svc.owner,))

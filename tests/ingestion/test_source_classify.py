@@ -1,11 +1,11 @@
 """Tests for source_classify — typed (type, is_profile, handle, shape) classification.
 
 Where _classify_url returns a bare type string, classify_source adds the three
-facts hub expansion + atom onboarding need: profile-vs-artifact, org-vs-personal,
+facts discovery + atom onboarding need: profile-vs-artifact, org-vs-personal,
 and the account handle.
 """
 
-from pipeline.ingestion.source_classify import classify_source
+from pipeline.platforms.source_classify import classify_source
 
 
 # ── GitHub: user profile vs repo artifact vs org ──────────────────────────────

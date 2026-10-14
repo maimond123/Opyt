@@ -1,4 +1,4 @@
-"""curation_state — the LIST clock. Pure state + pure clock math, no network anywhere.
+"""curation/clock.py — the LIST clock. Pure state + pure clock math, no network anywhere.
 
 Every test here defends the one decision the table exists for: `last_attempt_at` and `last_ok_at`
 are TWO columns because they answer two different questions, and collapsing them re-creates one of
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from pipeline.kb import curation_state as cs
+from pipeline.curation import clock as cs
 from pipeline.kb import schema
 
 T0 = datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
@@ -85,7 +85,7 @@ def test_a_never_run_collector_is_due_and_infinitely_stale(conn):
     lacking a timestamp to compare against."""
     row = cs.get_run(conn, "substack_follows")
     assert row is None
-    assert cs.hours_since_attempt(row) == float("inf")
+    assert cs.due_at(row, floor_hours=6.0) is None
     assert cs.hours_since_ok(row) == float("inf")
     assert cs.is_due(row, floor_hours=6.0) is True
     assert cs.status_summary(conn, ("substack_follows",))["collectors"][0]["stale"] is True
@@ -116,7 +116,7 @@ def test_a_non_ok_status_is_an_attempt_that_saw_nothing(conn):
         row = cs.get_run(conn, status)
         assert row.last_ok_at == _iso(T0), status
         assert cs.hours_since_ok(row, now) == pytest.approx(10.0), status
-        assert cs.hours_since_attempt(row, now) == pytest.approx(0.0), status
+        assert row.last_attempt_at == _iso(now), status
 
 
 def test_a_first_ever_run_that_fails_leaves_last_ok_null(conn):
@@ -176,7 +176,7 @@ def test_an_unparseable_stamp_reads_as_never(conn):
     permanently fresh (we never look again)."""
     cs.record_run(conn, "x_lists", status="ok", now="not-a-timestamp")
     row = cs.get_run(conn, "x_lists")
-    assert cs.hours_since_attempt(row, T0) == float("inf")
+    assert cs.due_at(row, floor_hours=6.0) is None
     assert cs.is_due(row, floor_hours=6.0, now=T0) is True
 
 
@@ -235,3 +235,25 @@ def test_status_summary_goes_stale_after_the_window(conn):
     out = cs.status_summary(conn, _ALL, now=T0 + timedelta(hours=cs.STALE_AFTER_HOURS))
     assert out["stale_collectors"] == len(_ALL) and out["needs_attention"] is True
     assert out["oldest_ok_at"] == out["newest_ok_at"] == _iso(T0)
+
+
+@pytest.mark.parametrize("found, prev_found, out", [
+    (10, None, True),       # no baseline yet holds
+    (None, 10, False),      # a baseline with no reading beside it does not
+    (5, 10, True),          # exactly at the ratio holds
+    (4, 10, False),         # below it collapsed
+    (0, 0, True),
+])
+def test_held_table(found, prev_found, out):
+    assert cs.held(found, prev_found) is out
+
+
+@pytest.mark.parametrize("prior, found, out", [
+    (None, 7, None),        # first run: no baseline
+    ((10, 8), None, 8),     # a run with no reading leaves the baseline alone
+    ((10, 8), 3, 10),       # the previous reading held: it becomes the baseline
+    ((3, 10), 9, 10),       # the previous reading collapsed: the baseline stays
+    ((None, None), 4, None),
+])
+def test_next_baseline_table(prior, found, out):
+    assert cs.next_baseline(prior, found) == out

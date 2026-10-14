@@ -29,7 +29,7 @@ def test_only_one_caller_claims_the_half_open_trial(tmp_path):
 def test_peek_never_claims_the_trial(tmp_path):
     """The bug this method exists for. `allow` CLAIMS the half-open trial, so a pre-check that
     asked with it consumed the very trial the real call was about to make — the call then found
-    HALF_OPEN, refused, and recorded no outcome. Measured on the live store 2026-09-08:
+    HALF_OPEN, refused, and recorded no outcome. Measured on a live store:
     `api.openalex.org` stranded 257 hours and `export.arxiv.org` 30, against a 15-minute
     cooldown, with both paper adapters silently dead the whole time."""
     breaker = _tripped(tmp_path, cooldown=0.0)
@@ -78,7 +78,7 @@ def test_a_success_closes_the_breaker(tmp_path):
 # ── the breaker must not take opyt.db's write lock ──────────────────────────────
 
 def test_breaker_state_never_lands_in_the_knowledge_base(tmp_path, monkeypatch):
-    """MEASURED on the box 2026-09-16: 12 `database is locked` failures during one connect, 6 of
+    """Measured on a hosted box: 12 `database is locked` failures during one connect, 6 of
     them OCR reads that were then discarded, because every `allow()`/`record_*` takes
     `BEGIN IMMEDIATE` — an EXCLUSIVE write lock — and it was taking it on `opyt.db`, the file a
     concurrent ingest holds in far longer transactions than this module's 5s `busy_timeout`.
@@ -111,8 +111,7 @@ def test_breaker_state_never_lands_in_the_knowledge_base(tmp_path, monkeypatch):
 def test_the_breaker_creates_a_home_that_does_not_exist_yet(tmp_path, monkeypatch):
     """`sqlite3.connect` raises on a missing PARENT, not a missing file. Riding on `opyt.db` hid
     that — something else always made the home first. Its own file has no such guarantor, and a
-    first call on a fresh home would otherwise raise where it used to work. Same trap `0e8b5438`
-    fixed in the profile lease."""
+    first call on a fresh home would otherwise raise where it used to work."""
     from pipeline import circuit_breaker as cb
 
     monkeypatch.setenv("OPYT_HOME", str(tmp_path / "never-created"))

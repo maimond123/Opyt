@@ -5,25 +5,17 @@ One-shot loopback HTTP capture for browser-driven credential acquisition.
 Keys enter here over 127.0.0.1 and go straight to `set_key`, so a secret never has to pass
 through chat. Nothing captured is ever returned to an MCP caller, logged, or echoed.
 
-ONE route: `cb`, an OAuth redirect target, where the credential arrives as a query param.
-A second `paste` route served a form for keys with no OAuth flow. Its caller was deleted on
-2026-09-05 under the `retired-key-paste-module` guard, and this half outlived it by four days
-on the strength of one test — its only caller. No remaining credential needs a form path (that
-guard's message says why GitHub and Semantic Scholar are not it), so `do_POST`, the form page
-and the `route`/`label` parameters went on 2026-09-09. The rule, kept where the story is not:
-a form on the loopback is a credential-entry surface any local process can reach, so it needs
-a live caller to exist at all.
+One route, `cb`: an OAuth redirect target where the credential arrives as a query param. The key
+form for credentials with no sign-in flow is `opyt_core/key_page.py`, which reuses this listener
+with its own handler; a form on the loopback is a credential-entry surface any local process can
+reach, so it lives only from the `onboard(start=...)` call that opens it until its key is
+collected, ten minutes at most.
 
 Loopback-only, single-request, plain HTTP by design — no second route, no navigation, no TLS,
-and nothing that fetches a stylesheet or an asset, because a single-request listener cannot
-serve one. The RESPONSE BODY is not covered by that rule: it renders `opyt_core.web_panel`,
-which is one self-contained string. That was settled on 2026-09-09, when the bare `<h2>` this
-used to return turned out to be the first Opyt-served page any local user ever sees.
+no assets. The response body is one self-contained `opyt_core.web_panel` string.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import secrets
 import socket
 import threading
@@ -36,11 +28,7 @@ from opyt_core import web_panel
 _DEFAULT_TIMEOUT = 300.0
 
 
-# NO FILESYSTEM PATH. This page named the keys file until 2026-09-09 — first as a hardcoded
-# `~/.opyt/.env`, which was wrong under `$OPYT_HOME`, then briefly as the resolved path, which
-# was right and still not wanted. Somebody who has just authorised a third party needs the
-# reassurance and the next step, not the location of a dotfile holding a secret. Resolving the
-# path was patching the premise; deleting it is the fix.
+# Names no filesystem path: the user needs reassurance and the next step, not where the secret is.
 _OK_PAGE = web_panel.render(
     "Opyt", ok=True,
     headline="Done — you can close this tab.",
@@ -78,15 +66,18 @@ class _Handler(BaseHTTPRequestHandler):
 class Capture:
     """A one-shot loopback listener. Use as a context manager, then `wait()`.
 
-    Binds TWO sockets on the SAME port — `127.0.0.1` and `::1` — because macOS resolves
+    Binds two sockets on the same port — `127.0.0.1` and `::1` — because macOS resolves
     `localhost` to `::1`, and a single dual-stack socket would require the `::` wildcard,
     which would put a credential capture on the LAN.
     """
 
+    handler: type[_Handler] = _Handler      # what answers the one route
+    route = "cb"
+
     def __init__(self, *, timeout: float = _DEFAULT_TIMEOUT):
         self.timeout = timeout
         self.nonce = secrets.token_urlsafe(32)
-        self.path = f"/cb/{self.nonce}"
+        self.path = f"/{self.route}/{self.nonce}"
         self.port = 0
         self._servers: list[HTTPServer] = []
         self._threads: list[threading.Thread] = []
@@ -106,7 +97,7 @@ class Capture:
 
     def _bind(self, family, host, port) -> HTTPServer:
         cls = type("_S", (HTTPServer,), {"address_family": family})
-        handler = type("_H", (_Handler,), {"capture": self})
+        handler = type("_H", (self.handler,), {"capture": self})
         return cls((host, port), handler)
 
     def __enter__(self) -> "Capture":
@@ -135,8 +126,8 @@ class Capture:
         return self
 
     def wait(self) -> dict | None:
-        """Block until a valid request lands, or the timeout expires. None means timeout —
-        Fail-safe: the caller degrades to a printed URL, it never dead-ends."""
+        """Block until a valid request lands, or the timeout expires. None means timeout; the
+        caller degrades to a printed URL."""
         return self._payload if self._done.wait(self.timeout) else None
 
     def __exit__(self, *exc):
@@ -148,28 +139,11 @@ class Capture:
         return False
 
 
-# ── The other half of a browser-driven acquisition, shared by every flow that runs one ────────
-# `Capture` is the loopback END of the round trip; these two are its START. They live here
-# rather than in one flow's module because there are now TWO flows — `openrouter_oauth`
-# (the user's own OpenRouter account) and `trial` (a key the gateway mints for them) — and a
-# second private copy of either is the shape drift starts in. Neither touches a credential:
-# one derives a public challenge, the other opens a URL.
-
-def pkce_pair() -> tuple[str, str]:
-    """A PKCE (verifier, S256 challenge). The VERIFIER never leaves the process that made it.
-
-    RFC 7636 S256: only the challenge travels through the browser, so an authorization code
-    stolen in transit is useless without the verifier that never went anywhere.
-    """
-    verifier = secrets.token_urlsafe(64)
-    digest = hashlib.sha256(verifier.encode()).digest()
-    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-
+# ── The start of a browser-driven acquisition ──────────────────────────────────────────────────
 
 def open_browser(url: str) -> bool:
-    """Best effort. False is a normal outcome, not an error: a headless box, a locked-down
-    desktop or a remote shell all land here, and every caller degrades to handing the user
-    the URL instead of dead-ending on it."""
+    """Best effort. False is a normal outcome (headless box, remote shell); callers then hand
+    the user the URL."""
     try:
         return bool(webbrowser.open(url))
     except Exception:

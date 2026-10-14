@@ -1,6 +1,6 @@
 """Stage 6 — academic identity URLs as Oracle roots, and the ORCID merge rule.
 
-The rootable set is what OPYT can PULL, which is OpenAlex and nothing else: an ORCID (one lookup
+The rootable set is what OPYT can pull, which is OpenAlex and nothing else: an ORCID (one lookup
 away from an author id) and an OpenAlex author URL (the id itself). Every other registry is
 refused by name.
 
@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import pytest
 
-from pipeline.kb import frontier_sources as fs
-from pipeline.kb import oracles, resolve, schema
+from pipeline.platforms.papers import openalex
+from pipeline.kb import resolve, schema
+from pipeline.oracles import reference
+from pipeline.oracles import identify
 
 
 @pytest.fixture()
@@ -29,12 +31,12 @@ _ARNOLD = {"id": "https://openalex.org/A5043841592", "display_name": "Frances H.
 # ── admission ────────────────────────────────────────────────────────────────────
 
 def test_an_academic_identity_url_no_longer_mints_a_blog_entity(conn, monkeypatch):
-    """The bug this replaces. Under the two-host deny-list, orcid.org was ADMITTED and became
-    `blog:orcid.org/0000-…` — so `oracle_refresh` pointed the BLOG ADAPTER at ORCID and scraped a
-    researcher's identity record as if it were their archive."""
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "author_by_orcid", lambda self, o: _ARNOLD)
+    """orcid.org must not be admitted as a blog: it would become `blog:orcid.org/0000-…`, and
+    `oracle_refresh` would point the blog adapter at ORCID and scrape a researcher's identity
+    record as if it were their archive."""
+    monkeypatch.setattr(openalex.OpenAlexClient, "author_by_orcid", lambda self, o: _ARNOLD)
 
-    cid = oracles._resolve_handle(conn, _ORCID)
+    cid = identify.resolve_handle(conn, _ORCID)
 
     assert cid == "openalex:A5043841592"
     assert not conn.execute("SELECT 1 FROM entities WHERE entity_id LIKE 'blog:%'").fetchone()
@@ -44,9 +46,9 @@ def test_an_orcid_resolves_to_the_id_that_has_a_works_feed(conn, monkeypatch):
     """`orcid:{id}` would be an Oracle whose every refresh found nothing — only an OpenAlex author
     id has a works feed. The ORCID is still stored as the identity link, which is what merges this
     entity with a `scholar:` one for the same person."""
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "author_by_orcid", lambda self, o: _ARNOLD)
+    monkeypatch.setattr(openalex.OpenAlexClient, "author_by_orcid", lambda self, o: _ARNOLD)
 
-    oracles._resolve_handle(conn, _ORCID)
+    identify.resolve_handle(conn, _ORCID)
 
     row = schema.get_entity(conn, "openalex:A5043841592")
     assert row["name"] == "Frances H. Arnold"
@@ -57,52 +59,47 @@ def test_a_failed_orcid_lookup_refuses_rather_than_falling_back_to_a_blog(conn, 
     """Falling back is the exact behaviour this change exists to stop."""
     def _boom(self, o):
         raise RuntimeError("openalex is down")
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "author_by_orcid", _boom)
+    monkeypatch.setattr(openalex.OpenAlexClient, "author_by_orcid", _boom)
 
-    assert oracles._resolve_handle(conn, _ORCID) is None
+    assert identify.resolve_handle(conn, _ORCID) is None
     assert not conn.execute("SELECT 1 FROM entities").fetchone()
 
 
 def test_a_semantic_scholar_author_page_is_refused_and_writes_nothing(conn):
-    """It minted `scholar:{id}` until 2026-09-09 — the id `derive_paper` uses for `who_id`, and
-    therefore the entity a user's saved papers already signal on. But that id has no pullable pair,
-    so the URL confirmed an Oracle with zero sources: a fail-safe violation, measured live.
+    """A `scholar:{id}` entity would have no pullable pair, so the URL would confirm an Oracle
+    with zero sources.
 
-    OpenAlex is what OPYT pulls papers through, and it subsumes S2 as a works index (Karpathy
-    24/24 keyed papers present; Arnold 398/408, 9 of the 10 misses being Protein Data Bank
-    depositions). So the root has to be an id OpenAlex is keyed by."""
-    assert oracles._resolve_handle(
+    OpenAlex is what OPYT pulls papers through, and it subsumes Semantic Scholar as a works index
+    (Karpathy 24/24 keyed papers present; Arnold 398/408, 9 of the 10 misses being Protein Data
+    Bank depositions). So the root has to be an id OpenAlex is keyed by."""
+    assert identify.resolve_handle(
         conn, "https://www.semanticscholar.org/author/F-Arnold/2081297") is None
     assert not conn.execute("SELECT 1 FROM entities").fetchone()
 
 
 def test_an_unpullable_registry_is_refused_without_a_network_call(conn, monkeypatch):
-    """`confirm(add_handles=[…])` reaches `_resolve_handle` WITHOUT passing `_unsupported_root`,
-    so the refusal has to live here too. Until 2026-09-09 an unpullable prefix fell through to the
-    ORCID lookup — a Semantic Scholar id was sent to `/authors/orcid:2354728` and refused only
-    because that lookup failed. A refusal that depends on a network call failing is not one."""
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "author_by_orcid",
+    """`confirm(add_handles=[…])` reaches `_resolve_handle` without passing `_unsupported_root`,
+    so the refusal has to live here too. An unpullable prefix must not fall through to the ORCID
+    lookup: a refusal that depends on a network call failing is not one."""
+    monkeypatch.setattr(openalex.OpenAlexClient, "author_by_orcid",
                         lambda self, o: pytest.fail(f"no lookup should be made for {o!r}"))
 
-    assert oracles._resolve_handle(
+    assert identify.resolve_handle(
         conn, "https://www.semanticscholar.org/author/F-Arnold/2081297") is None
 
 
 # ── the OpenAlex author URL ──────────────────────────────────────────────────────
 
 def test_an_openalex_author_url_roots_on_the_id_it_carries(conn, monkeypatch):
-    """The one academic URL that needs no lookup to be pullable — it IS the id the pull takes.
+    """The one academic URL that needs no lookup to be pullable — it is the id the pull takes.
 
-    It was admitted-and-broken until 2026-09-09: `canonical_identity` has no openalex branch, so
-    the URL collapsed to a bare `openalex.org`, missed `_SCHOLAR_ROOTS`, matched no venue name
-    (`sources?search=openalex` returns zero) and fell through to `blog:openalex.org` — pointing the
-    BLOG ADAPTER at an author record. It is also the shape the refusal copy now names, which is
-    what makes refusing Semantic Scholar cheap for a researcher who has no ORCID."""
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "author",
+    It is also the shape the refusal copy names, which is what makes refusing Semantic Scholar
+    cheap for a researcher who has no ORCID."""
+    monkeypatch.setattr(openalex.OpenAlexClient, "author",
                         lambda self, aid: {"id": f"https://openalex.org/{aid}",
                                            "display_name": "Andrej Karpathy", "works_count": 25})
 
-    cid = oracles._resolve_handle(conn, "https://openalex.org/A5009290031")
+    cid = identify.resolve_handle(conn, "https://openalex.org/A5009290031")
 
     assert cid == "openalex:A5009290031"
     assert schema.get_entity(conn, cid)["name"] == "Andrej Karpathy"
@@ -112,36 +109,35 @@ def test_an_openalex_author_url_roots_on_the_id_it_carries(conn, monkeypatch):
 def test_an_openalex_author_url_is_not_name_searched(conn, monkeypatch):
     """An `A…` id resolves through `author`, an `S…` through `source`, and neither pays the venue
     name search. Sending `openalex` to `sources_by_name` is what produced `blog:openalex.org`."""
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "author", lambda self, aid: None)
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "sources_by_name",
+    monkeypatch.setattr(openalex.OpenAlexClient, "author", lambda self, aid: None)
+    monkeypatch.setattr(openalex.OpenAlexClient, "sources_by_name",
                         lambda self, n: pytest.fail("a pasted id must not be name-searched"))
 
-    assert oracles._resolve_handle(conn, "https://openalex.org/A5009290031") \
+    assert identify.resolve_handle(conn, "https://openalex.org/A5009290031") \
         == "openalex:A5009290031"
 
 
-# ── the invariant the S2 defect broke ────────────────────────────────────────────
+# ── every pullable root really is pullable ────────────────────────────────────────────
 
-# One sample URL per prefix `_SCHOLAR_ROOTS` marks PULLABLE. The test below fails when a prefix is
-# marked True without one, which is the point: the S2 entry claimed pullability for four months
-# and nothing checked the claim against the thing that does the pulling.
+# One sample URL per prefix `_SCHOLAR_ROOTS` marks pullable. The test below fails when a prefix is
+# marked True without one, so the claim is always checked against the thing that does the pulling.
 _PULLABLE_SAMPLES = {"orcid.org/": _ORCID}
 
 
 def test_every_root_marked_pullable_actually_yields_a_pullable_pair(conn, monkeypatch):
-    """`_SCHOLAR_ROOTS`'s value means "OPYT can turn this URL into an id it can PULL work by", and
+    """`_SCHOLAR_ROOTS`'s value means "OPYT can turn this URL into an id it can pull work by", and
     `oracle_refresh_state.pair_from_member` is what decides that. The two must agree: a True entry
     whose entity yields no pair is an Oracle confirmed with zero sources."""
-    from pipeline.kb import oracle_refresh_state as st
+    from pipeline.oracles import pairs
 
-    monkeypatch.setattr(fs.OpenAlexWorksAdapter, "author_by_orcid", lambda self, o: _ARNOLD)
-    pullable = [p for p, ok in oracles._SCHOLAR_ROOTS.items() if ok]
+    monkeypatch.setattr(openalex.OpenAlexClient, "author_by_orcid", lambda self, o: _ARNOLD)
+    pullable = [p for p, ok in reference.SCHOLAR_ROOTS.items() if ok]
 
     assert set(pullable) == set(_PULLABLE_SAMPLES), "a pullable prefix needs a sample URL here"
     for prefix in pullable:
-        cid = oracles._resolve_handle(conn, _PULLABLE_SAMPLES[prefix])
+        cid = identify.resolve_handle(conn, _PULLABLE_SAMPLES[prefix])
         assert cid, prefix
-        assert st.pair_from_member(schema.get_entity(conn, cid)) is not None, prefix
+        assert pairs.pair_from_member(schema.get_entity(conn, cid)) is not None, prefix
 
 
 @pytest.mark.parametrize("url", [
@@ -155,21 +151,21 @@ def test_a_registry_with_no_works_feed_is_refused_with_the_shape_that_works(url)
     """Refused, not admitted-and-broken. These publish no free author→works feed, so an entity
     minted from one would be an Oracle whose every refresh had nothing to pull. The message names
     what to pass instead, the same way the X branch does."""
-    reason = oracles._unsupported_root(url)
+    reason = reference.unsupported_root(url)
 
     assert reason and "no author→works feed" in reason
     assert "orcid.org" in reason and "openalex.org/A" in reason
 
 
 def test_a_personal_site_is_still_a_blog_root():
-    assert oracles._unsupported_root("https://simonwillison.net") is None
+    assert reference.unsupported_root("https://simonwillison.net") is None
 
 
 # ── the merge ────────────────────────────────────────────────────────────────────
 
 def test_two_registries_sharing_an_orcid_become_one_person(conn):
-    """The whole reason a separate `openalex:` prefix costs nothing. Both carry the ORCID, both
-    count it as SELF, so the existing union-find merges them with no new code."""
+    """A separate `openalex:` prefix costs nothing. Both carry the ORCID, both
+    count it as self, so the existing union-find merges them with no new code."""
     schema.upsert_entity(conn, "openalex:A5043841592", name="Frances H. Arnold",
                          identity_links=[_ORCID])
     schema.upsert_entity(conn, "scholar:2081297", name="F. Arnold", identity_links=[_ORCID])
@@ -183,7 +179,7 @@ def test_two_registries_sharing_an_orcid_become_one_person(conn):
 
 
 def test_two_researchers_sharing_an_institution_do_not_merge(conn):
-    """The reason ORCID ALONE counts as self. Two people in one department share a lab page;
+    """Only an ORCID counts as self. Two people in one department share a lab page;
     nobody can claim another person's ORCID."""
     lab = "https://www.caltech.edu/people/arnold-group"
     schema.upsert_entity(conn, "openalex:A1", name="One", identity_links=[lab])

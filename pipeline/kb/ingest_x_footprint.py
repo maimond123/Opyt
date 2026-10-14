@@ -1,136 +1,59 @@
 """
-pipeline/kb/ingest_x_footprint.py — a confirmed Oracle's OWN X timeline → OPINION atoms.
+pipeline/kb/ingest_x_footprint.py — a confirmed Oracle's own X posts → opinion atoms, one
+timeline page at a time.
 
-Stage-5 footprint ingest for the ROOT channel: `discover_profile` only expands OFF-X sources, so
-an Oracle's primary X channel is otherwise absent from the corpus. Pulls the Oracle's last-~6mo
-timeline over x.com's internal GraphQL API on the user's own session cookies — the UNION of the
-Posts and Replies tabs, since Posts alone omits standalone replies — and lands each
-self-thread/original post as a full-body, chunked opinion atom. FREE: no third-party key, no
-per-read billing, and nobody outside this machine sees which accounts are being read.
+The X timeline scraper (`oracles/sources/timeline/walks.py`) reads the Oracle's
+`UserOriginalsTimeline` one request per unit. The page is oracles' (`oracles/sources/timeline/
+pages.py`); this module is the library half it renders and writes through (`_GroupWriter`,
+`group_atom`): each self-thread or original post becomes one full-body opinion atom. A
+thread's tail is fetched later by the tail queue (`threads.tails`), which renders through the
+same `_GroupWriter`.
 
-Distinct from `ingest_x.sync_bookmarks` (user's saves, keyed `x:{tweet_id}`) — this uses its own
-atom-id namespace `xprofile:{root_id}` so a footprint thread and a bookmark of the same root never
-collide and drop the richer version. `source_type` stays "x" so retrieval treats them as one family.
+Atom ids are `xprofile:{root_id}`, apart from bookmarks' `x:{tweet_id}`, so the two never collide;
+`source_type` stays "x".
 
-Curation filter: drop RTs and replies-to-others, keep originals + self-threads, no length gate.
-Filtering happens BEFORE stitching by conversationId — LOAD-BEARING, since conversationId includes
-the author's replies to commenters, not just the self-thread. One self-thread = one atom (chunked
-for embedding). Thread images are all VLM-described.
+Filter: drop RTs and replies-to-others, keep originals + self-threads, no length gate. Filtering
+runs before stitching by conversationId, since a conversation includes the author's replies to
+commenters.
 
-Dedup is via content-hash (`snapshot_and_hash` on `raw_hash`), not skip-on-atom-id-presence: X's
-timeline is one bulk fetch, so every group is re-rendered each run and only re-embedded when its
-hash changed (which also captures thread growth).
+Photos are never read here: a post renders the reads the image cache holds, and one with a photo
+still unread owes a `footprint_photos` row with its write.
 
-No eligibility gate: this pull is single-author by construction — one account's own timelines,
-filtered to that account — so the multi-author trust-laundering gate (`pipeline.kb.eligibility`)
-doesn't apply.
+Dedup is by content hash: a group is rewritten only when its hash changed, and a page another
+lane rewrote meanwhile is not written over (`pages.page_current`). No eligibility gate: one account's own
+timeline is single-author by construction.
 
-Fail-safe: a group that fails to render/embed/write SKIPS (no atom, no `seen` mark). A missing key
-or open credit breaker fails LOUD at the fetch.
-
+Fail-safe: a group that fails to render or write skips (no atom, no `seen` mark).
 """
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import sqlite3
 import threading
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pipeline.timeparse import utc_now
+from functools import partial
+from typing import Callable
 
-from . import derive, link_router, schema
-from .embed import assert_model
-from .ingest_common import (AtomSink, BASIS_OBSERVED, BODY_COMPLETE, BODY_PARTIAL,
-                            StageTimer, body_fields, llm_run_marker,
-                            llm_run_stats, run_concurrent, snapshot_and_hash)
+from pipeline.platforms.url_canon import host_of
 
-_DEFAULT_LOOKBACK_DAYS = 183       # ~6 months — cost-bounded default footprint window
-_MAX_LOOKBACK_DAYS = 730           # ~2 years — hard ceiling on the window. The pull is free now,
-                                   # ephemeral stream so `since` clamps rather than honors a longer ask
-_FETCH_CAP = 5000                  # safety cap on tweets pulled per run
-# Footprint mirrors the bookmark ingest: parallel per-group producers (OCR/VLM + article fetch) feed
-# ONE serial consumer owning conn + the batching embed sink. Real fan-out is capped lower by the
-# shared AIMD gates at the VLM/embed seams; this is only the producer-thread ceiling.
+from . import (derive, footprint_photos, link_cards, post_people, schema, vision, writes)
+from .ingest_common import (BASIS_OBSERVED, BODY_COMPLETE, BODY_PARTIAL, StageTimer,
+                            body_fields, changed_hash, store_atom)
+from .owed_links import owed_links
+
+# Producer-thread ceiling; per-group producers feed one serial consumer that owns conn.
 _INGEST_WORKERS = int(os.environ.get("OPYT_INGEST_WORKERS", "20"))
-_CACHE_FLUSH_EVERY = 16           # new media reads before the consumer persists img_cache (crash bound)
-
-# Substance filter: a post resting on the author's OWN words under this length is a fragment. Naked
-# = no attachment, a decorative photo, or a bare (non-github/paper/Substack) link. A quote or a
-# dispatchable link still provisionally keeps (David 2026-07-20).
-_NAKED_MIN_CHARS = 200
-_URL_IN_TEXT_RE = re.compile(r"https?://\S", re.I)
-
-
-def _author_chars(group: list[dict]) -> int:
-    """Chars of the AUTHOR's OWN words across the group (tweet text only — EXCLUDES the rendered
-    media transcription, the quoted post, and link expansions). The naked-substance measure."""
-    return sum(len((t.get("text") or "").strip()) for t in group)
-
 
 def _has_substantive_media(group: list[dict]) -> bool:
-    """Any of the AUTHOR's OWN photos the OCR cascade read as document/chart (substance=True). A
-    quoted image (someone else's) renders as context but does NOT promote the atom to an artifact."""
-    from .vision import _photos
+    """Any of the author's own photos read as a document/chart (substance=True). A quoted image
+    does not count."""
     return any((m.get("media_read") or {}).get("substance")
-               for t in group for m in _photos(t))
-
-
-# Dispatchable = github / research paper / Substack, the set that becomes its own atom later; any
-# other link counts as no retrievable substance, same as a decorative photo (David 2026-07-20).
-# `link_router` owns artifact classification and presence checks.
-_classify_link = link_router.classify_link
-_atom_present = link_router.atom_present
-
-
-def _post_urls(tweet: dict) -> list[str]:
-    """The tweet's EXPANDED outbound urls (`entities.urls[].expanded_url`). The text carries only
-    shortened t.co links, so classification MUST read the expanded field (populated on the profile
-    fetch — live-verified)."""
-    return [u.get("expanded_url", "") for u in (tweet.get("entities") or {}).get("urls") or []
-            if u.get("expanded_url")]
-
-
-def _dispatchable_link(urls: list[str]) -> bool:
-    """True if any url is github / a research paper / Substack — the set that becomes its own atom
-    (github/paper now, Substack later), so its post is KEPT (provisional) rather than judged as
-    effectively naked. A SUPERSET of what Step 3 actually mints."""
-    return any(_classify_link(u) for u in urls)
-
-
-def _keep_group(group: list[dict], *, has_article: bool) -> tuple[bool, str]:
-    """The substance decision for ONE stitched group → (keep, reason). Kept regardless of length
-    if it's a thread, an X-article/quoted-article, or has substantive media; otherwise it faces the
-    naked 200-char bar ("""
-    if len(group) > 1:
-        return True, "thread"
-    if has_article:
-        return True, "article"
-    root = group[0]
-    qt = root.get("quoted_tweet")
-    if isinstance(qt, dict) and qt.get("article"):
-        return True, "quoted-article"
-    if _has_substantive_media(group):
-        return True, "media-substance"
-    # Past here media is decorative; only a quote or a dispatchable link keeps the post alive.
-    urls = _post_urls(root)
-    if isinstance(qt, dict) or _dispatchable_link(urls):
-        return True, "provisional-keep"
-    from .vision import _photos
-    has_bare_link = bool(urls) or bool(_URL_IN_TEXT_RE.search(root.get("text") or ""))
-    label = "bare-link" if has_bare_link else ("decorative-media" if _photos(root) else "naked")
-    if _author_chars(group) >= _NAKED_MIN_CHARS:
-        return True, f"{label}>=200"
-    # Deep-probe LAST resort before the drop.
-    if has_bare_link and any(link_router.classify_link_deep(u) for u in urls):
-        return True, f"{label}-deep-paper"
-    return False, f"{label}<200"
+               for t in group for m in vision._photos(t))
 
 
 def _dedup_by_id(raw: list[dict]) -> list[dict]:
-    """Order-preserving dedup by tweet id (the API repeats tweets across pages). Shared by the
-    curation filter AND the engagement capture, so both always see the same tweet set."""
+    """Order-preserving dedup by tweet id (the API repeats tweets across pages)."""
     seen_ids: set[str] = set()
     unique: list[dict] = []
     for t in raw:
@@ -142,12 +65,8 @@ def _dedup_by_id(raw: list[dict]) -> list[dict]:
 
 
 def _majority_author(unique: list[dict]) -> tuple[str, str]:
-    """(numeric id, handle) of the pull's author. The author of this pull is uniform — the walk
-    filters each timeline to the account it asked for, which the Replies tab makes load-bearing
-    (it ships whole conversations, 45% of them other people's tweets);
-    majority vote guards a stray. ("", "") only if no tweet carries the field — then the filter
-    drops any reply with a populated target (conservative: a footprint frankenstein is worse
-    than a missed reply) and the engagement capture writes nothing (no attributable observer)."""
+    """(numeric id, handle) of the pull's author by majority vote. ("", "") when no tweet carries
+    it, and then the filter drops every reply with a known target."""
     from collections import Counter
 
     ids = [str((t.get("author") or {}).get("id")) for t in unique if (t.get("author") or {}).get("id")]
@@ -157,98 +76,14 @@ def _majority_author(unique: list[dict]) -> tuple[str, str]:
             Counter(handles).most_common(1)[0][0] if handles else "")
 
 
-def extract_engagements(raw: list[dict]) -> list[dict]:
-    """PURE (no DB / network): every reply / quote / mention observation in one account's pull —
-    read from the WHOLE deduped pull, BEFORE the curation filter drops replies-to-others, because
-    the dropped bucket (~49% of the corpus) is exactly where the engagement signal lives.
-
-    Rules (W0, 2026-08-07):
-      • Targets key on NUMERIC ids (`x:user:{id}`) whenever the payload carries one — reply
-        `inReplyToUserId` and `quoted_tweet.author.id` do. A handle-only target is stored as
-        `x:@{handle}` VERBATIM (screen names are [A-Za-z0-9_]; never slugified) for later
-        resolution. `inReplyToUsername` is never read: `x_graphql_core.normalize` does not emit it at
-        all, and the twitterapi.io shape this rule was first written against left it empty 100% of
-        the time. The numeric id is the only field either source populated reliably.
-      • Self-acts are NOT engagements: a self-reply is a thread continuation, a self-quote/self-
-        mention is thread plumbing. Excluded by id, and by handle (case-insensitive) when the
-        mention carries no id.
-      • Quote targets come from the `quoted_tweet` OBJECT, never the rendered markdown.
-      • Mentions come from ALL thread tweets, not just roots.
-      • No attributable observer (no author id anywhere) → no rows. No resolvable target → no row.
-      • `observed_at` = the TWEET's own date (day precision) — when the engagement happened.
-    """
-    unique = _dedup_by_id(raw)
-    author_id, author_handle = _majority_author(unique)
-    if not author_id:
-        return []
-    observer = f"x:user:{author_id}"
-    own_handle = (author_handle or "").lower()
-
-    out: list[dict] = []
-    seen: set[tuple] = set()
-
-    def _add(kind: str, target: str, tid: str, when: str | None) -> None:
-        key = (kind, target, tid)
-        if target and key not in seen:
-            seen.add(key)
-            out.append({"observer_id": observer, "kind": kind, "target_id": target,
-                        "src_ref": tid, "observed_at": when})
-
-    for t in unique:
-        if t.get("isRetweet"):          # a re-share's engagement surfaces aren't the author's acts
-            continue
-        tid = str(t.get("id", ""))
-        if not tid:
-            continue
-        when = derive._day(t.get("createdAt", "")) or None
-
-        reply_uid = str(t.get("inReplyToUserId") or "")
-        if t.get("isReply") and reply_uid and reply_uid != author_id:
-            _add("reply", f"x:user:{reply_uid}", tid, when)
-
-        qt = t.get("quoted_tweet")
-        if isinstance(qt, dict):
-            qa = qt.get("author") or {}
-            q_uid = str(qa.get("id") or "")
-            if q_uid:
-                if q_uid != author_id:
-                    _add("quote", f"x:user:{q_uid}", tid, when)
-            elif qa.get("userName"):
-                if str(qa["userName"]).lower() != own_handle:
-                    _add("quote", f"x:@{qa['userName']}", tid, when)
-
-        for m in (t.get("entities") or {}).get("user_mentions") or []:
-            m_uid = str(m.get("id_str") or m.get("id") or "")
-            if m_uid:
-                if m_uid != author_id:
-                    _add("mention", f"x:user:{m_uid}", tid, when)
-            elif m.get("screen_name"):
-                if str(m["screen_name"]).lower() != own_handle:
-                    _add("mention", f"x:@{m['screen_name']}", tid, when)
-    return out
-
-
 def _filter_and_stitch(raw: list[dict]) -> list[list[dict]]:
-    """Dedup → filter (drop RTs + replies-to-OTHERS, keep originals + self-replies) → stitch by
-    conversationId. Filter BEFORE stitch is LOAD-BEARING (this mirrored `x_render.sync_profile`
-    814→831 before that function was deleted 2026-08-14; the ordering is now stated only here):
-    conversationId is the WHOLE conversation incl. the author's replies to commenters, so
-    grouping first would weld a self-thread essay to its replies-to-commenters into one Frankenstein
-    atom. Returns chrono-sorted thread groups (solo posts = 1-element lists). Pure + offline — the
-    unit tests hit THIS, no DB / embedder / network.
+    """Dedup → filter (drop RTs + replies to others, keep originals + self-replies) → stitch by
+    conversationId. Filter before stitch: a conversation includes the author's replies to
+    commenters, which grouping first would weld into the thread. Returns chrono-sorted groups
+    (solo posts = 1-element lists). Pure + offline.
 
-    Reply target = `inReplyToUserId` compared to the AUTHOR's own numeric id — NOT `inReplyToUsername`
-    vs the handle. `x_graphql_core.normalize` does not emit `inReplyToUsername` at all, so a handle-string
-    check would keep every reply outright. It was already the wrong field before the source changed:
-    twitterapi.io's profile-fetch shape left it EMPTY (None) on every reply (LIVE-VERIFIED
-    2026-07-19: 0/136 populated for @martin_casado) while `inReplyToUserId` was 100% populated — so
-    the handle-string check silently kept EVERY reply and welded a person's replies-to-commenters
-    into 16-tweet atoms. We KEEP a reply ONLY when it's a self-reply (target ==
-    author = a thread continuation); every other reply (target is someone else, OR target unknown) is
-    dropped — its engagement signal is captured by `extract_engagements` BEFORE this drop, so the
-    drop costs curation noise, not data. Comparing IDs also beats a leading-`@` heuristic (a
-    self-continuation like "@x @y Nevermind, I'm an idiot" carries carried-over thread-participant
-    mentions but replies to the AUTHOR)."""
+    A reply is kept only when `inReplyToUserId` equals the author's numeric id; the handle field
+    is not emitted, and an unknown target drops the reply."""
     from pipeline.ingestion.x_render import _stitch_threads
 
     unique = _dedup_by_id(raw)
@@ -258,537 +93,178 @@ def _filter_and_stitch(raw: list[dict]) -> list[list[dict]]:
     for t in unique:
         if t.get("isRetweet"):          # from: excludes these; belt-and-suspenders (a re-share isn't theirs)
             continue
-        # KEEP originals + SELF-replies (continuations); DROP replies to anyone else (or unknown target).
+        # Keep originals + self-replies; drop replies to anyone else (or an unknown target).
         if t.get("isReply") and str(t.get("inReplyToUserId") or "") != author_id:
             continue
-        kept.append(t)                   # NO length / engagement gate — short aphorisms stay
+        kept.append(t)                   # no length / engagement gate — short aphorisms stay
 
-    groups = _stitch_threads(kept)       # {conv_id: [chrono tweets]} — group AFTER the filter
+    groups = _stitch_threads(kept)       # {conv_id: [chrono tweets]} — group after the filter
     return [g for g in groups.values() if g]
 
 
-# ── Step-3 link dispatch: a referenced github/paper → its OWN artifact atom ──
-
-class LinkDispatcher:
-    """Each github / paper / Substack-post link in an Oracle's OWN tweets (NOT quoted nodes — a
-    quoted tweet's links are the QUOTED author's references, not this Oracle's act) → its OWN
-    artifact atom, minted once and entered as `author_referenced`.
-
-    Author credibility is irrelevant here: `who_id` is always the artifact's own author, never the
-    Oracle.
-
-    State (ledgers, the in-flight set, the batching sink) is owned by ONE object because it's all
-    per-run and mutated only on the serial consumer thread. `_pending` holds atom_ids submitted to
-    the sink but not yet durable, and `mint_artifact` reads it as `in_flight` so a second tweet
-    referencing the same artifact rides the first one's flush instead of re-fetching and
-    re-embedding it. `_on_written` clears an id once it lands. `_pending` ("am I already working on
-    this, marked at submit") and `seen` ("is this durably stored") answer different questions and
-    must not be merged.
-
-    """
-
-    def __init__(self, conn, embedder, *, sink=None, img_cache: dict | None = None,
-                 prefetched: dict | None = None):
-        from collections import Counter
-
-        self.conn = conn
-        self.embedder = embedder
-        self.sink = sink
-        self.img_cache = img_cache
-        self.prefetched = prefetched or {}     # url → payload from the parallel fetch phase
-        self.paper_seen: dict = {}
-        self.gh_seen = schema.load_hashes(conn, "github")
-        self.sub_seen = schema.load_hashes(conn, "substack")
-        self._pending: set[str] = set()            # atom_ids submitted but not yet durable
-        self.kinds: Counter = Counter()
-        self.prefetch_hits = 0
-
-    # ── in-flight bookkeeping ───────────────────────────────────────────────────────────────
-    def _on_written(self, artifact_id: str) -> None:
-        """Fired by the sink when `artifact_id` is durable — it is no longer in flight."""
-        self._pending.discard(artifact_id)
-
-    def _mark_in_flight(self, artifact_id: str) -> None:
-        """Track a just-minted artifact IFF it is buffered rather than durable.
-
-        `_atom_present` is exactly the right question HERE and exactly the wrong one for "did the
-        mint succeed?" — it distinguishes durable-now from buffered, which is all this needs. The
-        caller must already have established that the artifact is one or the other."""
-        if not _atom_present(self.conn, artifact_id):
-            self._pending.add(artifact_id)
-
-    # ── dispatch ────────────────────────────────────────────────────────────────────────────
-    def dispatch(self, group: list[dict]) -> "Counter":
-        """One group → a kind→count tally of artifacts minted, already present, or queued.
-
-        Cheap + idempotent on a re-run: a PRESENT github/paper artifact is a DB check,
-        no network. (Substack has no url-derived id — its atom keys on the post's numeric
-        id — so it re-fetches to dedup, but skips the re-embed.) Every failure is swallowed — a bad
-        link never breaks the footprint pull (fail-safe)."""
-        from collections import Counter
-
-        from pipeline.ingestion.utils import log
-
-        kinds: Counter = Counter()
-        urls, seen_u = [], set()
-        for t in group:                      # OWN nodes only
-            for u in _post_urls(t):
-                if u not in seen_u:
-                    seen_u.add(u)
-                    urls.append(u)
-
-        for u in urls:
-            kind = _classify_link(u)
-            mint_url, content_type = u, None
-            if kind is None:
-                # Bounded on purpose: `dispatch()` only ever sees urls from a group that already
-                # survived `_keep_group`, so this fallback runs on a small, already-filtered set —
-                # not on every link of every tweet the pull touched.
-                deep = link_router.classify_link_deep(u)
-                if deep:
-                    kind, mint_url, content_type = deep
-            if kind not in ("github", "paper", "substack"):      # bare links are not dispatchable
-                continue
-            try:
-                captured = self._dispatch_one(mint_url, kind, content_type=content_type)
-            except Exception as e:           # a single bad link never breaks the pull
-                log(f"[footprint] link dispatch failed for {u}: {e}")
-                captured = False
-            if captured:
-                kinds[kind] += 1
-        self.kinds.update(kinds)
-        return kinds
-
-    def _dispatch_one(self, u: str, kind: str, *, content_type: str | None = None) -> bool:
-        """One url → True if the artifact is in the store or on its way there.
-
-        The MINT moved to `link_router.mint_artifact` (2026-08-13) so Hopper shares it; what stays
-        here is this caller's own half — turning a mint OUTCOME into the in-flight bookkeeping that
-        stops the NEXT tweet re-fetching the same artifact inside one flush window.
-
-        `content_type` — the deep probe's Content-Type, when `u` came from `classify_link_deep`
-        rather than the free host-list check; None on every other path."""
-        pre = self.prefetched.get(u)
-        res = link_router.mint_artifact(
-            self.conn, self.embedder, u, kind, entry_mode="author_referenced",
-            paper_seen=self.paper_seen, gh_seen=self.gh_seen, sub_seen=self.sub_seen,
-            img_cache=self.img_cache, sink=self.sink, on_written=self._on_written,
-            prefetched=pre, in_flight=self._pending, content_type=content_type)
-        self.prefetch_hits += res["used_prefetch"]
-
-        status, aid = res["status"], res["atom_id"]
-        if status == "failed" or not aid:
-            return False
-        # 'present' (already durable) and 'in-flight' (buffered by an earlier tweet, already
-        # tracked) both need nothing. Only a fresh mint may still be sitting in the sink's buffer.
-        if status not in ("present", "in-flight"):
-            self._mark_in_flight(aid)
-        return True
+def _own_site_hosts(conn, handle: str) -> frozenset[str]:
+    """The hosts of the Oracle's confirmed blog sources, found through its X handle. Their posts
+    belong to the blog footprint; minted here they would be stuck as `author_referenced`. No table
+    or row → no hosts."""
+    try:
+        rows = conn.execute(
+            "SELECT b.source_key FROM oracle_sources x JOIN oracle_sources b "
+            "ON b.canonical_id = x.canonical_id WHERE x.source_type = 'x' "
+            "AND lower(x.source_key) = lower(?) AND b.source_type = 'blog'", (handle,)).fetchall()
+    except sqlite3.Error:
+        return frozenset()
+    return frozenset(host_of(r[0]) for r in rows if r[0])
 
 
-def _resolve_since(since: datetime | None, now: datetime) -> datetime:
-    """The effective lower bound for the X pull: `since` (default ~6mo), FLOORED at the hard
-    2-year ceiling. However far back a caller asks, the window never exceeds
-    `_MAX_LOOKBACK_DAYS` — a longer request is clamped, not honored. Pure (takes `now`) so the
-    default + clamp are trivially testable."""
-    since = since or (now - timedelta(days=_DEFAULT_LOOKBACK_DAYS))
-    floor = now - timedelta(days=_MAX_LOOKBACK_DAYS)
-    return max(since, floor)
-
-
-def _prefetch_one_artifact(url: str, kind: str) -> dict | None:
-    """Fetch (never write) everything needed to mint one artifact. Pure network — no conn, no
-    embedder, no shared mutable state — which is what makes it safe to run on a pool thread."""
-    from . import ingest_github, ingest_papers
-
-    if kind == "github":
-        gh = ingest_github._github_owner_repo(url)
-        if not gh:
-            return None
-        repo = ingest_github._fetch_repo(*gh)
-        if not repo or not repo.get("name"):
-            return None
-        owner = (repo.get("owner") or {}).get("login", "") or gh[0]
-        from pipeline.ingestion.sources.github import _fetch_readme
-        return {"repo": repo, "readme": _fetch_readme(owner, repo.get("name", ""))}
-    paper = ingest_papers.paper_from_url(url)          # S2 enrich
-    if not paper:
-        return None
-    return {"paper": paper, "fulltext": ingest_papers.resolve_fulltext(paper)}   # PDF pull
-
-
-def _prefetch_counters(art_prefetch: dict | None) -> dict:
-    """The artifact prefetch's SHAPE, with the bodies left behind.
-
-    `prefetch_referenced_artifacts` returns `{payloads, links, unique, fetched}` — three counters
-    and a `{url: payload}` cache. The cache is consumed in-process by `LinkDispatcher` and read
-    by nobody afterwards, so only the counters belong in a run summary that a tool renders back
-    to a host. Empty in, empty out: an absent prefetch is not a prefetch of nothing.
-    """
-    if not art_prefetch:
-        return {}
-    return {k: v for k, v in art_prefetch.items() if k != "payloads"}
-
-
-def prefetch_referenced_artifacts(groups: list, *, workers: int) -> dict:
-    """Fetch every referenced github repo / paper up front, one future per artifact, so the serial
-    consumer's link dispatch doesn't serialize network fetches behind its writes.
-
-    Returns `{url: payload}`; a url that fails to fetch is simply absent and dispatch fetches it
-    inline instead. Does NOT skip already-present artifacts by DB lookup, since the github atom_id
-    depends on API-canonical owner casing only known after the fetch.
-
-"""
-    from concurrent.futures import ThreadPoolExecutor
-
-    from pipeline.ingestion.utils import log
-
-    todo: dict[str, str] = {}                 # url → kind, insertion-ordered, deduped
-    seen_links = 0
-    for group in groups:
-        for tweet in group:                   # OWN nodes only — mirrors LinkDispatcher.dispatch
-            for u in _post_urls(tweet):
-                kind = _classify_link(u)
-                if kind not in ("github", "paper"):    # substack is not sink-routed yet
-                    continue
-                seen_links += 1
-                todo.setdefault(u, kind)
-    if not todo:
-        return {}
-
-    out: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=min(len(todo), workers),
-                            thread_name_prefix="artifact-pre") as ex:
-        futs = {ex.submit(_prefetch_one_artifact, u, k): u for u, k in todo.items()}
-        for f in futs:
-            u = futs[f]
-            try:
-                payload = f.result()
-            except Exception as e:            # fail-safe: dispatch re-fetches this one inline
-                log(f"[footprint] artifact prefetch failed for {u}: {e}")
-                payload = None
-            if payload:
-                out[u] = payload
-    return {"payloads": out, "links": seen_links, "unique": len(todo), "fetched": len(out)}
-
-
-# ── stage nesting: which timed stages sit INSIDE which, so the UNtimed remainder is reportable ──
-# Declared beside the stage names it refers to, deliberately: this map's whole job is to go stale
-# loudly. It covers ONE adapter rather than `StageTimer` itself — nesting semantics on the shared
-# class would touch five ingesters to answer a question only this one is asking.
+# ── stage nesting: which timed stages sit inside which, so the untimed remainder is reportable ──
+# Keep in step with the stage names below; a stale child name would read as "measured, negligible".
 _STAGE_NESTING = {
-    # `article_fetch` left this map on 2026-08-30: an X Article's body now arrives as a field on
-    # the timeline walk, so there is no fetch to time. A dead name here would contribute 0 seconds
-    # and read as "measured and negligible" — the exact misreading the residual exists to prevent.
-    "produce": ("vlm", "render", "snapshot"),
-    "consume": ("link_dispatch", "cache_flush", "embed", "write"),
+    "produce": ("render", "snapshot"),
+    "consume": ("link_queue", "write"),
 }
 
 
 def _stage_residual(totals: dict[str, float]) -> dict[str, float]:
-    """Seconds inside a parent stage that NO child stage measured.
-
-    Untimed work contributes 0 to a profile and 100% to the clock, so a profile assembled only from
-    timed stages silently over-attributes cost to whatever happens to be timed — and the reader
-    cannot tell, because 'small' and 'unmeasured' are the same reading. Declaring the nesting turns
-    that gap into arithmetic: a nonzero residual names the parent that is hiding work. Drift fails
-    SAFE: an unregistered child stage inflates its parent's residual rather than hiding in silence.
-"""
+    """Seconds inside a parent stage that no child stage measured; a nonzero residual names the
+    parent hiding untimed work."""
     return {p: round(totals[p] - sum(totals.get(c, 0.0) for c in kids), 3)
             for p, kids in _STAGE_NESTING.items() if p in totals}
 
 
-# One request per page against a 50/15-min bucket, per timeline. The ceiling below the transport's
-# own `_USERTWEETS_MAX_PAGES` would be a second cap on the same thing, so this passes the transport
-# cap and lets it clamp — the date window is what actually ends a real walk (measured: 2 requests
-# for a 340-day window on a normal account, 26 for the most prolific oracle over 183 days).
-_TIMELINE_PAGES = 60
+def group_atom(res: dict, owed: list[dict]) -> dict:
+    """A prepared thread and its links become one atom, regardless of which lane fetched it."""
+    raw_hash = res["decided"]
+    meta, root, group = res["meta"], res["root"], res["group"]
+    who_id = res["who_id"]
+    return {
+        "atom_id": res["atom_id"],
+        "source_type": "x",           # X content — one family with bookmarks for retrieval
+        "what_kind": "opinion",
+        "who_id": who_id,
+        "when_ts": meta["when_ts"],
+        "when_precision": meta["when_precision"],
+        "about_entities": meta["about_entities"],  # @-mention slugs
+        "source_url": root.get("url") or f"https://x.com/{res['handle']}/status/{res['root_id']}",
+        "raw_hash": raw_hash,
+        "description": meta["description"],
+        # Structural signals. The author's footprint, so no user curation act is recorded.
+        "payload": {
+            "like_count": root.get("likeCount", 0),
+            "reply_count": root.get("replyCount", 0),
+            "is_thread": res["is_thread"],
+            "thread_len": len(group),
+            "is_article": bool(res["article"]),
+            # Also read the quoted object: the fetch can null isQuote on real quote tweets.
+            "is_quote": bool(root.get("isQuote") or root.get("quoted_tweet")),
+            "has_media": any((t.get("extendedEntities") or {}).get("media") for t in group),
+            "media_substance": _has_substantive_media(group),   # a photo read as a chart
+            "source_tags": meta["source_tags"],                 # hashtags — author-declared (§6)
+            # Partial if the author's own article body is missing or the thread's tail is owed.
+            **body_fields(BODY_PARTIAL if res["article_incomplete"] or res["owes_tail"]
+                          else BODY_COMPLETE, BASIS_OBSERVED),
+            # The tail queue's key: the conversation, its author, and the tweets this body holds.
+            **({"thread_tail": res["tail"], "thread_root": res["thread_root"],
+                "thread_author": res["thread_author"], "thread_ids": res["thread_ids"]}
+               if res["tail"] else {}),
+            # The referenced-links queue; recomputed whole on a rewrite.
+            "links_owed": owed,
+            # Who the post quotes, mentions or links, with the Oracle's own words (the mention arm).
+            "engages": post_people.post_people(group),
+        },
+        "entry_mode": "oracle-footprint",   # not user-saved (curation) / crawled (radar)
+    }
 
 
-@dataclass(frozen=True)
-class TimelineWalk:
-    """What one `_pull_own_timeline` call actually got — three values, because "how much did we
-    keep" and "how far back can we CLAIM to hold" stopped being the same question on 2026-09-14.
+class _GroupWriter:
+    """One stitched group's path to an atom — produce (pool thread: attach cached photo reads,
+    render, hash) → consume (serial: queue links, owe unread photos, hold the atom's write).
 
-    `tweets`   — the trimmed, deduped window, exactly what the old bare-list return was.
-    `complete` — which of {"posts", "replies"} finished their walk. The caller needs this and not
-                 a bare `partial` bool, because a one-sided walk is a BIASED sample rather than a
-                 shorter one: over one 108-day window, 200 of the 214 tweets found only by the
-                 paid API were replies. See `_pull_own_timeline`.
-    `reached`  — the oldest instant the WALK reached (epoch seconds), or None when it reached
-                 nothing. Computed BEFORE the `_in_window` trim, and the two differ exactly when
-                 a walk overshoots or is cut short: the trim says what the caller asked to keep,
-                 this says how far back we got. `None` for an empty walk.
-    """
-    tweets: list[dict]
-    complete: frozenset[str]
-    reached: float | None
+    The seam every Oracle X render passes through (timeline pages, the tail queue, the photo
+    source), so a thread renders, and hashes, the same whichever writes it. Photos are never read
+    here; an unread one owes a `footprint_photos` row in the write's transaction.
 
+    Producers touch only per-group locals and the tallies under `lock`; the consumer alone owns
+    `conn` and the ledgers. `owed_convs` / `tails` are the walk's inputs; the tail queue
+    and the photo source force the decision instead. `tail_rules` is the thread lane's tail state
+    (`oracles.sources.threads.tail_state`), handed in so this module never imports oracles."""
 
-def _pull_own_timeline(cookies: dict, headers: dict, user_id: str,
-                       since_ts: int, cap: int) -> TimelineWalk:
-    """One account's OWN tweets from `since_ts` to now — the union of X's two user timelines.
+    def __init__(self, conn, *, img_cache: dict, seen: dict, timer: "StageTimer",
+                 author_name: str | None = None, owed_convs: set[str] | frozenset = frozenset(),
+                 tails: dict | None = None, links_known: set[str] | None = None,
+                 tail_rules=None):
+        self.conn, self.author_name = conn, author_name
+        self.img_cache, self.seen, self.timer = img_cache, seen, timer
+        self.owed_convs, self.tails = owed_convs, tails or {}
+        self.tail_rules = tail_rules
+        # The writes the consumer decided (tail state, an unchanged post's links, owed photos,
+        # the atom itself), by the atom each belongs to, made by `write` (all) or `write_one`
+        # (one atom's).
+        self.local: dict[str, list[Callable[[], None]]] = {}
+        self.lock = threading.Lock()
+        self.added = self.skipped = self.failed = self.threads = 0   # consumer
+        self.submitted = 0                      # atoms held for a write; `added` is what landed
+        self.links_queued = 0                   # `links_owed` entries this run recorded
+        self._own_hosts: dict[str, frozenset[str]] = {}
+        # Posts whose links the queue already knows (`links_owed` present, even empty); an
+        # unchanged post not in here gets its links queued without a rewrite. Consumer-only.
+        self.links_known = _links_known(conn) if links_known is None else links_known
+        self.owed_held = 0                     # producer-phase tally (many threads) → `lock`
+        self.photos_owed = 0                   # posts written without a photo's read
+        self.cards = link_cards.load(conn)     # stored link cards, read-only on the producers
 
-    BOTH are required for parity, and this is the part that is easy to get wrong. The Posts tab
-    (`UserTweets`) omits standalone replies to other accounts: measured against twitterapi.io over
-    one 108-day window, 200 of the 214 tweets only twitterapi.io returned were replies. Walking
-    posts alone loses that entire population silently, because a short walk of a quiet account
-    looks exactly like a complete one.
+    def _owed_links(self, group: list[dict], post_atom_id: str) -> list[dict]:
+        handle = (group[0].get("author") or {}).get("userName") or ""
+        if handle not in self._own_hosts:
+            self._own_hosts[handle] = _own_site_hosts(self.conn, handle)
+        return owed_links(group, post_atom_id, own_hosts=self._own_hosts[handle])
 
-    The two operations hold INDEPENDENT rate buckets (50 per 15 minutes each), so the union costs
-    two walks but not two waits.
+    def produce(self, group: list[dict], *, atom_id: str | None = None, decision=None):
+        """Producer (pool thread): attach cached photo reads, read any X-Article body, render,
+        hash. No conn writes. Returns a write-ready result (even for an unchanged group, whose links
+        the consumer still queues), or None to skip.
 
-    Trimmed to the window on the way out. The walk overshoots `since_ts` by up to one page — its
-    date stop fires only after a page has landed — and `since` is a bound the caller chose, not an
-    approximation. `_dedupe_tweets` is the same pure helper the old paid path used; a tweet can
-    legitimately appear on both timelines.
+        `atom_id` pins the atom this group rewrites (the tail queue's owed atom); `decision`
+        forces the tail decision instead of asking `tail_rules.decide`."""
+        from pipeline.ingestion import x_render as xt
+        from pipeline.ingestion.utils import log
 
-    Does NOT sleep. Pacing is the caller's, deliberately — see `enrichment` for the one loop in
-    this repo that is allowed to wait out a window.
-
-    IT KEEPS WHAT IT WALKED (2026-09-14). `XRateLimited` is caught per timeline instead of
-    escaping, and each page is snapshotted through `after_page` as it lands, so a walk cut short
-    returns the tweets it already paid for rather than discarding them. This used to be
-    all-or-nothing, and that one property cost more than anything else in the path: a thin meter
-    produced zero atoms for requests genuinely spent, which in turn justified a pre-emptive
-    reserve that refused whole Oracles before a single request — measured 2026-09-14, two of four
-    Oracles got 0 requests and 0 atoms, twice, permanently. It is also the precondition for
-    finishing this work in the background at all: a killed pass must lose time, never work.
-
-    Snapshotting through `after_page` rather than changing `fetch_user_tweets`' contract is
-    deliberate — that function has other callers, and its accumulator is already handed to the
-    callback after every landed page, so the partial is there for the taking.
-
-    What it does NOT do is make a resume cheap. X paginates newest-first with no `until` bound, so
-    going deeper re-walks everything newer; `snapshot_and_hash` keeps that from re-embedding, but
-    requests are the scarce thing and it does not save those."""
-    from pipeline.ingestion import x_graphql_core as core
-    from pipeline.ingestion import x_render as xt
-    from pipeline.ingestion.utils import log
-
-    walked: list[dict] = []
-    complete: set[str] = set()
-
-    def _reached_the_window(acc: list[dict]) -> bool:
-        # `cap` counts across BOTH walks, not per walk — it is a bound on the run. Reading only
-        # `acc` (this walk's own accumulator) would let the second timeline start a fresh budget
-        # and fetch up to 2x the cap before the trim below threw half of it away.
-        if len(walked) + len(acc) >= cap:
-            return True
-        stamps = [xt._parse_twitter_date(t.get("createdAt", "")) for t in acc]
-        oldest = min((d.timestamp() for d in stamps if d), default=None)
-        return oldest is not None and oldest < since_ts
-
-    def _stamp(t: dict) -> float | None:
-        d = xt._parse_twitter_date(t.get("createdAt", ""))
-        return d.timestamp() if d else None
-
-    for timeline in ("posts", "replies"):
-        # The walk's own accumulator, copied after every landed page. `fetch_user_tweets` builds
-        # it up and discards it on a raise, so this is the only place the partial survives.
-        landed: list[dict] = []
-
-        def _after_page(acc: list[dict], _landed=landed) -> bool:
-            _landed[:] = acc
-            return _reached_the_window(acc)
-
-        try:
-            walked += core.fetch_user_tweets(cookies, headers, user_id, pages=_TIMELINE_PAGES,
-                                             timeline=timeline, after_page=_after_page)
-            complete.add(timeline)
-        except core.XRateLimited as e:
-            # NOT re-raised. The other timeline holds an INDEPENDENT bucket and may still answer,
-            # and what this one already walked is real content that was really paid for.
-            walked += landed
-            log(f"[footprint] x:user:{user_id} ({timeline}): the window ran out {len(landed)} "
-                f"tweets in — keeping them, and claiming no frontier for this walk. {e}")
-
-    # BEFORE the trim. A complete walk reached the bound it was given; a cut-short one reached
-    # only as far as its oldest tweet, which is a shorter window than the caller asked for — and
-    # `complete` is what tells the caller whether that number is defensible as a frontier at all.
-    if len(complete) == 2:
-        reached: float | None = float(since_ts)
-    else:
-        reached = min((s for s in (_stamp(t) for t in walked) if s is not None), default=None)
-
-    def _in_window(t: dict) -> bool:
-        s = _stamp(t)
-        return s is not None and s >= since_ts
-
-    return TimelineWalk(tweets=xt._dedupe_tweets([t for t in walked if _in_window(t)])[:cap],
-                        complete=frozenset(complete), reached=reached)
-
-
-_BOTH_TIMELINES = frozenset({"posts", "replies"})
-
-
-def _walk_frontier(walk: TimelineWalk) -> str | None:
-    """The backward frontier this walk may CLAIM — ISO, or None when it may claim none.
-
-    ⚠️ A ONE-SIDED WALK CLAIMS NOTHING, and this is the one rule in the durable-partial-walk work
-    that is load-bearing for correctness rather than for cost. `covered_from` only ever WIDENS —
-    `record_pull` takes the MIN — so a frontier recorded once is a claim nothing ever revisits:
-    `backfill_pair` reads it, sees the target window met, and never goes back.
-
-    `_pull_own_timeline` walks posts then replies against INDEPENDENT buckets, and the Posts tab
-    omits standalone replies. Over one 108-day window, 200 of the 214 tweets found only by the
-    paid API were replies. So a walk that finished posts and never started replies is a BIASED
-    sample rather than a shorter one, and recording its reach would make the missing majority
-    permanently invisible instead of merely missing.
-
-    Atoms from a partial walk still land — that is the point of keeping them, and it does not
-    violate the fail-safe invariant, because no unfinished work is being marked done. Claiming
-    the frontier would be exactly that.
-
-    None is not a degraded answer here: `record_pull` already documents it as "this pull had no
-    lower bound to report", and leaves the stored value alone."""
-    if walk.reached is None or walk.complete != _BOTH_TIMELINES:
-        return None
-    return datetime.fromtimestamp(walk.reached, tz=timezone.utc).isoformat()
-
-
-def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
-                     author_name: str | None = None, since: datetime | None = None) -> dict:
-    """Ingest a confirmed Oracle's OWN X timeline (from `since`..now) as opinion atoms.
-
-    `handle` names the account; `since` bounds the window (default ~6mo).
-    All qualifying groups in the fetched window are processed.
-
-    FREE: x.com's internal GraphQL API on this machine's own X session cookies. There is no key and
-    no non-browser path — a headless deployment cannot run this at all, which is the deliberate
-    trade taken when twitterapi.io was removed on 2026-08-30. A dead or absent cookie raises
-    `SyncAuthError`; an unreadable account returns `undetermined` rather than a silent 0.
-    Returns a run summary. Does NOT run entity resolution — the caller re-resolves after footprint
-    expansion so the author folds into the Oracle's canonical."""
-    from collections import Counter
-
-    from pipeline.ingestion import x_render as xt
-    from pipeline.ingestion.utils import log
-    from pipeline.image_cache import load_image_cache, save_image_cache
-    from opyt_core.paths import opyt_home
-
-    from .vision import enrich_tweet_media_cascade, prefetch_group_media
-
-    assert_model(conn, embedder)          # guard the store's embedding identity BEFORE any spend
-    llm0 = llm_run_marker()               # mark before the first paid call so the summary reports
-                                           # THIS run's LLM calls, not the process-cumulative total
-    h = (handle or "").lstrip("@")
-    if not h:
-        return {"source": "x-footprint", "error": "no handle"}
-
-    now = utc_now()
-    effective = _resolve_since(since, now)
-    if since is not None and effective > since:
-        log(f"[footprint] x @{h}: requested window exceeds the {_MAX_LOOKBACK_DAYS}-day (2yr) cap "
-            f"— clamped to {effective:%Y-%m-%d}")
-    since = effective
-    since_ts = int(since.timestamp())
-
-    # A handle names the account; the timeline walk keys on the numeric `rest_id`, which is also
-    # what its author filter compares against. One extra request on a 150/15-min bucket.
-    from pipeline.ingestion import x_graphql_core as core
-    session = core.x_session(f"https://x.com/{h}")
-    profile = core.fetch_user_profile(session, session, h)
-    if not profile:
-        # Suspended, deactivated, protected, or renamed. A FACT about the account, not a transient
-        # miss — but `undetermined` is still the honest verdict, because this path cannot tell
-        # which, and the three have different answers.
-        log(f"[footprint] x @{h}: profile unreadable (suspended / protected / renamed?)")
-        return {"source": "x-footprint", "fetched": 0, "added": 0, "skipped": 0, "failed": 0,
-                "undetermined": 1, "error": "x profile unreadable"}
-
-    log(f"[footprint] x @{h}: posts + replies since {since:%Y-%m-%d} "
-        f"(cap {_FETCH_CAP} tweets) — FREE, this session's own cookies")
-    walk = _pull_own_timeline(session, session, profile["user_id"], since_ts, _FETCH_CAP)
-    if not walk.complete:
-        # ⚠️ NOTHING WAS OBSERVED, so this is still a refusal — and re-raising is what keeps the
-        # fail-safe invariant intact: a failed external call must not mark work done. Both walks
-        # were cut off before either finished, so there is no observation to stamp
-        # `last_pulled_at` with, and letting it return an ordinary empty summary would classify as
-        # `ingested`, restart the pair's TTL, and hide the pair for a full window.
-        #
-        # The bar is `complete`, never the tweet count: an account that genuinely posted nothing
-        # in the window finishes both walks and returns zero tweets, which is a real observation
-        # and must keep stamping. And one finished timeline IS an observation, even an empty one —
-        # it just claims no frontier (see `_walk_frontier`).
-        raise core.XRateLimited(
-            f"@{h}: x.com cut off both timelines before either finished — nothing observed, so "
-            f"nothing is being marked as pulled.")
-    raw = walk.tweets
-    log(f"[footprint] x @{h}: fetched {len(raw)} tweets")
-
-    # Image descriptions cached by URL (immutable CDN links) → re-runs are free + keep the atom's
-    # snapshot HASH stable (an un-cached VLM would vary the text → spurious re-embeds).
-    img_cache = load_image_cache(opyt_home())
-    seen = schema.load_hashes(conn, "x")   # SHARED "x" ledger; footprint keys (xprofile:) never
-                                           # collide with bookmark keys (x:) — separate namespaces.
-    groups = _filter_and_stitch(raw)
-    # Record every reply/quote/mention observation from the WHOLE pull, including replies-to-others
-    # the curation filter just dropped — the walk already fetched them. Fail-safe: a capture error
-    # never costs the atoms.
-    engagements = 0
-    try:
-        engagements = schema.record_engagements(conn, extract_engagements(raw))
-    except Exception as e:
-        log(f"[footprint] x @{h}: engagement capture failed (atoms unaffected): {e}")
-    added = skipped = failed = threads = dispatched = 0   # consumer-owned (single writer)
-    dispatch_kinds: Counter = Counter()
-    dropped = 0                           # producer-phase tallies (many threads) → ride counts_lock
-    drop_reasons: Counter = Counter()     # why a group was cut (fragment) — observability
-    keep_reasons: Counter = Counter()     # why a group survived (artifact / naked>=200 / provisional)
-    media_kinds: Counter = Counter()      # OCR cascade routes across the run (document/chart/photo)
-    counts_lock = threading.Lock()
-
-    home = opyt_home()
-    timer = StageTimer()
-    bs = int(getattr(embedder, "batch_size", 64) or 64)
-    # A BATCHING sink, not per-atom store_atom: a 6-month footprint is 100s of thread-atoms, and a
-    # per-atom embed on the consumer would re-serialize the very cost the producer pool parallelizes.
-    # 8×batch_size flush lets the Phase-3 embed gate probe 8-way. One consumer owns conn + this sink.
-    sink = AtomSink(conn, embedder, timer=timer, flush_chunks=8 * bs)
-    cache_pending = 0
-    # Images read INSIDE a producer thread rather than by the prefetch. After a prefetch this should
-    # be 0; anything above it means the prefetch leaked and that image was read serially — the exact
-    # behavior the prefetch removes. Reported so a partial regression is a NUMBER, not a slow run
-    # that looks fine.
-    late_reads = 0
-
-    def _produce(group: list[dict]):
-        """PRODUCER (pool thread): the network-bound per-group work — OCR/VLM the images, read
-        any X-Article body, render, hash. Touches ONLY per-group locals + thread-safe shared state (the
-        AIMD-gated VLM seam, the locked img_cache, the counts_lock-guarded tallies). No conn
-        writes. Returns a write-ready result — even for an UNCHANGED group, because the consumer still
-        dispatches its referenced links — or None to skip (no root / dropped fragment)."""
-        nonlocal dropped
+        timer = self.timer
         root = group[0]                    # chronologically first tweet = the atom's canonical
         root_id = str(root.get("id", ""))
         if not root_id:
             return None
-        atom_id = f"xprofile:{root_id}"
+        # A group's identity is its conversation, so later self-replies on a newer page than
+        # their root key to the thread's atom rather than a second one.
+        conv = str(root.get("conversationId") or root_id)
+        has_root = conv == root_id
+        atom_id = atom_id or f"xprofile:{conv}"
         is_thread = len(group) > 1
+        h = (root.get("author") or {}).get("userName") or ""
+        ids = [str(t.get("id")) for t in group]
+        author = str((root.get("author") or {}).get("id") or "")
 
-        # OCR cascade for ALL images (transcribe → route → chart-VLM), mutating each node in place with
-        # `description` + `media_read` (the substance verdict _keep_group reads). Cached URLs are free.
-        n_reads = 0
-        with timer.stage("vlm"):
-            for t in group:
-                _n, node_reads = enrich_tweet_media_cascade(t, img_cache)
-                n_reads += _n
-                if node_reads:
-                    with counts_lock:
-                        media_kinds.update(mr.kind for mr in node_reads)
+        if decision is None:
+            decision = self.tail_rules.decide(self.tails.get(atom_id), conv=conv, ids=ids,
+                                              has_root=has_root, stored=atom_id in self.seen,
+                                              owed_convs=self.owed_convs)
+        if decision.skip:
+            return None
+        if decision.mark_owed:
+            with self.lock:
+                self.owed_held += 1
+            return {"mark_owed": True, "atom_id": atom_id, "tail": decision.tail,
+                    "thread_root": conv, "thread_author": author, "group": group}
 
-        # X-Article body — a FIELD READ, not a fetch. The timeline walk asks for
-        # `withArticleRichContentState`, so a tweet that carries an Article arrives with the whole
-        # `content_state` already attached (`x_graphql_core.normalize` carries the node verbatim, and
-        # recurses into `quoted_status_result`, so a QUOTED article needs no separate handling
-        # either). This used to be one paid `/twitter/article` call per article, per run.
-        #
-        # An X ARTICLE whose body did not arrive renders as its teaser tweet — a real fragment of a
-        # real long-form post, and the atom must say so rather than look complete. That is still
-        # possible without a fetch to fail: X returns a TEASER node (cover image, title,
-        # `preview_text`, no blocks) whenever `withArticleRichContentState` is off or ignored, and
-        # it is truthy, so `bool(article)` cannot be the test. Ask whether it has a BODY.
+        # Cached photo reads and stored link cards, put on each node in place (`description` for
+        # the render, `media_read` for `media_substance`, `link_cards` for the `## Links` entry).
+        # An unread photo is owed to the photo source.
+        for t in group:
+            vision.attach_cached(t, self.img_cache)
+            link_cards.attach(t, self.cards)
+        photos_owed = any(vision._photos_pending(t, self.img_cache) for t in group)
+
+        # X-Article body is a field read: the walk asks for `withArticleRichContentState`. A
+        # teaser node (no blocks) is truthy, so test for a body, and mark the atom partial.
         article = None
         article_incomplete = False
         for t in group:
@@ -802,186 +278,165 @@ def sync_x_footprint(conn: sqlite3.Connection, embedder, *, handle: str,
                     f"(rendering the teaser) — check `withArticleRichContentState`.")
             break
 
-        # Substance filter: drop a fragment (naked post under the length bar) BEFORE the paid embed.
-        # Runs AFTER media-read + article fetch so the artifact signals are known.
-        keep, reason = _keep_group(group, has_article=bool(article))
-        if not keep:
-            with counts_lock:
-                dropped += 1
-                drop_reasons[reason] += 1
-            return None
-        with counts_lock:
-            keep_reasons[reason] += 1
+        if decision.owes:
+            with self.lock:
+                self.owed_held += 1
 
         meta = derive.derive_x(root)
         with timer.stage("render"):
             md = xt.tweet_to_markdown(root, article=article,
                                       thread_tweets=group if is_thread else None,
                                       source="x-profile", footer_label="Profile extract")
-        # Content-hash dedup: re-embed ONLY on a new/changed body (captures thread growth).
-        with timer.stage("snapshot"):      # writes the snapshot file — the producer's other real I/O
-            decided = snapshot_and_hash("x", atom_id, md, seen)
+        # Content-hash dedup: rewrite only on a new/changed body.
+        with timer.stage("snapshot"):      # hashes the snapshot against the stored one
+            decided = (None if decision.keep_stored
+                       else changed_hash(atom_id, md, self.seen))
         return {"group": group, "root": root, "root_id": root_id, "atom_id": atom_id,
                 "who_id": meta["who_id"], "meta": meta, "md": md, "is_thread": is_thread,
-                "article": article, "reason": reason, "decided": decided, "n_reads": n_reads,
-                "article_incomplete": article_incomplete}
+                "article": article, "decided": decided,
+                "photos_owed": photos_owed,
+                "article_incomplete": article_incomplete, "tail": decision.tail,
+                "owes_tail": decision.owes, "thread_root": conv,
+                "thread_author": author, "thread_ids": ids, "handle": h}
 
-    def _work(group: list[dict]):
-        """`_produce` under a parent timer. The wrapper exists so the producer's children
-        (vlm/render/snapshot) sum against a KNOWN total — see `stage_residual`."""
-        with timer.stage("produce"):
-            return _produce(group)
+    def work(self, group: list[dict]):
+        """`produce` under a parent timer, so its children sum against a known total."""
+        with self.timer.stage("produce"):
+            return self.produce(group)
 
-    def _mark_written(atom_id: str, raw_hash: str, is_thread: bool) -> None:
-        """Fires AFTER an atom is durably written (consumer thread) → the summary counts DURABLE atoms."""
-        nonlocal added, threads
-        seen[atom_id] = raw_hash
-        added += 1
-        threads += int(is_thread)
+    def _mark_written(self, atom_id: str, raw_hash: str, is_thread: bool, links: int) -> None:
+        """Fires after an atom is durably written, so the summary counts durable atoms."""
+        self.seen[atom_id] = raw_hash
+        self.added += 1
+        self.threads += int(is_thread)
+        self.links_queued += links
+        self.links_known.add(atom_id)
 
-    def _consume_body(res: dict) -> None:
-        """CONSUMER (caller's thread, SERIAL): the sole owner of the write path. Dispatches the group's
-        referenced links FIRST (always — artifact capture is independent of whether this body
-        re-embeds), persists paid media reads on a cadence, then submits the atom to the batching sink
-        when the snapshot changed."""
-        nonlocal skipped, dispatched, cache_pending, late_reads
+    def _consume_body(self, res: dict) -> None:
+        """Consumer (caller's thread, serial), the sole owner of the write path: works out the
+        group's owed links, holds the changed atom's write, and owes its unread photos."""
+
+        timer = self.timer
+        if res.get("mark_owed"):
+            self._side(res["atom_id"], partial(self.tail_rules.set_tail_state, self.conn,
+                                               res["atom_id"], res["tail"], body=BODY_PARTIAL,
+                                               root=res["thread_root"],
+                                               author=res["thread_author"]))
+            return
         group = res["group"]
         who_id = res["who_id"]
-        # STEP-3 link dispatch — for EVERY kept group (even hash-unchanged) so an already-captured tweet
-        # still captures the referenced artifact. Consumer-only (writes conn + the dedup ledgers).
-        with timer.stage("link_dispatch"):          # SERIAL: the fetch is prefetched, the write batches
-            dk = dispatcher.dispatch(group)
-        dispatched += sum(dk.values())
-        dispatch_kinds.update(dk)
-        cache_pending += res["n_reads"]
-        late_reads += res["n_reads"]      # after a prefetch this should be 0; see `late_reads`
-        if cache_pending >= _CACHE_FLUSH_EVERY:     # bound a crash's re-OCR cost (paid); save snapshots
-            with timer.stage("cache_flush"):        # a whole-file JSON dump, on the serial consumer
-                save_image_cache(home, img_cache)   # under the cache lock → safe vs concurrent producers
-            cache_pending = 0
+        with timer.stage("link_queue"):
+            owed = self._owed_links(group, res["atom_id"])
 
         decided = res["decided"]
-        if decided is None:                         # snapshot unchanged → skip the (paid) embed
-            skipped += 1
+        if decided is None:                         # snapshot unchanged → no rewrite
+            self.skipped += 1
+            if res["atom_id"] not in self.links_known:
+                # Its links are not queued yet: queue them in place, with no rewrite.
+                self._side(res["atom_id"], partial(self._queue_links, res["atom_id"], owed))
+                self.links_known.add(res["atom_id"])
+            # A post stored before `engages` existed gains it the same way; a no-op once it has it.
+            self._side(res["atom_id"], partial(_fill_engages, self.conn, res["atom_id"],
+                                               post_people.post_people(group)))
             return
-        raw_ref, raw_hash = decided
         meta = res["meta"]
         root = res["root"]
         # Persist the author as a person with the @handle (same convention as ingest_x); idempotent.
         site = meta.get("who_site")
         schema.upsert_entity(
-            conn, who_id, name=meta.get("who_name") or author_name,
+            self.conn, who_id, name=meta.get("who_name") or self.author_name,
             identity_links=[site] if site else None,
             profile={"handle": meta["who_handle"]} if meta.get("who_handle") else None)
 
-        atom = {
-            "atom_id": res["atom_id"],
-            "source_type": "x",           # X content — one family with bookmarks for retrieval
-            "what_kind": "opinion",
-            "who_id": who_id,
-            "when_ts": meta["when_ts"],
-            "when_precision": meta["when_precision"],
-            "about_entities": meta["about_entities"],  # @-mention slugs
-            "source_url": root.get("url") or f"https://x.com/{h}/status/{res['root_id']}",
-            "raw_ref": raw_ref,
-            "raw_hash": raw_hash,
-            "description": meta["description"],
-            # Structural signals (observability + the deferred substantiveness view). This is the
-            # AUTHOR's footprint, so — unlike a bookmark — there is NO user curation act to record.
-            "payload": {
-                "like_count": root.get("likeCount", 0),
-                "reply_count": root.get("replyCount", 0),
-                "is_thread": res["is_thread"],
-                "thread_len": len(group),
-                "is_article": bool(res["article"]),
-                # Derive from the quoted OBJECT, not isQuote — the profile fetch nulls the flag on
-                # real quote tweets (see tweet_to_markdown's quote-render note), so the raw bool lies.
-                "is_quote": bool(root.get("isQuote") or root.get("quoted_tweet")),
-                "has_media": any((t.get("extendedEntities") or {}).get("media") for t in group),
-                "media_substance": _has_substantive_media(group),   # OCR found a doc/chart artifact
-                "keep_reason": res["reason"],                       # substance-filter verdict (observability)
-                "source_tags": meta["source_tags"],                 # hashtags — author-declared (§6)
-                # PARTIAL only if this author's own ARTICLE failed to load; a failed quoted-article
-                # fetch doesn't count (that's someone else's content, rendered as context only).
-                **body_fields(BODY_PARTIAL if res["article_incomplete"] else BODY_COMPLETE,
-                              BASIS_OBSERVED),
-            },
-            "entry_mode": "oracle-footprint",   # NOT user-saved (curation) / crawled (radar)
+        atom = group_atom(res, owed)
+        aid, it, n = res["atom_id"], res["is_thread"], len(owed)
+        self.submitted += 1
+        if res["photos_owed"]:
+            self._side(aid, partial(footprint_photos.owe, self.conn, aid, who_id, group))
+            self.photos_owed += 1
+        # Bookkeeping rides on_written so the counters count durable atoms, not submitted ones.
+        self._side(aid, partial(store_atom, self.conn, atom, res["md"],
+                                on_written=partial(self._mark_written, aid, atom["raw_hash"],
+                                                   it, n)))
+
+    def _side(self, atom_id: str, write: Callable[[], None]) -> None:
+        self.local.setdefault(atom_id, []).append(write)
+
+    def consume(self, res: dict) -> None:
+        """`_consume_body` under a parent timer. The consumer is serial, so its total is wall
+        clock, comparable to `process` (`produce` is thread-seconds)."""
+        with self.timer.stage("consume"):
+            self._consume_body(res)
+
+    def _queue_links(self, atom_id: str, owed: list[dict]) -> None:
+        if _queue_links(self.conn, atom_id, owed):
+            writes.after_commit(self.conn, partial(self._count_links, len(owed)))
+
+    def _count_links(self, n: int) -> None:
+        self.links_queued += n
+
+    def write(self) -> None:
+        """Every write the consumer decided, atoms included, in one transaction, or in the
+        caller's when one is open."""
+        with self.timer.stage("consume"), self.timer.stage("write"), \
+                writes.write_tx(self.conn, site="x.footprint"):
+            for side in self.local.values():
+                for write in side:
+                    write()
+        self.local = {}
+
+    def write_one(self, atom_id: str) -> None:
+        """One atom's share of `write`, in one transaction or in the caller's when one is open.
+        The photo source lands each post with its settle this way, so one post never waits on
+        another's."""
+        with self.timer.stage("consume"), self.timer.stage("write"), \
+                writes.write_tx(self.conn, site="x.footprint"):
+            for write in self.local.pop(atom_id, []):
+                write()
+
+    def close(self) -> None:
+        """Write whatever remains."""
+        self.write()
+
+    def summary(self) -> dict:
+        """The counters and diagnostics every caller reports, in the walk's summary shape."""
+        return {
+            "added": self.added, "skipped": self.skipped,
+            "failed": self.failed, "threads": self.threads,
+            # Posts written without a photo's read, which went to the photo source.
+            "photos_owed": self.photos_owed,
+            # Link entries this run queued for the reference sources — what tells a caller the
+            # queue has work. Captured links are counted by the queue, not here.
+            "links_owed": self.links_queued,
+            # Parent−Σ(children) per nested stage.
+            "stage_residual": _stage_residual(self.timer.totals),
+            "stage_seconds": self.timer.totals, "stage_latency": self.timer.distribution(),
         }
-        aid, it = res["atom_id"], res["is_thread"]
-        # Bookkeeping rides on_written so added/threads/seen count DURABLE atoms, not merely submitted.
-        sink.submit(atom, res["md"],
-                    on_written=(lambda a=aid, rh=raw_hash, t=it: _mark_written(a, rh, t)))
 
-    def _consume(res: dict) -> None:
-        """`_consume_body` under a parent timer. This one is the load-bearing measurement: the
-        consumer is SERIAL, so its total IS wall clock — directly comparable to `process`, unlike
-        `produce` (thread-seconds across the pool). `consume / process` ≈ 1 means no amount of
-        producer parallelism can help and the serial write path is the floor."""
-        with timer.stage("consume"):
-            _consume_body(res)
 
-    # Read images and referenced artifacts before rendering groups.
-    with timer.stage("media_prefetch"):
-        prefetch = prefetch_group_media(
-            groups, img_cache, workers=_INGEST_WORKERS,
-            flush_every=_CACHE_FLUSH_EVERY, on_flush=lambda: save_image_cache(home, img_cache))
-    log(f"[footprint] x @{h}: media prefetch — {prefetch['read']} read, "
-        f"{prefetch['failed']} failed, {prefetch['images']} refs "
-        f"({prefetch['dispatched']} unique+uncached)")
-    with timer.stage("artifact_prefetch"):
-        art_prefetch = prefetch_referenced_artifacts(groups, workers=_INGEST_WORKERS)
-    if art_prefetch:
-        log(f"[footprint] x @{h}: artifact prefetch — {art_prefetch['fetched']} fetched of "
-            f"{art_prefetch['unique']} unique ({art_prefetch['links']} refs)")
+# ── The referenced-links queue: what the walk queued, captured after it ──
 
-    # The dispatcher owns every ledger the SERIAL consumer mutates, plus the batching sink, so the
-    # single-writer rule those unlocked dicts depend on is a property of one object rather than a
-    # comment on four separate locals.
-    dispatcher = LinkDispatcher(conn, embedder, sink=sink, img_cache=img_cache,
-                                prefetched=art_prefetch.get("payloads") if art_prefetch else None)
+def _links_known(conn) -> set[str]:
+    """X atoms that carry `links_owed` at all, even `[]`."""
+    return {r[0] for r in conn.execute(
+        "SELECT atom_id FROM atoms WHERE source_type = 'x' "
+        "AND json_type(payload, '$.links_owed') IS NOT NULL")}
 
-    # ── PHASE 3: produce (pooled) → consume (serial). `process` is this phase's WALL clock, the
-    # denominator every other number here is read against.
-    with timer.stage("process"):
-        run_concurrent(groups, _work, _consume, workers=_INGEST_WORKERS)
-        with timer.stage("consume"):           # the tail is consumer work too, so it stays UNDER
-            sink.close()                       # `consume` — else embed/write/cache_flush leak out of
-            with timer.stage("cache_flush"):   # their parent and the residual goes negative
-                save_image_cache(home, img_cache)   # backstop: persist reads not yet flushed
-    log(f"[footprint] x @{h}: added {added}, dropped {dropped} {dict(drop_reasons)}, "
-        f"skipped {skipped}, failed {failed}; media {dict(media_kinds)}; "
-        f"dispatched {dispatched} {dict(dispatch_kinds)}")
-    return {"source": "x-footprint", "fetched": len(raw), "groups": len(groups),
-            "engagements": engagements,
-            # What this run HOLDS, beside what it added. `partial` says more of this window is
-            # owed; `covered_from` is the frontier it may claim, which is None whenever the claim
-            # would not be defensible — see `_walk_frontier`. Neither rides `run_stats`: that
-            # copies int counters and dict diagnostics, and these two are neither.
-            "partial": walk.complete != _BOTH_TIMELINES,
-            "covered_from": _walk_frontier(walk),
-            "added": added, "dropped": dropped, "skipped": skipped, "failed": failed,
-            "threads": threads, "drop_reasons": dict(drop_reasons),
-            "keep_reasons": dict(keep_reasons), "media_kinds": dict(media_kinds),
-            "dispatched": dispatched, "dispatch_kinds": dict(dispatch_kinds),
-            # late_reads > 0 means images were read inside a producer thread despite the prefetch —
-            # a partial regression, surfaced as a number instead of just latency.
-            "media_prefetch": prefetch, "late_reads": late_reads,
-            # A url absent from the payload map failed prefetch; dispatch re-fetches it inline.
-            #
-            # ⚠️ COUNTERS ONLY — `payloads` NEVER RIDES (2026-09-14). It is a CACHE: built above,
-            # handed to `LinkDispatcher(prefetched=…)`, and read by nobody once this function
-            # returns. But it holds every prefetched artifact body verbatim — full GitHub repo
-            # objects, `node_id`s and all — and `oracles._ingest_oracle` renders this whole dict
-            # into a result row with `str()`. Measured on a real ingest: 41,339 of one row's
-            # 46,473 bytes, which put `oracle(action='progress')` at 110KB and past the host's
-            # token limit, so the completion report for a finished pull could not be read at all.
-            # Every fact a reader wants is already in `stats` as real JSON, in 1.8KB.
-            "artifact_prefetch": _prefetch_counters(art_prefetch),
-            "prefetch_hits": dispatcher.prefetch_hits,
-            # Parent−Σ(children) per nested stage — read `consume` against `process` (consumer is
-            # SERIAL, so its total is wall clock; `produce` is thread-seconds, not comparable).
-            "stage_residual": _stage_residual(timer.totals),
-            "stage_seconds": timer.totals, "stage_latency": timer.distribution(),
-            **llm_run_stats(llm0),
-            "total": schema.count_atoms(conn, "x")}
+
+def _queue_links(conn, atom_id: str, owed: list[dict]) -> bool:
+    """Queue an unchanged post's links in place (no rewrite), only where nothing is queued yet.
+    The caller commits."""
+    cur = conn.execute(
+        "UPDATE atoms SET payload = json_set(COALESCE(payload, '{}'), '$.links_owed', json(?)) "
+        "WHERE atom_id = ? AND json_type(payload, '$.links_owed') IS NULL",
+        (json.dumps(owed), atom_id))
+    return cur.rowcount > 0
+
+
+def _fill_engages(conn, atom_id: str, engages: list[dict]) -> None:
+    """Set an unchanged post's `engages` in place (no rewrite), only where it has none yet. The
+    caller commits."""
+    conn.execute(
+        "UPDATE atoms SET payload = json_set(COALESCE(payload, '{}'), '$.engages', json(?)) "
+        "WHERE atom_id = ? AND json_type(payload, '$.engages') IS NULL",
+        (json.dumps(engages), atom_id))

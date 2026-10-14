@@ -1,0 +1,392 @@
+{
+ "aggregate": [
+  200,
+  "application/json",
+  "{\"scope\":{},\"kb\":\"x\",\"notices\":[],\"total\":7,\"by_what_kind\":{\"artifact\":3,\"opinion\":4},\"by_source_type\":{\"blog\":1,\"github\":2,\"paper\":1,\"substack\":1,\"x\":2},\"trusted_atoms\":1,\"top_entities\":[{\"who_id\":\"blog:example.com\",\"count\":1},{\"who_id\":\"github:root\",\"count\":1},{\"who_id\":\"github:stranger\",\"count\":1},{\"who_id\":\"scholar:1\",\"count\":1},{\"who_id\":\"substack:carol\",\"count\":1},{\"who_id\":\"x:user:1\",\"count\":1},{\"who_id\":\"x:user:2\",\"count\":1}],\"recent_descriptions\":[{\"atom_id\":\"x:2\",\"description\":\"x:2 card\",\"who_id\":\"x:user:2\",\"when_ts\":\"2025-06-01\"},{\"atom_id\":\"substack:post1\",\"description\":\"substack:post1 card\",\"who_id\":\"substack:carol\",\"when_ts\":\"2025-03-02\"},{\"atom_id\":\"x:1\",\"description\":\"x:1 card\",\"who_id\":\"x:user:1\",\"when_ts\":\"2025-01-15\"},{\"atom_id\":\"github:stranger/agents\",\"description\":\"github:stranger/agents card\",\"who_id\":\"github:stranger\",\"when_ts\":\"2024-07-09\"},{\"atom_id\":\"github:root/agentkit\",\"description\":\"github:root/agentkit card\",\"who_id\":\"github:root\",\"when_ts\":\"2024-05-01\"},{\"atom_id\":\"paper:2401.00001\",\"description\":\"paper:2401.00001 card\",\"who_id\":\"scholar:1\",\"when_ts\":\"2024-01-01\"},{\"atom_id\":\"blog:home\",\"description\":\"blog:home card\",\"who_id\":\"blog:example.com\",\"when_ts\":\"\"}]}"
+ ],
+ "feed": [
+  200,
+  "application/json",
+  "{\"kb\":\"x\",\"notices\":[],\"items\":[{\"atom_id\":\"substack:post1\",\"description\":\"substack:post1 card\",\"source_url\":\"https://example/substack:post1\",\"who_id\":\"substack:carol\",\"who\":\"Carol\",\"when_ts\":\"2025-03-02\",\"seen_at\":\"<time>\",\"source_type\":\"substack\",\"what_kind\":\"opinion\",\"entry_mode\":\"user-saved\"},{\"atom_id\":\"x:1\",\"description\":\"x:1 card\",\"source_url\":\"https://example/x:1\",\"who_id\":\"x:user:1\",\"who\":\"Alice\",\"when_ts\":\"2025-01-15\",\"seen_at\":\"<time>\",\"source_type\":\"x\",\"what_kind\":\"opinion\",\"entry_mode\":\"user-saved\"},{\"atom_id\":\"x:2\",\"description\":\"x:2 card\",\"source_url\":\"https://example/x:2\",\"who_id\":\"x:user:2\",\"who\":\"Bob\",\"when_ts\":\"2025-06-01\",\"seen_at\":\"<time>\",\"source_type\":\"x\",\"what_kind\":\"opinion\",\"entry_mode\":\"author_referenced\"}],\"next\":{\"since\":\"<time>\",\"since_id\":\"x:2\"},\"more\":false}"
+ ],
+ "feed_bad_date": [
+  400,
+  "application/json",
+  "{\"detail\":\"date bound 'yesterday' is not a date. Use YYYY, YYYY-MM or YYYY-MM-DD; a partial widens to its natural edge (date_from='2026' is 2026-01-01, date_to='2026' is 2026-12-31).\"}"
+ ],
+ "grant": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"code\":\"<secret>\"}"
+ ],
+ "grant_agent": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"code\":\"<secret>\"}"
+ ],
+ "grant_agent_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "grant_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "library_add_oracle_later": [
+  200,
+  "application/json",
+  "{\"status\":\"later\",\"message\":\"They'll be added to your library when your computer is next on.\"}"
+ ],
+ "library_forget_later": [
+  200,
+  "application/json",
+  "{\"status\":\"later\",\"message\":\"It'll be removed from your library when your computer is next on.\"}"
+ ],
+ "library_forget_preview": [
+  200,
+  "application/json",
+  "{\"status\":\"preview\",\"atoms\":[{\"atom_id\":\"x:1\",\"description\":\"x:1 card\",\"who_id\":\"x:user:1\",\"when_ts\":\"2025-01-15\",\"source_url\":\"https://example/x:1\"}],\"consent\":[\"This removes one atom: x:1 card.\",\"Its text and search entry are deleted.\",\"There is no undo; saving the source again requires a new ingest.\",\"If this X post is still in your bookmarks, it will return on an hourly bookmark pass. Unbookmark it on x.com to keep it removed.\"]}"
+ ],
+ "library_hopper_later": [
+  200,
+  "application/json",
+  "{\"status\":\"later\",\"message\":\"It'll be in your library when your computer is next on.\"}"
+ ],
+ "library_no_token": [
+  401,
+  "application/json",
+  "{\"detail\":\"missing bearer token\"}"
+ ],
+ "library_owner_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an agent token\"}"
+ ],
+ "library_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an agent token\"}"
+ ],
+ "library_reader_view": [
+  200,
+  "application/json",
+  "{\"status\":\"made\",\"url\":\"/p/<key>\",\"message\":\"Give the user the link as a markdown link whose text is the page's title, and say in the same line that anyone with the link can read it and comment on it, and that it is deleted 90 days after it was last opened. The page is what they asked for: do not also make an artifact, document or page of the same answer with your own tools.\"}"
+ ],
+ "library_reader_view_delete": [
+  200,
+  "application/json",
+  "{\"status\":\"deleted\",\"message\":\"Taken down. The link now says the page has expired.\"}"
+ ],
+ "library_share": [
+  200,
+  "application/json",
+  "{\"status\":\"shared\",\"invite\":\"https://useopyt.com/invite#<secret>\",\"message\":\"Give the user the invite to send to Maya. It works once: in Opyt on their computer, or pasted into claude.ai or ChatGPT with the Opyt connector added.\"}"
+ ],
+ "library_share_preview": [
+  200,
+  "application/json",
+  "{\"status\":\"preview\",\"items\":7,\"by_source_type\":{\"blog\":1,\"github\":2,\"paper\":1,\"substack\":1,\"x\":2},\"by_what_kind\":{\"artifact\":3,\"opinion\":4},\"top_entities\":[{\"who_id\":\"blog:example.com\",\"count\":1},{\"who_id\":\"github:root\",\"count\":1},{\"who_id\":\"github:stranger\",\"count\":1},{\"who_id\":\"scholar:1\",\"count\":1},{\"who_id\":\"substack:carol\",\"count\":1},{\"who_id\":\"x:user:1\",\"count\":1},{\"who_id\":\"x:user:2\",\"count\":1}],\"readers\":2,\"last_published_at\":\"<time>\",\"consent\":[\"The person who redeems the link can search all 7 items in this library. There is no way to share part of it.\",\"It is standing access, not a one-time copy: they see the library as it updates, until they are cut off with `unshare`.\",\"The link works once. They redeem it in Opyt on their own computer, or by pasting it into claude.ai or ChatGPT with the Opyt connector added.\"]}"
+ ],
+ "library_status": [
+  200,
+  "application/json",
+  "{\"status\":\"ready\",\"items\":7,\"last_published_at\":\"<time>\",\"search\":\"keyword\",\"setup\":\"https://useopyt.com/connector.html\",\"changes\":[]}"
+ ],
+ "library_unshare": [
+  200,
+  "application/json",
+  "{\"status\":\"reader_revoked\",\"reader_label\":\"a reader\",\"readers_remaining\":1,\"message\":\"a reader loses access on their very next request. The knowledge base is still shared with everyone else.\"}"
+ ],
+ "library_unshare_preview": [
+  200,
+  "application/json",
+  "{\"status\":\"preview\",\"scope\":\"one_reader\",\"reader_label\":\"a reader\",\"reader_id\":\"<key>\",\"readers_remaining\":1,\"service\":\"\",\"consent\":[\"This cuts off a reader and nobody else. 1 other(s) keep their access.\",\"The served copy of this knowledge base stays up.\",\"The invite a reader redeemed was already spent, so nothing they hold keeps working. Letting them back in means a new `share` link.\"]}"
+ ],
+ "library_watch_unavailable": [
+  200,
+  "application/json",
+  "{\"status\":\"unavailable\",\"message\":\"Topics can't be shown right now.\"}"
+ ],
+ "line_answer": [
+  200,
+  "application/json",
+  "{\"recorded\":true}"
+ ],
+ "line_answer_again": [
+  200,
+  "application/json",
+  "{\"recorded\":false}"
+ ],
+ "line_answer_no_ok": [
+  422,
+  "application/json",
+  "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"ok\"],\"msg\":\"Field required\",\"input\":{\"answer\":{}}}]}"
+ ],
+ "line_next_call": [
+  200,
+  "application/json",
+  "{\"call\":{\"id\":\"<key>\",\"tool\":\"hopper\",\"args\":{\"reference\":\"https://example.com/a\",\"confirm\":true}}}"
+ ],
+ "line_next_no_token": [
+  401,
+  "application/json",
+  "{\"detail\":\"missing bearer token\"}"
+ ],
+ "line_next_no_writer": [
+  200,
+  "application/json",
+  "{\"call\":null,\"retry_after\":3600}"
+ ],
+ "line_next_nothing": [
+  200,
+  "application/json",
+  "{\"call\":null}"
+ ],
+ "line_next_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "open": [
+  200,
+  "application/json",
+  "{\"atom_id\":\"github:root/agentkit\",\"kb\":\"x\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"who_id\":\"github:root\",\"when_ts\":\"2024-05-01\",\"when_precision\":\"day\",\"source_url\":\"https://example/github:root/agentkit\",\"cite\":\"[Root Dev · 2024-05-01](https://example/github:root/agentkit)\",\"description\":\"github:root/agentkit card\",\"raw\":\"an autonomous agent framework with tools for building agents\",\"raw_available\":true,\"body_state\":\"complete\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"ai-agents\"]}}"
+ ],
+ "open_missing": [
+  200,
+  "application/json",
+  "{\"atom_id\":\"nope:1\",\"kb\":\"david\",\"error\":\"not found\"}"
+ ],
+ "open_offset": [
+  200,
+  "application/json",
+  "{\"atom_id\":\"github:root/agentkit\",\"kb\":\"x\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"who_id\":\"github:root\",\"when_ts\":\"2024-05-01\",\"when_precision\":\"day\",\"source_url\":\"https://example/github:root/agentkit\",\"cite\":\"[Root Dev · 2024-05-01](https://example/github:root/agentkit)\",\"description\":\"github:root/agentkit card\",\"raw\":\"ramework with tools for building agents\",\"raw_available\":true,\"body_state\":\"partial\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"ai-agents\"]},\"raw_offset\":21,\"raw_chars\":60,\"next_offset\":null}"
+ ],
+ "open_offset_outside": [
+  200,
+  "application/json",
+  "{\"atom_id\":\"github:root/agentkit\",\"error\":\"offset 10000 is outside this item's text, which has 60 characters; pass 0, or the `next_offset` an earlier answer gave.\"}"
+ ],
+ "openapi": [
+  200,
+  "application/json",
+  "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"OPYT knowledge-base service\",\"version\":\"0.1.0\"},\"paths\":{\"/v1/kb/{owner}/search\":{\"post\":{\"summary\":\"Search\",\"operationId\":\"search_v1_kb__owner__search_post\",\"parameters\":[{\"name\":\"owner\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Owner\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/SearchBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Search V1 Kb  Owner  Search Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/kb/{owner}/open\":{\"post\":{\"summary\":\"Open Atom\",\"operationId\":\"open_atom_v1_kb__owner__open_post\",\"parameters\":[{\"name\":\"owner\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Owner\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/OpenBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Open Atom V1 Kb  Owner  Open Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/kb/{owner}/aggregate\":{\"post\":{\"summary\":\"Aggregate\",\"operationId\":\"aggregate_v1_kb__owner__aggregate_post\",\"parameters\":[{\"name\":\"owner\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Owner\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/AggregateBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Aggregate V1 Kb  Owner  Aggregate Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/kb/{owner}/feed\":{\"get\":{\"summary\":\"Feed\",\"operationId\":\"feed_v1_kb__owner__feed_get\",\"parameters\":[{\"name\":\"owner\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Owner\"}},{\"name\":\"since\",\"in\":\"query\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Since\"}},{\"name\":\"since_id\",\"in\":\"query\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Since Id\"}},{\"name\":\"limit\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"integer\",\"default\":50,\"title\":\"Limit\"}},{\"name\":\"entry_mode\",\"in\":\"query\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Entry Mode\"}},{\"name\":\"date_from\",\"in\":\"query\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Date From\"}},{\"name\":\"date_to\",\"in\":\"query\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Date To\"}},{\"name\":\"as_kb\",\"in\":\"query\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"As Kb\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Feed V1 Kb  Owner  Feed Get\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/upload/{owner}\":{\"post\":{\"summary\":\"Upload\",\"operationId\":\"upload_v1_upload__owner__post\",\"parameters\":[{\"name\":\"owner\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Owner\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Upload V1 Upload  Owner  Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/upload/{owner}/delta\":{\"post\":{\"summary\":\"Upload Delta\",\"operationId\":\"upload_delta_v1_upload__owner__delta_post\",\"parameters\":[{\"name\":\"owner\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Owner\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Upload Delta V1 Upload  Owner  Delta Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/register\":{\"post\":{\"summary\":\"Register\",\"operationId\":\"register_v1_register_post\",\"requestBody\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/RegisterBody\"}}},\"required\":true},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"additionalProperties\":true,\"type\":\"object\",\"title\":\"Response Register V1 Register Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/grant\":{\"post\":{\"summary\":\"Grant\",\"operationId\":\"grant_v1_grant_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/GrantBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Grant V1 Grant Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/redeem\":{\"post\":{\"summary\":\"Redeem\",\"operationId\":\"redeem_v1_redeem_post\",\"requestBody\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/RedeemBody\"}}},\"required\":true},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"additionalProperties\":true,\"type\":\"object\",\"title\":\"Response Redeem V1 Redeem Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/revoke\":{\"post\":{\"summary\":\"Revoke\",\"operationId\":\"revoke_v1_revoke_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/RevokeBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Revoke V1 Revoke Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/link\":{\"post\":{\"summary\":\"Link\",\"operationId\":\"link_v1_link_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Link V1 Link Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/unlink\":{\"post\":{\"summary\":\"Unlink\",\"operationId\":\"unlink_v1_unlink_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Unlink V1 Unlink Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/unpublish\":{\"post\":{\"summary\":\"Unpublish\",\"operationId\":\"unpublish_v1_unpublish_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Unpublish V1 Unpublish Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/tokens\":{\"get\":{\"summary\":\"Tokens\",\"operationId\":\"tokens_v1_tokens_get\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Tokens V1 Tokens Get\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/line/next\":{\"get\":{\"summary\":\"Line Next\",\"operationId\":\"line_next_v1_line_next_get\",\"parameters\":[{\"name\":\"wait\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"number\",\"default\":50.0,\"title\":\"Wait\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Line Next V1 Line Next Get\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/line/{call_id}/answer\":{\"post\":{\"summary\":\"Line Answer\",\"operationId\":\"line_answer_v1_line__call_id__answer_post\",\"parameters\":[{\"name\":\"call_id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Call Id\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/AnswerBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Line Answer V1 Line  Call Id  Answer Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/status\":{\"get\":{\"summary\":\"Library Status\",\"operationId\":\"library_status_v1_library_status_get\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Status V1 Library Status Get\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/reader_view\":{\"post\":{\"summary\":\"Library Reader View\",\"operationId\":\"library_reader_view_v1_library_reader_view_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/ReaderViewBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Reader View V1 Library Reader View Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/share\":{\"post\":{\"summary\":\"Library Share\",\"operationId\":\"library_share_v1_library_share_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/ShareBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Share V1 Library Share Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/unshare\":{\"post\":{\"summary\":\"Library Unshare\",\"operationId\":\"library_unshare_v1_library_unshare_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/UnshareBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Unshare V1 Library Unshare Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/hopper\":{\"post\":{\"summary\":\"Library Hopper\",\"operationId\":\"library_hopper_v1_library_hopper_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HopperBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Hopper V1 Library Hopper Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/forget\":{\"post\":{\"summary\":\"Library Forget\",\"operationId\":\"library_forget_v1_library_forget_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/ForgetBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Forget V1 Library Forget Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/watch\":{\"post\":{\"summary\":\"Library Watch\",\"operationId\":\"library_watch_v1_library_watch_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/WatchBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Watch V1 Library Watch Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/library/add_oracle\":{\"post\":{\"summary\":\"Library Add Oracle\",\"operationId\":\"library_add_oracle_v1_library_add_oracle_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/AddOracleBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Library Add Oracle V1 Library Add Oracle Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/stats\":{\"get\":{\"summary\":\"Stats\",\"operationId\":\"stats_v1_stats_get\",\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"additionalProperties\":true,\"type\":\"object\",\"title\":\"Response Stats V1 Stats Get\"}}}}}}},\"/stats\":{\"get\":{\"summary\":\"Stats Page\",\"operationId\":\"stats_page_stats_get\",\"responses\":{\"200\":{\"content\":{\"text/html\":{\"schema\":{\"type\":\"string\"}}}}}}},\"/v1/pages\":{\"post\":{\"summary\":\"Make Page\",\"operationId\":\"make_page_v1_pages_post\",\"parameters\":[{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/PageBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Make Page V1 Pages Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/pages/{page_id}/delete\":{\"post\":{\"summary\":\"Delete Page\",\"operationId\":\"delete_page_v1_pages__page_id__delete_post\",\"parameters\":[{\"name\":\"page_id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Page Id\"}},{\"name\":\"authorization\",\"in\":\"header\",\"required\":false,\"schema\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Authorization\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response Delete Page V1 Pages  Page Id  Delete Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/v1/x-signin\":{\"post\":{\"summary\":\"X Signin Mint\",\"operationId\":\"x_signin_mint_v1_x_signin_post\",\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"additionalProperties\":true,\"type\":\"object\",\"title\":\"Response X Signin Mint V1 X Signin Post\"}}}}}}},\"/v1/x-signin/collect\":{\"post\":{\"summary\":\"X Signin Collect\",\"operationId\":\"x_signin_collect_v1_x_signin_collect_post\",\"requestBody\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/CollectBody\"}}},\"required\":true},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"additionalProperties\":true,\"type\":\"object\",\"title\":\"Response X Signin Collect V1 X Signin Collect Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/x-signin/{nonce}\":{\"get\":{\"summary\":\"X Signin Open\",\"operationId\":\"x_signin_open_x_signin__nonce__get\",\"parameters\":[{\"name\":\"nonce\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Nonce\"}}],\"responses\":{\"200\":{\"content\":{\"text/html\":{\"schema\":{\"type\":\"string\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/x-signin/{nonce}/claim\":{\"post\":{\"summary\":\"X Signin Claim\",\"operationId\":\"x_signin_claim_x_signin__nonce__claim_post\",\"parameters\":[{\"name\":\"nonce\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Nonce\"}}],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/ClaimBody\"}}}},\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response X Signin Claim X Signin  Nonce  Claim Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/x-signin/s/{session}/start\":{\"post\":{\"summary\":\"X Signin Start\",\"operationId\":\"x_signin_start_x_signin_s__session__start_post\",\"parameters\":[{\"name\":\"session\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Session\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response X Signin Start X Signin S  Session  Start Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/x-signin/s/{session}/restart\":{\"post\":{\"summary\":\"X Signin Restart\",\"operationId\":\"x_signin_restart_x_signin_s__session__restart_post\",\"parameters\":[{\"name\":\"session\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Session\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response X Signin Restart X Signin S  Session  Restart Post\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}},\"/x-signin/s/{session}/status\":{\"get\":{\"summary\":\"X Signin Status\",\"operationId\":\"x_signin_status_x_signin_s__session__status_get\",\"parameters\":[{\"name\":\"session\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\",\"title\":\"Session\"}}],\"responses\":{\"200\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"title\":\"Response X Signin Status X Signin S  Session  Status Get\"}}}},\"422\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/HTTPValidationError\"}}}}}}}},\"components\":{\"schemas\":{\"AddOracleBody\":{\"properties\":{\"reference\":{\"type\":\"string\",\"title\":\"Reference\"},\"x_lookback\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"X Lookback\"},\"web_lookback\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Web Lookback\"},\"scholar_lookback\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Scholar Lookback\"},\"scholar_topics\":{\"anyOf\":[{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Scholar Topics\"}},\"type\":\"object\",\"required\":[\"reference\"],\"title\":\"AddOracleBody\"},\"AggregateBody\":{\"properties\":{\"scope\":{\"anyOf\":[{\"additionalProperties\":true,\"type\":\"object\"},{\"type\":\"null\"}],\"title\":\"Scope\"},\"as_kb\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"As Kb\"}},\"type\":\"object\",\"title\":\"AggregateBody\"},\"AnswerBody\":{\"properties\":{\"ok\":{\"type\":\"boolean\",\"title\":\"Ok\"},\"answer\":{\"additionalProperties\":true,\"type\":\"object\",\"title\":\"Answer\"}},\"type\":\"object\",\"required\":[\"ok\",\"answer\"],\"title\":\"AnswerBody\"},\"ClaimBody\":{\"properties\":{\"session\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Session\"}},\"type\":\"object\",\"title\":\"ClaimBody\"},\"CollectBody\":{\"properties\":{\"signin\":{\"type\":\"string\",\"title\":\"Signin\"}},\"type\":\"object\",\"required\":[\"signin\"],\"title\":\"CollectBody\"},\"ForgetBody\":{\"properties\":{\"atom_id\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Atom Id\"},\"atom_ids\":{\"anyOf\":[{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Atom Ids\"},\"oracle\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Oracle\"},\"confirm\":{\"type\":\"boolean\",\"title\":\"Confirm\",\"default\":false}},\"type\":\"object\",\"title\":\"ForgetBody\"},\"GrantBody\":{\"properties\":{\"label\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Label\"},\"agent\":{\"type\":\"boolean\",\"title\":\"Agent\",\"default\":false}},\"type\":\"object\",\"title\":\"GrantBody\"},\"HTTPValidationError\":{\"properties\":{\"detail\":{\"items\":{\"$ref\":\"#/components/schemas/ValidationError\"},\"type\":\"array\",\"title\":\"Detail\"}},\"type\":\"object\",\"title\":\"HTTPValidationError\"},\"HopperBody\":{\"properties\":{\"reference\":{\"type\":\"string\",\"title\":\"Reference\"},\"kind_hint\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Kind Hint\"}},\"type\":\"object\",\"required\":[\"reference\"],\"title\":\"HopperBody\"},\"OpenBody\":{\"properties\":{\"atom_id\":{\"type\":\"string\",\"title\":\"Atom Id\"},\"as_kb\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"As Kb\"},\"offset\":{\"type\":\"integer\",\"title\":\"Offset\",\"default\":0}},\"type\":\"object\",\"required\":[\"atom_id\"],\"title\":\"OpenBody\"},\"PageBody\":{\"properties\":{\"title\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Title\"},\"note\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Note\"},\"answer\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Answer\"},\"items\":{\"items\":{\"additionalProperties\":true,\"type\":\"object\"},\"type\":\"array\",\"title\":\"Items\"}},\"type\":\"object\",\"required\":[\"items\"],\"title\":\"PageBody\"},\"ReaderViewBody\":{\"properties\":{\"atom_ids\":{\"anyOf\":[{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Atom Ids\"},\"title\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Title\"},\"note\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Note\"},\"answer\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Answer\"},\"delete\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Delete\"}},\"type\":\"object\",\"title\":\"ReaderViewBody\"},\"RedeemBody\":{\"properties\":{\"code\":{\"type\":\"string\",\"title\":\"Code\"},\"install_id\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Install Id\"}},\"type\":\"object\",\"required\":[\"code\"],\"title\":\"RedeemBody\"},\"RegisterBody\":{\"properties\":{\"label\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Label\"}},\"type\":\"object\",\"title\":\"RegisterBody\"},\"RevokeBody\":{\"properties\":{\"token_sha256\":{\"type\":\"string\",\"title\":\"Token Sha256\"}},\"type\":\"object\",\"required\":[\"token_sha256\"],\"title\":\"RevokeBody\"},\"SearchBody\":{\"properties\":{\"query\":{\"type\":\"string\",\"title\":\"Query\"},\"tags\":{\"anyOf\":[{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Tags\"},\"what_kind\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"What Kind\"},\"source_type\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Source Type\"},\"who_id\":{\"anyOf\":[{\"type\":\"string\"},{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Who Id\"},\"who\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Who\"},\"date_from\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Date From\"},\"date_to\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Date To\"},\"entry_mode\":{\"anyOf\":[{\"type\":\"string\"},{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Entry Mode\"},\"k\":{\"type\":\"integer\",\"title\":\"K\",\"default\":8},\"offset\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}],\"title\":\"Offset\"},\"as_kb\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"As Kb\"}},\"type\":\"object\",\"required\":[\"query\"],\"title\":\"SearchBody\"},\"ShareBody\":{\"properties\":{\"confirm\":{\"type\":\"boolean\",\"title\":\"Confirm\",\"default\":false},\"for_whom\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"For Whom\"}},\"type\":\"object\",\"title\":\"ShareBody\"},\"UnshareBody\":{\"properties\":{\"reader\":{\"type\":\"string\",\"title\":\"Reader\"},\"confirm\":{\"type\":\"boolean\",\"title\":\"Confirm\",\"default\":false}},\"type\":\"object\",\"required\":[\"reader\"],\"title\":\"UnshareBody\"},\"ValidationError\":{\"properties\":{\"loc\":{\"items\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]},\"type\":\"array\",\"title\":\"Location\"},\"msg\":{\"type\":\"string\",\"title\":\"Message\"},\"type\":{\"type\":\"string\",\"title\":\"Error Type\"},\"input\":{\"title\":\"Input\"},\"ctx\":{\"type\":\"object\",\"title\":\"Context\"}},\"type\":\"object\",\"required\":[\"loc\",\"msg\",\"type\"],\"title\":\"ValidationError\"},\"WatchBody\":{\"properties\":{\"action\":{\"type\":\"string\",\"title\":\"Action\"},\"name\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Name\"},\"watches\":{\"anyOf\":[{\"items\":{},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Watches\"},\"words\":{\"anyOf\":[{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Words\"},\"people\":{\"anyOf\":[{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"People\"},\"topic_id\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"title\":\"Topic Id\"},\"drop_watches\":{\"anyOf\":[{\"items\":{\"type\":\"string\"},\"type\":\"array\"},{\"type\":\"null\"}],\"title\":\"Drop Watches\"}},\"type\":\"object\",\"required\":[\"action\"],\"title\":\"WatchBody\"}}}}"
+ ],
+ "page_delete": [
+  200,
+  "application/json",
+  "{\"deleted\":true}"
+ ],
+ "page_delete_again": [
+  200,
+  "application/json",
+  "{\"deleted\":false}"
+ ],
+ "page_make": [
+  200,
+  "application/json",
+  "{\"id\":\"<key>\",\"path\":\"/p/<key>\",\"days\":90}"
+ ],
+ "page_make_empty": [
+  400,
+  "application/json",
+  "{\"detail\":\"a page needs at least one item\"}"
+ ],
+ "page_make_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "read_agent_other_kb": [
+  403,
+  "application/json",
+  "{\"detail\":\"this token cannot read that knowledge base\"}"
+ ],
+ "read_agent_token": [
+  200,
+  "application/json",
+  "{\"kb\":\"david\",\"notices\":[],\"items\":[{\"atom_id\":\"blog:home\",\"description\":\"blog:home card\",\"source_url\":\"https://example/blog:home\",\"who_id\":\"blog:example.com\",\"who\":\"Example Blog\",\"when_ts\":\"\",\"seen_at\":\"<time>\",\"source_type\":\"blog\",\"what_kind\":\"opinion\",\"entry_mode\":\"user-saved\"},{\"atom_id\":\"github:root/agentkit\",\"description\":\"github:root/agentkit card\",\"source_url\":\"https://example/github:root/agentkit\",\"who_id\":\"github:root\",\"who\":\"Root Dev\",\"when_ts\":\"2024-05-01\",\"seen_at\":\"<time>\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"entry_mode\":\"user-saved\"},{\"atom_id\":\"github:stranger/agents\",\"description\":\"github:stranger/agents card\",\"source_url\":\"https://example/github:stranger/agents\",\"who_id\":\"github:stranger\",\"who\":\"Stranger\",\"when_ts\":\"2024-07-09\",\"seen_at\":\"<time>\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"entry_mode\":\"oracle-footprint\"},{\"atom_id\":\"paper:2401.00001\",\"description\":\"paper:2401.00001 card\",\"source_url\":\"https://example/paper:2401.00001\",\"who_id\":\"scholar:1\",\"who\":\"A Researcher\",\"when_ts\":\"2024-01-01\",\"seen_at\":\"<time>\",\"source_type\":\"paper\",\"what_kind\":\"artifact\",\"entry_mode\":\"oracle-footprint\"},{\"atom_id\":\"substack:post1\",\"description\":\"substack:post1 card\",\"source_url\":\"https://example/substack:post1\",\"who_id\":\"substack:carol\",\"who\":\"Carol\",\"when_ts\":\"2025-03-02\",\"seen_at\":\"<time>\",\"source_type\":\"substack\",\"what_kind\":\"opinion\",\"entry_mode\":\"user-saved\"},{\"atom_id\":\"x:1\",\"description\":\"x:1 card\",\"source_url\":\"https://example/x:1\",\"who_id\":\"x:user:1\",\"who\":\"Alice\",\"when_ts\":\"2025-01-15\",\"seen_at\":\"<time>\",\"source_type\":\"x\",\"what_kind\":\"opinion\",\"entry_mode\":\"user-saved\"},{\"atom_id\":\"x:2\",\"description\":\"x:2 card\",\"source_url\":\"https://example/x:2\",\"who_id\":\"x:user:2\",\"who\":\"Bob\",\"when_ts\":\"2025-06-01\",\"seen_at\":\"<time>\",\"source_type\":\"x\",\"what_kind\":\"opinion\",\"entry_mode\":\"author_referenced\"}],\"next\":{\"since\":\"<time>\",\"since_id\":\"x:2\"},\"more\":false}"
+ ],
+ "read_no_token": [
+  401,
+  "application/json",
+  "{\"detail\":\"missing bearer token\"}"
+ ],
+ "read_not_arrived": [
+  404,
+  "application/json",
+  "{\"detail\":\"this knowledge base has not arrived on the service yet. Its owner shared it, and the copy usually lands within a minute or two of them doing so — nothing is wrong with your install. Try again shortly.\"}"
+ ],
+ "read_not_bearer": [
+  401,
+  "application/json",
+  "{\"detail\":\"missing bearer token\"}"
+ ],
+ "read_other_kb": [
+  403,
+  "application/json",
+  "{\"detail\":\"this token cannot read that knowledge base\"}"
+ ],
+ "read_owner_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this token cannot read that knowledge base\"}"
+ ],
+ "read_unknown_token": [
+  401,
+  "application/json",
+  "{\"detail\":\"unknown or revoked token\"}"
+ ],
+ "redeem": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"token\":\"<secret>\",\"suggested_name\":\"David's KB\",\"notice\":\"This service counts reads per day per reader so the owner can see usage and revoke access; it never records query text, IP addresses, or which atoms you read. Details: TELEMETRY.md in the Opyt repo.\"}"
+ ],
+ "redeem_agent": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"token\":\"<secret>\",\"suggested_name\":\"David's KB\",\"notice\":\"This service counts reads per day per reader so the owner can see usage and revoke access; it never records query text, IP addresses, or which atoms you read. Details: TELEMETRY.md in the Opyt repo.\",\"role\":\"agent\"}"
+ ],
+ "redeem_agent_spent": [
+  404,
+  "application/json",
+  "{\"detail\":\"that code is not valid, or has already been used.\"}"
+ ],
+ "redeem_spent": [
+  404,
+  "application/json",
+  "{\"detail\":\"that code is not valid, or has already been used.\"}"
+ ],
+ "register": [
+  200,
+  "application/json",
+  "{\"owner\":\"<key>\",\"token\":\"<secret>\"}"
+ ],
+ "register_no_label": [
+  200,
+  "application/json",
+  "{\"owner\":\"<key>\",\"token\":\"<secret>\"}"
+ ],
+ "revoke": [
+  200,
+  "application/json",
+  "{\"revoked\":true}"
+ ],
+ "revoke_again": [
+  200,
+  "application/json",
+  "{\"revoked\":false}"
+ ],
+ "search": [
+  200,
+  "application/json",
+  "{\"hits\":[{\"citation_id\":\"github:stranger/agents\",\"atom_id\":\"github:stranger/agents\",\"kb\":\"x\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"who_id\":\"github:stranger\",\"who_name\":\"Stranger\",\"when_ts\":\"2024-07-09\",\"when_precision\":\"day\",\"description\":\"github:stranger/agents card\",\"snippet\":\"an agent framework library\",\"snippet_span\":[0,26],\"source_url\":\"https://example/github:stranger/agents\",\"cite\":\"[Stranger · 2024-07-09](https://example/github:stranger/agents)\",\"score\":1.0,\"entry_mode\":\"oracle-footprint\",\"body_state\":\"partial\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"ai-agents\"]}},{\"citation_id\":\"github:root/agentkit\",\"atom_id\":\"github:root/agentkit\",\"kb\":\"x\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"who_id\":\"github:root\",\"who_name\":\"Root Dev\",\"when_ts\":\"2024-05-01\",\"when_precision\":\"day\",\"description\":\"github:root/agentkit card\",\"snippet\":\"an autonomous agent framework with tools for building agents\",\"snippet_span\":[0,60],\"source_url\":\"https://example/github:root/agentkit\",\"cite\":\"[Root Dev · 2024-05-01](https://example/github:root/agentkit)\",\"score\":0.5,\"entry_mode\":\"user-saved\",\"body_state\":\"complete\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"ai-agents\"]}},{\"citation_id\":\"paper:2401.00001\",\"atom_id\":\"paper:2401.00001\",\"kb\":\"x\",\"source_type\":\"paper\",\"what_kind\":\"artifact\",\"who_id\":\"scholar:1\",\"who_name\":\"A Researcher\",\"when_ts\":\"2024-01-01\",\"when_precision\":\"year\",\"description\":\"paper:2401.00001 card\",\"snippet\":\"a paper about an agent framework and its library\",\"snippet_span\":[0,48],\"source_url\":\"https://example/paper:2401.00001\",\"cite\":\"[A Researcher · 2024-01-01](https://example/paper:2401.00001)\",\"score\":0.3333,\"entry_mode\":\"oracle-footprint\",\"body_state\":\"complete\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"ai-agents\"]}}],\"notices\":[{\"code\":\"foreign_kb\",\"kb\":\"x\",\"message\":\"These results come from David's KB, not your own. Attribute anything you repeat from them to it, and pass kb='x' back to `open()` to read one — your own store does not hold these atoms.\"},{\"code\":\"results_truncated\",\"ranked\":4,\"showing\":3,\"message\":\"Showing the top 3 of 4 atoms that scored; raise k to see more.\"}],\"insights\":{\"authors\":{\"Stranger\":1,\"Root Dev\":1,\"A Researcher\":1},\"sources\":{\"github\":2,\"paper\":1},\"topics\":{\"ai-agents\":3},\"date_span\":[\"2024-01-01\",\"2024-07-09\"],\"body_state\":{\"complete\":2,\"partial\":1},\"saved_vs_crawled\":{\"oracle-footprint\":2,\"user-saved\":1},\"corpus_newest\":\"<time>\",\"filter_cost\":{}},\"trace\":{\"kb\":\"x\",\"candidates\":7,\"ranked\":4,\"showing\":\"3 of 4 ranked (7 passed filters)\",\"fts_query\":\"\\\"agent\\\" OR \\\"framework\\\"\",\"filters\":{},\"pool_saturated\":false,\"cutoff\":{\"last_returned\":0.3333,\"next_best\":0.25}},\"frontier_atoms\":{\"hits\":[],\"candidates\":0}}"
+ ],
+ "search_offset": [
+  200,
+  "application/json",
+  "{\"hits\":[{\"citation_id\":\"github:root/agentkit\",\"atom_id\":\"github:root/agentkit\",\"kb\":\"x\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"who_id\":\"github:root\",\"who_name\":\"Root Dev\",\"when_ts\":\"2024-05-01\",\"when_precision\":\"day\",\"description\":\"github:root/agentkit card\",\"snippet\":\"an autonomous agent framework with tools for building agents\",\"snippet_span\":[0,60],\"source_url\":\"https://example/github:root/agentkit\",\"cite\":\"[Root Dev · 2024-05-01](https://example/github:root/agentkit)\",\"score\":1.0,\"entry_mode\":\"user-saved\",\"body_state\":\"complete\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"ai-agents\"]}},{\"citation_id\":\"blog:home\",\"atom_id\":\"blog:home\",\"kb\":\"x\",\"source_type\":\"blog\",\"what_kind\":\"opinion\",\"who_id\":\"blog:example.com\",\"who_name\":\"Example Blog\",\"when_ts\":\"\",\"when_precision\":\"\",\"description\":\"blog:home card\",\"snippet\":\"web tools\",\"snippet_span\":[0,9],\"source_url\":\"https://example/blog:home\",\"cite\":\"[Example Blog](https://example/blog:home)\",\"score\":0.5,\"entry_mode\":\"user-saved\",\"body_state\":\"complete\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[]}}],\"notices\":[{\"code\":\"foreign_kb\",\"kb\":\"x\",\"message\":\"These results come from David's KB, not your own. Attribute anything you repeat from them to it, and pass kb='x' back to `open()` to read one — your own store does not hold these atoms.\"},{\"code\":\"results_truncated\",\"ranked\":5,\"showing\":2,\"message\":\"Showing results 1-2 of 5 that matched. Pass offset=2 for the next ones, or narrow the search.\"}],\"insights\":{\"authors\":{\"Root Dev\":1,\"Example Blog\":1},\"sources\":{\"github\":1,\"blog\":1},\"topics\":{\"ai-agents\":1},\"date_span\":[\"2024-05-01\",\"2024-05-01\"],\"body_state\":{\"complete\":2},\"saved_vs_crawled\":{\"user-saved\":2},\"corpus_newest\":\"<time>\",\"filter_cost\":{}},\"trace\":{\"kb\":\"x\",\"candidates\":7,\"ranked\":5,\"showing\":\"2 of 5 ranked (7 passed filters)\",\"fts_query\":\"\\\"agent\\\" OR \\\"framework\\\" OR \\\"autonomous\\\" OR \\\"tools\\\"\",\"filters\":{},\"pool_saturated\":false,\"cutoff\":{\"last_returned\":0.5,\"next_best\":0.3333}},\"frontier_atoms\":{\"hits\":[],\"candidates\":0},\"next_offset\":2}"
+ ],
+ "search_offset_next": [
+  200,
+  "application/json",
+  "{\"hits\":[{\"citation_id\":\"x:2\",\"atom_id\":\"x:2\",\"kb\":\"x\",\"source_type\":\"x\",\"what_kind\":\"opinion\",\"who_id\":\"x:user:2\",\"who_name\":\"Bob\",\"when_ts\":\"2025-06-01\",\"when_precision\":\"day\",\"description\":\"x:2 card\",\"snippet\":\"autonomous agents and crypto proof\",\"snippet_span\":[0,34],\"source_url\":\"https://example/x:2\",\"cite\":\"[Bob · 2025-06-01](https://example/x:2)\",\"score\":0.3333,\"entry_mode\":\"author_referenced\",\"body_state\":\"complete\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"crypto\",\"ai-agents\"]}},{\"citation_id\":\"github:stranger/agents\",\"atom_id\":\"github:stranger/agents\",\"kb\":\"x\",\"source_type\":\"github\",\"what_kind\":\"artifact\",\"who_id\":\"github:stranger\",\"who_name\":\"Stranger\",\"when_ts\":\"2024-07-09\",\"when_precision\":\"day\",\"description\":\"github:stranger/agents card\",\"snippet\":\"an agent framework library\",\"snippet_span\":[0,26],\"source_url\":\"https://example/github:stranger/agents\",\"cite\":\"[Stranger · 2024-07-09](https://example/github:stranger/agents)\",\"score\":0.25,\"entry_mode\":\"oracle-footprint\",\"body_state\":\"partial\",\"body_basis\":\"observed\",\"payload\":{\"source_tags\":[\"ai-agents\"]}}],\"notices\":[{\"code\":\"foreign_kb\",\"kb\":\"x\",\"message\":\"These results come from David's KB, not your own. Attribute anything you repeat from them to it, and pass kb='x' back to `open()` to read one — your own store does not hold these atoms.\"},{\"code\":\"results_truncated\",\"ranked\":5,\"showing\":2,\"message\":\"Showing results 3-4 of 5 that matched. Pass offset=4 for the next ones, or narrow the search.\"}],\"insights\":{\"authors\":{\"Root Dev\":1,\"Example Blog\":1,\"Bob\":1,\"Stranger\":1},\"sources\":{\"github\":2,\"blog\":1,\"x\":1},\"topics\":{\"ai-agents\":3,\"crypto\":1},\"date_span\":[\"2024-05-01\",\"2025-06-01\"],\"body_state\":{\"complete\":3,\"partial\":1},\"saved_vs_crawled\":{\"user-saved\":2,\"author_referenced\":1,\"oracle-footprint\":1},\"corpus_newest\":\"<time>\",\"filter_cost\":{}},\"trace\":{\"kb\":\"x\",\"candidates\":7,\"ranked\":5,\"showing\":\"4 of 5 ranked (7 passed filters)\",\"fts_query\":\"\\\"agent\\\" OR \\\"framework\\\" OR \\\"autonomous\\\" OR \\\"tools\\\"\",\"filters\":{},\"pool_saturated\":false,\"cutoff\":{\"last_returned\":0.25,\"next_best\":0.2}},\"frontier_atoms\":{\"hits\":[],\"candidates\":0},\"next_offset\":4}"
+ ],
+ "search_offset_outside": [
+  200,
+  "application/json",
+  "{\"error\":\"offset 250 is outside 0-249. Pass 0, or the `next_offset` of the previous page; to reach other results, narrow the search (a person, dates, a source type).\"}"
+ ],
+ "stats_json": [
+  200,
+  "application/json",
+  "{\"stored_bytes_total\":<bytes>,\"reads_total\":2,\"reads_30d\":2,\"reads_by_tool\":{\"open\":1,\"search\":1},\"active_readers_30d\":1,\"readers_total\":1,\"codes_minted\":1,\"codes_redeemed\":1,\"zero_result_rate\":1.0,\"kbs_published\":1,\"stored_bytes_by_kb\":[{\"owner\":\"david\",\"bytes\":<bytes>,\"owner_since\":\"<time>\",\"last_published_at\":\"<time>\"}],\"generated_at\":\"<time>\"}"
+ ],
+ "stats_page": [
+  200,
+  "text/html; charset=utf-8",
+  "<!doctype html>\n<meta charset=\"utf-8\">\n<title>OPYT sharing service — what it has served</title>\n<style>\n body { font: 16px/1.6 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }\n dt { font-weight: 600; margin-top: 1.2rem; }\n dd { margin: 0.1rem 0 0; color: #444; }\n .n { font-size: 1.6rem; font-variant-numeric: tabular-nums; }\n footer { margin-top: 3rem; color: #666; font-size: 0.9rem; }\n</style>\n<h1>What this service has served</h1>\n<p>Every number on this page is a total. No reader and no query appears here or in the database\nbehind it. Knowledge bases do appear, by their routing key — the address of a file, which\n<code>register</code> now assigns at random, though a key claimed before it did so may still\nread like a name; <code>/v1/stats</code> lists how much disk each one uses. See TELEMETRY.md in\nthe Opyt repository for the full schema.</p>\n<dl>\n <dt class=\"n\">1</dt><dd>knowledge bases published to this service.</dd>\n <dt class=\"n\">0 MB</dt><dd>of exports stored, across all of them.</dd>\n <dt class=\"n\">1</dt><dd>reader tokens currently held. Revoked ones leave this count\n   and stay in the read totals below.</dd>\n <dt class=\"n\">1 / 1</dt>\n   <dd>grant codes redeemed, of those minted. The gap is invitations nobody used.</dd>\n <dt class=\"n\">2</dt><dd>reads served in total.</dd>\n <dt class=\"n\">2</dt><dd>reads served in the last 30 days.</dd>\n <dt class=\"n\">1</dt><dd>readers who read something in the last 30 days.</dd>\n <dt class=\"n\">1 open, 1 search</dt><dd>reads by tool. Opens against searches is how often a result\n   was worth reading in full.</dd>\n <dt class=\"n\">100%</dt><dd>of searches returned nothing.</dd>\n</dl>\n<footer>Generated <time>.</footer>\n"
+ ],
+ "tokens": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"tokens\":[{\"token_sha256\":\"<sha256>\",\"role\":\"owner\",\"label\":\"David's KB\",\"install_id\":null,\"created_at\":\"<time>\"},{\"token_sha256\":\"<sha256>\",\"role\":\"reader\",\"label\":\"a reader\",\"install_id\":\"install-1\",\"created_at\":\"<time>\"}],\"last_upload_at\":\"<time>\",\"reads_since_last_upload\":1,\"google_linked_at\":null}"
+ ],
+ "tokens_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "tokens_with_agent": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"tokens\":[{\"token_sha256\":\"<sha256>\",\"role\":\"agent\",\"label\":\"Instinct\",\"install_id\":null,\"created_at\":\"<time>\"},{\"token_sha256\":\"<sha256>\",\"role\":\"owner\",\"label\":\"David's KB\",\"install_id\":null,\"created_at\":\"<time>\"},{\"token_sha256\":\"<sha256>\",\"role\":\"reader\",\"label\":\"a reader\",\"install_id\":\"install-1\",\"created_at\":\"<time>\"}],\"last_upload_at\":\"<time>\",\"reads_since_last_upload\":1,\"google_linked_at\":null}"
+ ],
+ "unlink_nothing_linked": [
+  200,
+  "application/json",
+  "{\"unlinked\":false}"
+ ],
+ "unlink_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "unpublish": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"readers_revoked\":1,\"export_deleted\":true,\"deleted\":true}"
+ ],
+ "unpublish_again": [
+  401,
+  "application/json",
+  "{\"detail\":\"unknown or revoked token\"}"
+ ],
+ "unpublish_agent_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "upload": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"bytes\":<bytes>,\"sha256\":\"<sha256>\",\"path\":\"<home>/exports/david.db\"}"
+ ],
+ "upload_agent_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "upload_delta": [
+  200,
+  "application/json",
+  "{\"owner\":\"david\",\"bytes\":<bytes>,\"digest\":\"<sha256>\"}"
+ ],
+ "upload_delta_no_token": [
+  401,
+  "application/json",
+  "{\"detail\":\"missing bearer token\"}"
+ ],
+ "upload_delta_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ],
+ "upload_delta_stale": [
+  409,
+  "application/json",
+  "{\"detail\":\"send the whole export: the served copy is not the one this delta was cut against\"}"
+ ],
+ "upload_other_name": [
+  403,
+  "application/json",
+  "{\"detail\":\"this token cannot upload that knowledge base\"}"
+ ],
+ "upload_reader_token": [
+  403,
+  "application/json",
+  "{\"detail\":\"this action needs an owner token\"}"
+ ]
+}

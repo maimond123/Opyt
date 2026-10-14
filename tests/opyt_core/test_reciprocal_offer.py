@@ -15,36 +15,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import mcp_server.atoms_tools as atoms_tools
-from opyt_core import kb_remote
-from pipeline.kb import peers
-from tests.conftest import reset_atoms_session
+from pipeline.retrieval import peers
+from pipeline.sharing import share_back
+from tests import mcp_session
 from tests.opyt_core.conftest import PEER
 
 
-def _tools(mcp_stub):
-    atoms_tools.register_atoms_tools(mcp_stub)
-    return mcp_stub.got
-
-
 @pytest.fixture()
-def tools(remote, emb, monkeypatch):
-    """The three atom tools, over the real served peer, with the session counters reset."""
-    monkeypatch.setattr(kb_remote, "embedder_from_meta", lambda meta, **kw: emb)
-    reset_atoms_session()
-
-    class _Fake:
-        got: dict = {}
-
-        def tool(self, *a, **kw):
-            def deco(fn):
-                self.got[fn.__name__] = fn
-                return fn
-            return deco
-
-    stub = _Fake()
-    stub.got = {}
-    return SimpleNamespace(**_tools(stub))
+def tools(remote):
+    """The atom tools through the real server, over the real served peer, in one MCP session."""
+    return SimpleNamespace(**mcp_session.session().tools())
 
 
 def _offers(out) -> list[dict]:
@@ -71,8 +51,8 @@ def test_it_survives_a_new_session(tools):
     a client — R2 says once, never repeated, and "once per session" is not once."""
     assert _offers(tools.search("agent framework", kb=PEER))
 
-    reset_atoms_session()
-    assert _offers(tools.search("agent framework", kb=PEER)) == []
+    later = mcp_session.session().tools()["search"]          # a new conversation
+    assert _offers(later("agent framework", kb=PEER)) == []
 
 
 def test_a_search_of_your_own_store_never_offers(tools):
@@ -84,7 +64,7 @@ def test_a_search_of_your_own_store_never_offers(tools):
 def test_an_empty_foreign_result_does_not_offer(tools):
     """Asking for a favour on the strength of a disappointment. The latch must also NOT trip, so
     the offer still gets made on the first read that actually works."""
-    assert _offers(tools.search("zzz-nothing-matches-this-zzz", kb=PEER, mode="bm25")) == []
+    assert _offers(tools.search("zzz-nothing-matches-this-zzz", kb=PEER)) == []
     assert _offers(tools.search("agent framework", kb=PEER))
 
 
@@ -100,21 +80,21 @@ def test_a_second_peer_gets_its_own_first_offer(tools, remote):
 
 def test_an_unwritable_marker_still_returns_results(tools, monkeypatch):
     """Fail-safe (P3): a notice is an addition to the answer and must never break it."""
-    monkeypatch.setattr(atoms_tools.Path, "touch",
+    monkeypatch.setattr(share_back.Path, "touch",
                         lambda self, *a, **kw: (_ for _ in ()).throw(OSError("read-only")))
 
     out = tools.search("agent framework", kb=PEER)
     assert out["hits"]
 
 
-def test_the_frontier_notice_and_the_offer_never_both_ride(tools, monkeypatch):
-    """Mutually exclusive by construction. Frontier's queue is the READER's own staged
-    artifacts, so riding it on a foreign result would tell them their backlog grew because they
-    looked at somebody else's knowledge base."""
-    monkeypatch.setattr("mcp_server.frontier_tools.notice", lambda: {"staged": 7})
+def test_the_latest_notice_and_the_offer_never_both_ride(tools, monkeypatch):
+    """Mutually exclusive by construction. `latest` counts the READER's own arrivals, so riding
+    it on a foreign result would tell them their library grew because they looked at somebody
+    else's knowledge base."""
+    monkeypatch.setattr("pipeline.arrivals.notice.notice", lambda conn, now: {"arrived": 7})
 
     foreign = tools.search("agent framework", kb=PEER)
-    assert _offers(foreign) and "frontier" not in foreign
+    assert _offers(foreign) and "latest" not in foreign
 
     own = tools.search("agent framework")
-    assert _offers(own) == [] and own.get("frontier")
+    assert _offers(own) == [] and own.get("latest")

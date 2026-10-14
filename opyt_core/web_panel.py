@@ -1,35 +1,21 @@
 """
 opyt_core/web_panel.py
-The one Opyt-styled page served into a browser.
+The one Opyt-styled page served into a browser, by both the local client and the service.
 
-Four surfaces finish a browser-facing flow, and until 2026-09-09 only the hosted ones looked
-like Opyt. The local loopback returned a bare `<h2>` and a `<p>` in the browser's default serif
-— and that page is the FIRST thing a new local user ever sees, because the OpenRouter approval
-is phase 1 of onboarding. Unstyled Times New Roman on white was the product's first impression.
-
-Lives in `opyt_core` because BOTH homes render it and the dependency only runs one way: the
-client wheel ships `opyt_core*` and deliberately excludes `gateway*` (see `pyproject.toml`'s
-packages-find list), while the gateway is deployed from a full checkout with
-`pip install -e ".[server]"`, so `opyt_core` is present on that box by construction. A client
-that imported `gateway` would violate the distributable invariant; a gateway that imports
-`opyt_core` is the sanctioned direction.
-
-No template engine, no CSS file, no static assets. One function returning one string, because
-the two servers that call it have no way to serve a second request for a stylesheet: the
-loopback listener is single-request by design, and adding an asset route to it is the thing
-`local_auth`'s docstring forbids.
+One self-contained string with inline CSS: the loopback listener serves a single request, so
+there is no second request for a stylesheet.
 """
 from __future__ import annotations
 
 from html import escape as html_escape
 
 
-def render(title: str, *, ok: bool, headline: str, detail: str) -> str:
+def render(title: str, *, ok: bool, headline: str, detail: str, body: str = "") -> str:
     """One Opyt panel. `title` is the browser tab; `headline` and `detail` are the card.
 
-    `ok` picks the glyph and its colour, and it means "did the flow the user just finished
-    succeed", not "is this page an error page" — a failure still renders a full panel with the
-    instruction that matters, which is how to get back to where they were.
+    `ok` means "did the flow the user just finished succeed"; it picks the glyph and its colour.
+    `body` is trusted markup placed under the detail (the key form); a page with a body asks
+    rather than reports, so it carries no glyph.
     """
     mark = "&#10003;" if ok else "!"
     tone = "var(--accent)" if ok else "var(--faint)"
@@ -57,6 +43,6 @@ def render(title: str, *, ok: bool, headline: str, detail: str) -> str:
         "<rect width=64 height=64 fill=#141414 />"
         "<path d=\"M18 16 L36 32 L18 48\" stroke=#ffffff stroke-width=7 fill=none />"
         "<rect x=40 y=41 width=11 height=7 fill=#dd3418 /></svg>Opyt</div>"
-        f"<p class=mark aria-hidden=true>{mark}</p>"
-        f"<h1>{html_escape(headline)}</h1><p>{html_escape(detail)}</p>"
+        + ("" if body else f"<p class=mark aria-hidden=true>{mark}</p>") +
+        f"<h1>{html_escape(headline)}</h1><p>{html_escape(detail)}</p>{body}"
         "</main></body></html>")

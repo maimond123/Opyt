@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from service import store
+from service import db, grants, tokens
 from tests.service.conftest import LABEL
 
 
@@ -24,8 +24,8 @@ def test_a_reader_token_cannot_reach_another_knowledge_base(svc):
     """Scope is the `owner` column, so this is one string comparison and there is nothing else
     to get wrong. A second knowledge base is registered so the 403 is about the TOKEN's scope and
     not about the name being unknown to the service."""
-    conn = store.connect()
-    other = store.mint_token("stranger", "reader")
+    conn = db.connect()
+    other = tokens.mint_token("stranger", "reader")
     conn.close()
 
     mine = svc.client.post(f"/v1/kb/{svc.owner}/search", json={"query": "agent"},
@@ -71,16 +71,16 @@ def test_a_revoked_token_fails_on_the_very_next_request(svc):
 def test_an_owner_cannot_revoke_another_owners_token(svc):
     """Scoped in the WHERE clause rather than checked beforehand: naming a stranger's token hash
     deletes nothing, and the answer teaches nothing about whether it existed."""
-    conn = store.connect()
-    victim = store.mint_token("stranger", "reader")
+    conn = db.connect()
+    victim = tokens.mint_token("stranger", "reader")
     conn.close()
 
-    r = svc.client.post("/v1/revoke", json={"token_sha256": store.token_hash(victim)},
+    r = svc.client.post("/v1/revoke", json={"token_sha256": tokens.token_hash(victim)},
                         headers=svc.owner_hdr)
     assert r.json() == {"revoked": False}
 
-    conn = store.connect()
-    assert store.resolve_token(victim) is not None
+    conn = db.connect()
+    assert tokens.resolve_token(victim) is not None
     conn.close()
 
 
@@ -109,7 +109,7 @@ def test_an_owner_who_registered_without_a_label_suggests_nothing(svc):
     """Null rather than an invented name: `share_tools.accept` falls back to the routing key,
     which is at least a string that resolves. Guessing one here would put a name in the reader's
     registry that the owner never chose."""
-    hdr = {"Authorization": f"Bearer {store.mint_token('nameless', 'owner')}"}
+    hdr = {"Authorization": f"Bearer {tokens.mint_token('nameless', 'owner')}"}
     code = svc.client.post("/v1/grant", json={}, headers=hdr).json()["code"]
     body = svc.client.post("/v1/redeem", json={"code": code, "install_id": "a"}).json()
 
@@ -127,10 +127,10 @@ def test_two_simultaneous_redeems_of_one_code_produce_exactly_one_token(svc):
     code = svc.client.post("/v1/grant", json={}, headers=svc.owner_hdr).json()["code"]
 
     def redeem(i):
-        conn = store.connect()
+        conn = db.connect()
         try:
-            return store.redeem_grant(code, f"racer-{i}")
-        except store.GrantUnavailable:
+            return grants.redeem_grant(code, f"racer-{i}")
+        except grants.GrantUnavailable:
             return None
         finally:
             conn.close()
@@ -141,11 +141,11 @@ def test_two_simultaneous_redeems_of_one_code_produce_exactly_one_token(svc):
     won = [r for r in results if r is not None]
     assert len(won) == 1
 
-    conn = store.connect()
+    conn = db.connect()
     try:
         # A prefix the fixture's own reader token does not share, so this counts the
         # tokens THIS race minted rather than every reader that ever redeemed.
-        minted = [t for t in store.list_tokens(svc.owner)
+        minted = [t for t in tokens.list_tokens(svc.owner)
                   if (t["install_id"] or "").startswith("racer-")]
         assert len(minted) == 1
     finally:
@@ -170,18 +170,18 @@ def test_the_database_holds_no_usable_credential(svc):
     raw = (svc.home / "service.db").read_bytes()
     assert svc.owner_token.encode() not in raw
     assert svc.reader_token.encode() not in raw
-    assert store.token_hash(svc.reader_token).encode() in raw
+    assert tokens.token_hash(svc.reader_token).encode() in raw
 
 
 def test_a_grant_code_is_findable_by_the_regex_that_extracts_it(svc):
-    """`share_tools._CODE` is `(?<![A-Za-z0-9])([A-Za-z0-9]{43})(?![A-Za-z0-9])` — how `accept`
+    """`invite._CODE` is `(?<![A-Za-z0-9])([A-Za-z0-9]{43})(?![A-Za-z0-9])` — how `accept`
     finds the code inside a link, a fragment or a bare paste. A `-` or `_` would fail both the
     character class and the lookarounds, so the invite would silently not work.
 
     The alphabet predates that regex: it was added because `opyt-redeem <url> <code>` put the code
     in an argparse POSITIONAL and `secrets.token_urlsafe` starts one with `-` about 1 time in 64.
-    That command was deleted 2026-09-05 and the constraint got STRICTER, not looser. Asserted
+    That command is gone and the constraint is STRICTER, not looser. Asserted
     TOTALLY rather than sampled: every character, over enough codes to be worth the second."""
     for _ in range(200):
-        code = store.mint_grant(svc.owner)
+        code = grants.mint_grant(svc.owner)
         assert code.isalnum() and len(code) >= 40, code

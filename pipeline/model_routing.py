@@ -1,20 +1,19 @@
 """
-pipeline/model_routing.py — the ONE home for model slugs + the provider-availability preflight.
+pipeline/model_routing.py — the one home for model slugs, plus the provider-availability preflight.
 
 "Is this model served by a provider I allow" is a fact about OpenRouter's live catalog crossed
 with the active deny-list, so it can't be caught statically. The invariant is enforced in three
 layers, two of them here:
 
-  1. AST guard (.guards.py `bare-model-slug`) — a model slug may only be a literal HERE, so the
-     registry below is complete by construction and preflight cannot be blind to a new override.
+  1. AST guard (.guards.py `bare-model-slug`) — a model slug may only be a literal here, so the
+     registry below is complete by construction.
   2. Preflight (this module) — before a rail spends anything, every registered model is checked
-     for surviving providers under the active deny-list (rail_runtime.models_unroutable). A dead
-     model with no live fallback blocks the rail; fragile/unknown warn in the rail log and on the
-     `oracle` screen's `model_routing` notice. Fails LOUD, before the spend.
-  3. Runtime (llm_client.ModelUnroutableError) — a "no providers" 404 is TERMINAL, not transient:
-     never retried, never counted against the shared breaker.
+     for surviving providers under the active deny-list (`models_unroutable`). A dead model with
+     no live fallback blocks the rail; fragile/unknown warn.
+  3. Runtime (llm_client.ModelUnroutableError) — a "no providers" 404 is terminal: never retried,
+     never counted against the shared breaker.
 
-Selection criterion is provider redundancy first, price second. See
+Selection criterion is provider redundancy first, price second.
 """
 from __future__ import annotations
 
@@ -25,26 +24,21 @@ import urllib.request
 
 from opyt_core.config import openrouter_deny_upstreams, settings
 from opyt_core.paths import opyt_home
+from pipeline.credentials import model_access
+from pipeline.ingestion import utils
 
-# ── the registry: EVERY code-level model override lives here ──────────────────────────────────
-# Role models (the `vision`/`content_quality`/... entries in settings.yaml) are config, not
-# literals, and are enumerated separately by `registered_models()` so preflight covers both.
+# ── the registry: every code-level model override lives here ──────────────────────────────────
+# Role models (the `vision` entry in settings.yaml) are config, not literals, and are enumerated
+# separately by `registered_models()` so preflight covers both.
 #
-# OCR_MODEL: served by four independent orgs (Parasail, Nebius, Novita, Phala) under the deny-list.
-OCR_MODEL = "google/gemma-3-27b-it"
-CHART_MODEL = "google/gemini-2.5-flash"
+# CHART_MODEL: the one image model — reads a chart or answers NOT_CHART. Served by twelve
+# independent orgs at the time of writing (DeepInfra, CoreWeave, Venice, Chutes, Crusoe, Friendli, Novita,
+# Parasail, Io Net, SambaNova, ModelRun, SiliconFlow), so no fallback is declared.
+CHART_MODEL = "google/gemma-4-31b-it"
 
-# The atom-KB embedder's code default (overridable via `embeddings:` in settings.yaml). Registered
-# here because it is the most load-bearing model in the system: an unroutable embedder blocks
-# every atom, and the subspace invariant means it can't be swapped without a full re-embed. Only
-# two orgs survive the deny-list (Nebius, SiliconFlow) — see doc for the measurement.
-EMBED_MODEL = "qwen/qwen3-embedding-8b"
-
-# Declared FALLBACKS, in order. `resolve_ocr_model` walks these and picks the first with any
-# surviving org; the substitution is always REPORTED, never inferred. `nova-lite-v1` is
-# Amazon-Bedrock-only, hence a fallback and not the primary. See doc for why other candidates (qwen3-vl-8b, gemini-2.5-flash-lite,
-# llama-4-scout) are deliberately excluded.
-OCR_FALLBACKS = (OCR_MODEL, "amazon/nova-lite-v1")
+# The roles the code calls, one per `llm_backends.roles` entry it reads. A role left in an older
+# settings.yaml after the code stopped calling it is not here, so it is never preflighted.
+ROLES = ("vision",)
 
 MIN_ORGS = 2          # below this a model is one withdrawal from dead — warn, don't fail
 _CACHE_TTL = 86400    # 24h; the cache key includes the deny-list, so editing it re-checks at once
@@ -52,32 +46,28 @@ _ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{model}/endpoints"
 
 
 def registered_models() -> dict[str, str]:
-    """Every model this install may call → why it is called. Code overrides (above) PLUS the role
-    models from the active settings.yaml, because a role model can go unroutable exactly the same
-    way and is just as load-bearing."""
-    out = {OCR_MODEL: "OCR (code override)", CHART_MODEL: "chart read (code override)",
-           EMBED_MODEL: "atom-KB embeddings"}
-    for m in OCR_FALLBACKS:
-        out.setdefault(m, "OCR fallback")
-    # `settings` is imported at module level on purpose, so a wrong name fails loudly at import
-    # time instead of being swallowed by a broad except below. See doc for the incident.
+    """Every model this install may call → why it is called: code overrides plus the role models
+    from the active settings.yaml. Only roles the code calls (`ROLES`) count, so a
+    role deleted from the code but left in an older settings.yaml is never preflighted."""
+    out = {CHART_MODEL: "chart read (code override)"}
+    # `settings` is imported at module level on purpose, so a wrong name fails at import time
+    # instead of being swallowed by the except below.
     try:
         cfg = settings() or {}
     except (OSError, ValueError):     # missing / unparseable settings.yaml — degrade, never block
         return out
     roles = ((cfg.get("llm_backends") or {}).get("roles") or {})
     for role, spec in (roles or {}).items():
+        if role not in ROLES:
+            continue
         if (spec or {}).get("provider") == "openrouter" and (spec or {}).get("model"):
             out.setdefault(str(spec["model"]), f"role:{role}")
     return out
 
 
 def _org_of(provider_name: str) -> str:
-    """A provider display name → the ORGANISATION behind it.
-
-    Counting endpoints overstates redundancy (e.g. `gemini-2.5-flash-lite` reports five endpoints
-    from one company). Heuristic: first word, lowered ('Google AI Studio'→google). Can only
-    under-count redundancy, which fails toward warning — the safe direction."""
+    """A provider display name → the organisation behind it: first word, lowered
+    ('Google AI Studio'→google). Counting orgs, not endpoints, avoids overstating redundancy."""
     return (provider_name or "").strip().split()[0].lower() if provider_name else ""
 
 
@@ -119,16 +109,13 @@ def _cache_write(key: str, orgs: list[str]) -> None:
 def surviving_orgs(model: str, deny: list[str] | None = None, *,
                    api_key: str | None = None, use_cache: bool = True,
                    fetch: bool = True) -> list[str] | None:
-    """Distinct ORGS serving `model` after the deny-list is applied.
+    """Distinct orgs serving `model` after the deny-list is applied.
 
     Returns None when availability could not be determined (no key, network error, unparseable
-    response). None is distinct from `[]`: `[]` means nothing can serve this model (block), None
-    means unknown (warn, proceed) — collapsing them would let a flaky network abort onboarding.
+    response). `[]` means nothing can serve this model (block); None means unknown (warn, proceed).
 
-    `fetch=False` answers from the cache alone (miss → None). For interactive surfaces like the
-    `oracle` screen, which must never pay a catalog round-trip inside a tool call — the rail
-    preflight is what populates the cache."""
-    import os
+    `fetch=False` answers from the cache alone (miss → None), for tool calls that must not pay a
+    catalog round-trip; the rail preflight populates the cache."""
     if deny is None:
         deny = openrouter_deny_upstreams()
     key = _cache_key(model, deny)
@@ -138,7 +125,9 @@ def surviving_orgs(model: str, deny: list[str] | None = None, *,
             return cached
     if not fetch:
         return None
-    api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        from pipeline.credentials import get_credential
+        api_key = get_credential("openrouter")
     if not api_key:
         return None
     try:
@@ -159,13 +148,10 @@ def surviving_orgs(model: str, deny: list[str] | None = None, *,
 
 def preflight(models: dict[str, str] | None = None, *, deny: list[str] | None = None,
               fetch: bool = True) -> dict:
-    """Check every registered model BEFORE a run spends anything.
+    """Check every registered model before a run spends anything.
 
     Returns {"ok": bool, "dead": [...], "fragile": [...], "unknown": [...], "checked": {...}}.
-    `dead` (zero surviving orgs) flips `ok` — that stage cannot function. `fragile` (one org) and
-    `unknown` warn but never block. One excusable dead case: an OCR-family model while
-    `resolve_ocr_model` still finds a survivor — the cascade substitutes and reports, so flipping
-    `ok` for it would block every rail on a failure the fallback chain exists to absorb.
+    `dead` (zero surviving orgs) flips `ok`; `fragile` (one org) and `unknown` never block.
     """
     if deny is None:
         deny = openrouter_deny_upstreams()
@@ -180,31 +166,34 @@ def preflight(models: dict[str, str] | None = None, *, deny: list[str] | None = 
             dead.append((model, why))
         elif len(orgs) < MIN_ORGS:
             fragile.append((model, why, orgs))
-    blocking = [d for d in dead if d[0] not in OCR_FALLBACKS]
-    if len(blocking) < len(dead) and resolve_ocr_model(deny=deny, fetch=fetch)[0] is None:
-        blocking = dead          # the whole OCR chain is dead — nothing excusable about it
-    return {"ok": not blocking, "dead": dead, "fragile": fragile,
+    return {"ok": not dead, "dead": dead, "fragile": fragile,
             "unknown": unknown, "checked": checked, "deny": list(deny)}
 
 
-def resolve_ocr_model(*, deny: list[str] | None = None,
-                      fetch: bool = True) -> tuple[str | None, str]:
-    """The OCR model to actually use, walking `OCR_FALLBACKS` in order.
+def routing_notice() -> dict | None:
+    """What the oracle screen says about model routability, or None when nothing is wrong.
 
-    Returns (model, reason). `model` is None only when every declared candidate is definitively
-    dead. An `unknown` verdict (network/no key) resolves to the primary: preflight must never be
-    the reason a run cannot start."""
-    for i, m in enumerate(OCR_FALLBACKS):
-        orgs = surviving_orgs(m, deny, fetch=fetch)
-        if orgs is None:
-            return m, f"{m} (availability unknown — proceeding with the primary)"
-        if len(orgs) >= 1:
-            if i == 0:
-                return m, f"{m} ({len(orgs)} orgs)"
-            # A substitution is always REPORTED. Never inferred, never silent.
-            return m, f"FALLBACK {m} ({len(orgs)} orgs) — primary {OCR_FALLBACKS[0]} is unroutable"
-    return None, (f"no declared OCR model is routable under deny={deny} — "
-                  f"tried {list(OCR_FALLBACKS)}")
+    Cache-only (`fetch=False`), so a tool call never pays catalog round-trips. `unknown` is
+    suppressed: here it is cache-miss noise."""
+    rep = preflight(fetch=False)
+    notice = {}
+    if rep["dead"]:
+        notice["dead"] = [f"{m} ({why}) — NO provider survives the deny-list"
+                          for m, why in rep["dead"]]
+    if rep["fragile"]:
+        notice["fragile"] = [f"{m} ({why}) — only {orgs}; one withdrawal from dead"
+                             for m, why, orgs in rep["fragile"]]
+    return notice or None
+
+
+def chart_model_unroutable(*, deny: list[str] | None = None, fetch: bool = True) -> str | None:
+    """Why `CHART_MODEL` cannot be served under the deny-list, or None when it can. An `unknown`
+    verdict (network / no key) is None too: preflight must never be the reason a run cannot start."""
+    if deny is None:
+        deny = openrouter_deny_upstreams()
+    if surviving_orgs(CHART_MODEL, deny, fetch=fetch) == []:
+        return f"{CHART_MODEL} has no provider under deny={deny}"
+    return None
 
 
 def format_report(rep: dict) -> str:
@@ -219,3 +208,26 @@ def format_report(rep: dict) -> str:
     if rep["ok"] and not rep["fragile"] and not rep["unknown"]:
         lines.append(f"  all {len(rep['checked'])} registered models OK")
     return "\n".join(lines)
+
+
+def models_unroutable(rail: str) -> str | None:
+    """The preflight at a job's spend boundary — the reason this pass must skip, or None to
+    proceed. Asked in the job's own process after its keys load (the catalog fetch needs the key).
+
+    Blocks only on `ok: False`; `fragile` and `unknown` log and proceed, and a preflight that
+    throws proceeds. A free install (no key) spends nothing, so there is nothing to check."""
+    if not model_access():
+        return None
+    try:
+        rep = preflight()
+        if rep["dead"] or rep["fragile"] or rep["unknown"]:
+            utils.log(f"[{rail}] {format_report(rep)}")
+        if not rep["ok"]:
+            dead = ", ".join(f"{m} ({why})" for m, why in rep["dead"])
+            return (f"unroutable under the active deny-list: {dead}. No provider survives and "
+                    f"no fallback is declared — every call would 404. Edit the OpenRouter "
+                    f"deny-list (or the model) and re-run; the `oracle` screen's "
+                    f"`model_routing` notice shows what survives.")
+        return None
+    except Exception:
+        return None

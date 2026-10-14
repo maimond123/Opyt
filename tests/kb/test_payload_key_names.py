@@ -14,13 +14,18 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-_KB = Path(__file__).resolve().parents[2] / "pipeline" / "kb"
-# `frontier_sources` is here because its adapters write `frontier_candidates.payload`, a
-# different table from `atoms.payload` but the same free-form blob with the same failure mode —
-# and its GitHubAdapter shipped `language` and `topics` for months precisely because this list
-# did not name it. A second writer for the same source is exactly when the names must agree.
-_ADAPTERS = ("ingest_x", "ingest_x_footprint", "ingest_substack", "ingest_curation",
-             "ingest_blog", "ingest_github", "ingest_papers", "frontier_sources")
+_PIPELINE = Path(__file__).resolve().parents[2] / "pipeline"
+_KB = _PIPELINE / "kb"
+# The three `frontier/*_candidates` adapters are here because they write
+# `frontier_candidates.payload`, a different table from `atoms.payload` but the same free-form blob
+# with the same failure mode — and the GitHubAdapter shipped `language` and `topics` for months
+# precisely because this list did not name it. A second writer for the same source is exactly when the names must agree.
+_ADAPTERS = {**{name: _KB / f"{name}.py"
+                for name in ("ingest_x", "ingest_x_footprint", "ingest_substack",
+                             "ingest_blog", "ingest_github", "ingest_papers")},
+             **{f"frontier/{name}": _PIPELINE / "frontier" / f"{name}.py"
+                for name in ("arxiv_candidates", "github_candidates", "openalex_candidates")},
+             "curation/substack_saved": _PIPELINE / "curation" / "substack_saved.py"}
 
 
 def _literal_keys(d: ast.Dict) -> set[str]:
@@ -28,16 +33,15 @@ def _literal_keys(d: ast.Dict) -> set[str]:
 
 
 def _payload_keys(path: Path) -> set[str]:
-    """Every literal key in every payload dict an adapter writes, in EITHER spelling.
+    """Every literal key in every payload dict an adapter writes, in either spelling.
 
     Two forms, because the atom writers and the frontier adapters build their payload
-    differently and a check that saw only one form would pass the other vacuously — which is
-    exactly what happened: `frontier_sources` writes `Candidate(..., payload={...})`, a keyword
-    ARGUMENT, so the dict-entry walk returned an empty set for it and any ban would have been
-    silently satisfied. A guard that cannot see its target is worse than an absent one.
+    differently and a check that saw only one form would pass the other vacuously: the frontier
+    adapters write `Candidate(..., payload={...})`, a keyword argument, so a dict-entry walk
+    returns an empty set for them and any ban would be silently satisfied. A guard that cannot see its target is worse than an absent one.
 
       `"payload": {...}`   a dict entry   — the `ingest_*` atom writers
-      `payload={...}`      a keyword arg  — `frontier_sources`' Candidate construction
+      `payload={...}`      a keyword arg  — the frontier adapters' Candidate construction
     """
     keys = set()
     tree = ast.parse(path.read_text())
@@ -55,13 +59,13 @@ def _payload_keys(path: Path) -> set[str]:
 
 
 def _all_payload_keys() -> dict[str, set[str]]:
-    return {name: _payload_keys(_KB / f"{name}.py") for name in _ADAPTERS}
+    return {name: _payload_keys(path) for name, path in _ADAPTERS.items()}
 
 
 def test_no_adapter_writes_a_bare_language_key():
     """`language` is banned because two sources mean opposite things by it.
 
-    GitHub's is a PROGRAMMING language ("C++"); Substack and blog both hand us a NATURAL language
+    GitHub's is a programming language ("C++"); Substack and blog both hand us a natural language
     ("en"), which the field model captures as `content_lang`. Under one key they share an
     expression index, and a reader holding the value cannot tell which kind it has — "C++" and "en"
     are both just strings. Split at the NAME so the ambiguity cannot be constructed.
@@ -77,11 +81,11 @@ def test_github_declares_its_language_as_code():
     assert "code_language" in _payload_keys(_KB / "ingest_github.py")
 
 
-# ── author-declared labels (§6) ─────────────────────────────────────────────────────
-# Every source has its OWN word for "labels the author put on this": GitHub says `topics`,
+# ── author-declared labels ─────────────────────────────────────────────────────
+# Every source has its own word for "labels the author put on this": GitHub says `topics`,
 # X says `hashtags`, Substack says `postTags`, blog says `tags`+`categories`. Storing each
 # under its source's word makes "what did the author call this?" a per-source special case,
-# which is the defect §6 exists to prevent. One key, every source.
+# which is the defect this prevents. One key, every source.
 _SOURCE_SPECIFIC_TAG_NAMES = {"topics", "hashtags", "postTags", "post_tags", "categories", "tags"}
 
 
@@ -111,8 +115,8 @@ def test_the_sources_that_have_declared_labels_write_them():
             "emptiness we have not observed")
 
 
-# ── the READ side: capture ⇒ visible, structurally ──────────────────────────────────
-# The write-side tests above keep the names honest. This one keeps them REACHABLE.
+# ── the read side: capture ⇒ visible, structurally ──────────────────────────────────
+# The write-side tests above keep the names honest. This one keeps them reachable.
 #
 # `payload` is returned to the host verbatim, so a field an adapter starts capturing is readable
 # the day it lands — no second edit anywhere. The way that guarantee dies is quiet: someone needs
@@ -121,10 +125,10 @@ def test_the_sources_that_have_declared_labels_write_them():
 # invisible until someone remembers to extend it, and nothing fails while that is true. Pinned in
 # the AST because there is no runtime moment where "an allowlist appeared" is observable.
 _READ_PATH = {
-    "pipeline/kb/retrieve.py": Path(__file__).resolve().parents[2] / "pipeline" / "kb" / "retrieve.py",
-    "opyt_core/kb.py": Path(__file__).resolve().parents[2] / "opyt_core" / "kb.py",
+    "pipeline/retrieval/engine.py": Path(__file__).resolve().parents[2] / "pipeline" / "retrieval" / "engine.py",
+    "pipeline/retrieval/local.py": Path(__file__).resolve().parents[2] / "pipeline" / "retrieval" / "local.py",
 }
-# The ONLY literal keys the read path may name. Both are the documented promotion: moved to the
+# The only literal keys the read path may name. Both are the documented promotion: moved to the
 # top level of a hit because they qualify the snippet rather than describe the source.
 _PROMOTED = {"body_state", "body_basis"}
 
@@ -168,12 +172,12 @@ def test_the_promotion_itself_is_still_there():
 
 
 def test_the_guard_can_actually_see_every_adapter_it_names():
-    """The anti-vacuum check, and the reason this file grew a second AST form.
+    """The anti-vacuum check, and the reason this file has a second AST form.
 
-    A ban is only a ban if the extractor reaches the code. `frontier_sources` builds its payload
-    as a keyword ARGUMENT, so the original dict-entry walk returned an empty set for it — every
-    prohibition above would have "passed" while the module wrote two banned keys. An empty key
-    set for a named adapter now fails here instead of quietly satisfying everything else.
+    A ban is only a ban if the extractor reaches the code. The frontier adapters build their payload
+    as a keyword argument, so a dict-entry walk alone returns an empty set for them — every
+    prohibition above would "pass" while the module wrote banned keys. An empty key set for a
+    named adapter fails here instead of quietly satisfying everything else.
     """
     empty = [n for n, ks in _all_payload_keys().items() if not ks]
     assert not empty, (

@@ -1,9 +1,6 @@
 """X-Article rendering: the Draft.js body X ships on the tweet, through `_render_article`.
 
-There used to be TWO shapes here — this one and twitterapi.io's `/twitter/article` response, with
-`_article_shape` normalizing between them. The provider was removed on 2026-08-30 and that second
-shape has no producer left, so the branch went with it. What remains is the distinction that still
-bites: a node WITH `content_state.blocks` versus a node without."""
+The distinction that bites: a node WITH `content_state.blocks` versus a node without."""
 from __future__ import annotations
 
 from pipeline.ingestion.x_render import _article_shape, _render_article, tweet_to_markdown

@@ -6,7 +6,7 @@ wrong because nothing downstream could tell they were five. A sample is wrong th
 moment it over-represents one corner and nothing says so.
 
   • BREADTH BEATS VOLUME. The densest part of a store is its most repetitive part — the reason
-    `densest_unread` was deleted. A sample that walks authors in rounds cannot be captured by
+    a dense sample would be a bad one. A sample that walks authors in rounds cannot be captured by
     one prolific voice; `LIMIT`/random both can.
   • THE SAMPLE DECLARES ITSELF. `sampled`/`of` and `authors`/`of_authors` ride every result,
     because "300 of 1801 from 300 authors" and "300 of 1801 from 4 authors" are the same size
@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import pytest
 
-from opyt_core.kb import kb_aggregate
-from pipeline.kb import corpus_census as cc
+from pipeline.retrieval.reads import kb_aggregate
+from pipeline.retrieval import corpus_census as cc
 from pipeline.kb import schema
 
 
@@ -43,7 +43,7 @@ def _seed(conn, rows):
 
 # ── breadth ─────────────────────────────────────────────────────────────────────
 def test_one_prolific_author_cannot_capture_the_sample(conn):
-    """⚠️ THE WHOLE REASON THIS IS A ROUND-ROBIN. 200 atoms from one voice and 1 each from ten
+    """This is the reason for the round-robin. 200 atoms from one voice and 1 each from ten
     others is a store ABOUT eleven things; a plain LIMIT or a random draw returns ~95% one
     voice and the host names that voice's preoccupation as the corpus."""
     _seed(conn, [("x:loud", f"2026-01-{1 + i % 28:02d}") for i in range(200)]
@@ -96,14 +96,14 @@ def test_the_sample_reports_what_it_is_a_sample_of(conn):
     assert (got["sampled"], got["of"]) == (10, 50)
     assert (got["authors"], got["of_authors"]) == (9, 9)
     assert "SAMPLE" in got["host_note"] and "search(query=" in got["host_note"]
-    # STRINGS, not rows: the three id fields were dropped 2026-09-16 after the first live call
+    # STRINGS, not rows: the three id fields are dropped because the first live call
     # overflowed the host's tool-result cap and its own `jq` recovery read only `.description`.
     assert all(isinstance(d, str) for d in got["descriptions"])
     assert "atoms" not in got
 
 
 def test_the_note_sends_the_host_to_verify_before_naming(conn):
-    """The one instruction that separates this from the retired Stage 6: a name is a guess
+    """The one instruction that separates this from an assertion: a name is a guess
     until the index confirms it. Without this line the host reads a spread and asserts."""
     _seed(conn, [(f"x:w{i % 9}", "2026-06-01") for i in range(50)])
 
@@ -162,7 +162,7 @@ def test_a_scoped_census_describes_the_scope_and_not_the_store(conn):
 
 def test_a_census_writes_nothing(conn):
     """The invariant this whole design exists to keep: interpretations are query-time and
-    disposable. A census that left a row behind would be Stage 6 wearing a different name."""
+    disposable. A census that left a row behind would be a stored interpretation under another name."""
     _seed(conn, [(f"x:w{i % 5}", "2026-09-01") for i in range(30)])
     before = conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0]
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

@@ -1,20 +1,18 @@
-"""Per-stage timing has to REACH the report, not merely be produced.
+"""Per-stage timing has to reach the report, not merely be produced.
 
-Every content adapter already built a `StageTimer` and emitted `stage_seconds` / `stage_latency`.
-`run_stats` then dropped all of it, because it copied keys only `if isinstance(v, int)` — so every
-dict was filtered out by construction on the way to the caller. The numbers survived one place
-only: stringified inside the `detail` field, which is how the rerun9 baseline ended up regexing a
-latency table back out of a debug string.
+Every content adapter builds a `StageTimer` and emits `stage_seconds` / `stage_latency`.
+`run_stats` must not drop them by copying keys only `if isinstance(v, int)`, which would filter
+every dict out on the way to the caller and leave the numbers only stringified inside the
+`detail` field.
 
 What these pin:
   • dict-valued diagnostics travel through `run_stats` into `results[].stats`, while the
     user-facing integer counters keep their own filter (the two sets stay separate);
-  • the router timings that exist nowhere else — `curation_pull`'s six sources and
-    `onboard_footprint`'s per-source-type clock, which is the ONLY clock `sync_github` has.
+  • the router timings that exist nowhere else — `curation_pull`'s six sources.
 """
 from __future__ import annotations
 
-from pipeline.kb import ingest_common, onboard_footprint, schema
+from pipeline.kb import ingest_common
 
 
 def test_run_stats_carries_dict_diagnostics_and_int_counters(kb_home):
@@ -34,7 +32,7 @@ def test_run_stats_carries_dict_diagnostics_and_int_counters(kb_home):
 
 
 def test_the_two_key_sets_stay_disjoint():
-    """`RUN_STAT_KEYS` is what a USER is told; `RUN_DIAG_KEYS` is what an ENGINEER reads. One key
+    """`RUN_STAT_KEYS` is what a user is told; `RUN_DIAG_KEYS` is what an engineer reads. One key
     in both would mean a counter can't be stripped from a user-facing payload without also
     stripping a diagnostic (or the reverse)."""
     assert not set(ingest_common.RUN_STAT_KEYS) & set(ingest_common.RUN_DIAG_KEYS)
@@ -45,36 +43,3 @@ def test_a_wrongly_shaped_diagnostic_is_dropped_not_forwarded(kb_home):
     than handed on to break whoever reads the report."""
     out = ingest_common.run_stats({"stage_latency": "0.4s", "added": {"n": 1}})
     assert out == {}
-
-
-def test_onboard_footprint_reports_a_per_source_clock(kb_home, monkeypatch, fake_embedder):
-    """The router-level clock: `sync_github` carries no StageTimer of its own, so without this it
-    contributes nothing to a wall-clock profile except an unexplained gap.
-
-    A website stage covers the eligibility gate AND the adapter, since `gate_and_sync_website` is
-    one call. The gate's own share stays recoverable as the stage total minus that source's
-    adapter-reported `stage_seconds`, which is why no separate `eligibility_gate` stage is owed."""
-    from pipeline.kb import eligibility, ingest_blog, ingest_github
-
-    monkeypatch.setattr(ingest_github, "sync_github",
-                        lambda conn, emb, **kw: {"added": 3, "stage_seconds": {}})
-    monkeypatch.setattr(ingest_blog, "sync_blog_footprint",
-                        lambda conn, emb, **kw: {"added": 2,
-                                                 "stage_latency": {"fetch": {"p95": 1.0}}})
-    monkeypatch.setattr(eligibility, "gate",
-                        lambda conn, url, **kw: eligibility.GateDecision("ingest", "stub"))
-
-    conn = schema.connect()
-    out = onboard_footprint.onboard_footprint(
-        conn, fake_embedder, "x:user:1",
-        [{"source_type": "blog", "url": "https://nia.dev", "metadata": {},
-          "trust": {"trusted": True}},
-         {"source_type": "github", "url": "https://github.com/nia", "metadata": {"handle": "nia"},
-          "trust": {"trusted": True}}])
-
-    assert {"blog", "github"} <= set(out["stage_seconds"])
-    assert set(out["stage_latency"]["github"]) == {"count", "mean", "p50", "p95", "max"}
-    # …and the adapters' own diagnostics survived the trip through run_stats onto the records.
-    blog_rec = next(r for r in out["results"] if r["type"] == "blog")
-    assert blog_rec["stats"]["stage_latency"] == {"fetch": {"p95": 1.0}}
-    conn.close()

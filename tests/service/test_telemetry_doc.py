@@ -2,7 +2,7 @@
 
 The direction is the whole test: schema ⊆ doc. In an open-source project a telemetry document
 that UNDERCOUNTS what the schema holds is worse than none — anyone can read the schema, find the
-column the doc omitted, and quote both. So every table and every column in `service/store.py`'s
+column the doc omitted, and quote both. So every table and every column in `service/db.py`'s
 DDL has to appear in the document, and a column added later fails this test until it is written
 down.
 
@@ -14,14 +14,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from service import store
+from service import db
 
 TELEMETRY = Path(__file__).parents[2] / "TELEMETRY.md"
 
 
 def test_every_table_in_the_ddl_is_documented():
     doc = TELEMETRY.read_text()
-    tables = re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", store._DDL)
+    tables = re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", db._DDL)
     assert tables, "the DDL parse found no tables — the regex has gone stale, not the doc"
     for table in tables:
         assert f"`{table}`" in doc, f"{table} is in service.db and not in TELEMETRY.md"
@@ -32,7 +32,7 @@ def test_every_column_in_the_ddl_is_documented():
     and a bare-substring check for it passes on any English sentence. Column names in this DDL are
     lowercase and SQL keywords are not, which is what separates `zero_results` from `PRIMARY`."""
     doc = TELEMETRY.read_text()
-    cols = {c for c in re.findall(r"^\s{2}(\w+)\s", store._DDL, re.M) if c.islower()}
+    cols = {c for c in re.findall(r"^\s{2}(\w+)\s", db._DDL, re.M) if c.islower()}
     assert cols, "the DDL parse found no columns — the regex has gone stale, not the doc"
     for col in cols:
         assert f"`{col}`" in doc, f"{col} is a column in service.db and not in TELEMETRY.md"

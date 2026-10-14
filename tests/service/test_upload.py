@@ -12,9 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from pipeline.kb import peers
-from service import store, uploads
-from tests.service.conftest import query_vector
+from pipeline.retrieval import peers
+from pipeline.sharing import delta, fingerprint
+from service import publications, uploads
 
 
 def _sha(path):
@@ -115,18 +115,16 @@ def test_a_second_upload_replaces_rather_than_merges(svc, tmp_path):
     assert r.json()["bytes"] == 8192
 
 
-def test_the_served_file_is_byte_identical_after_a_session_of_reads(svc, emb):
+def test_the_served_file_is_byte_identical_after_a_session_of_reads(svc):
     """I3, enforced by SQLite rather than by discipline: `peers.open_peer` is the only place a
     peer store is opened and it opens read-only, so this holds for every read path at once —
     including the idempotent DDL that a writable connect would have run."""
-    from tests.service.conftest import query_vector
 
     served = uploads.export_path(svc.owner)
     before = _sha(served)
 
     hits = svc.client.post(f"/v1/kb/{svc.owner}/search",
-                           json={"query": "agent framework",
-                                 "query_vector": query_vector(emb, "agent framework")},
+                           json={"query": "agent framework"},
                            headers=svc.reader_hdr).json()["hits"]
     for h in hits:
         svc.client.post(f"/v1/kb/{svc.owner}/open", json={"atom_id": h["atom_id"]},
@@ -141,12 +139,12 @@ def test_the_served_file_is_byte_identical_after_a_session_of_reads(svc, emb):
 # ── the two limits ───────────────────────────────────────────────────────────────
 #
 # They argue from different things and answer differently, which is why they are two numbers and
-# two status codes. The cap is about LATENCY — every search scans the whole vector column on one
-# shared core, so one oversized export slows every other owner's readers, and that is real at one
-# honest publisher. The floor is a fail-safe fix: a disk that filled mid-upload short-wrote, and
+# two status codes. The cap is about LATENCY and disk — every served copy and its search index live
+# on one shared box, so one oversized export crowds out every other owner's readers, and that is
+# real at one honest publisher. The floor is a fail-safe fix: a disk that filled mid-upload short-wrote, and
 # `commit` then replaced the served file with a truncated database.
 
-def test_an_export_over_the_cap_is_refused_and_the_old_one_still_answers(svc, monkeypatch, emb):
+def test_an_export_over_the_cap_is_refused_and_the_old_one_still_answers(svc, monkeypatch):
     """The previously served export must keep answering. `abort` touches only the temp file, so
     the refusal costs the owner nothing they already had."""
     monkeypatch.setattr(uploads, "MAX_EXPORT_BYTES", 1024)
@@ -154,10 +152,10 @@ def test_an_export_over_the_cap_is_refused_and_the_old_one_still_answers(svc, mo
 
     r = svc.client.post(f"/v1/upload/{svc.owner}", content=b"x" * 2048, headers=svc.owner_hdr)
     assert r.status_code == 413
-    assert "slows down every other reader" in r.json()["detail"]
+    assert "crowd out every other reader" in r.json()["detail"]
 
     assert _sha(uploads.export_path(svc.owner)) == served
-    body = {"query": "agent framework", "query_vector": query_vector(emb, "agent framework")}
+    body = {"query": "agent framework"}
     assert svc.client.post(f"/v1/kb/{svc.owner}/search", json=body,
                            headers=svc.reader_hdr).json()["hits"]
 
@@ -193,11 +191,11 @@ def test_a_full_disk_refuses_before_writing_anything(svc, monkeypatch):
 def test_a_refused_upload_does_not_move_the_accounting(svc, monkeypatch):
     """`record_upload` runs after `commit` returns, so a refusal cannot claim bytes the service
     is not holding. Otherwise the number an operator acts on would count uploads that failed."""
-    before = store.stored_bytes()
+    before = publications.stored_bytes()
     monkeypatch.setattr(uploads, "MAX_EXPORT_BYTES", 1024)
     assert svc.client.post(f"/v1/upload/{svc.owner}", content=b"x" * 4096,
                            headers=svc.owner_hdr).status_code == 413
-    assert store.stored_bytes() == before
+    assert publications.stored_bytes() == before
 
 
 def test_an_owner_cannot_upload_to_a_name_that_is_not_theirs(svc):
@@ -214,3 +212,61 @@ def test_an_owner_name_that_would_become_a_bad_filename_is_refused(name):
     store and therefore permanently unopenable as a peer."""
     with pytest.raises(uploads.BadOwner):
         uploads.valid_owner(name)
+
+
+# ── changes-only uploads ─────────────────────────────────────────────────────────
+
+def _stamped_upload(svc, tmp_path):
+    """What a current install uploads whole: the export with its digest stamped in it."""
+    whole = tmp_path / "stamped.db"
+    whole.write_bytes(svc.export.read_bytes())
+    held = fingerprint.of_copy(whole)
+    fingerprint.stamp(whole, held.digest)
+    assert svc.client.post(f"/v1/upload/{svc.owner}", content=whole.read_bytes(),
+                           headers=svc.owner_hdr).status_code == 200
+    return whole, held
+
+
+def test_a_delta_file_never_outlives_its_request(svc, tmp_path):
+    """Patched or refused, the delta lands beside the served copy only for the request."""
+    whole, held = _stamped_upload(svc, tmp_path)
+    landed = uploads.export_path(svc.owner).with_name(f"{svc.owner}.db.delta")
+    cut = tmp_path / "push.delta"
+    path = f"/v1/upload/{svc.owner}/delta"
+
+    delta.build(whole, fingerprint.diff(held, held), "0" * 64, held.digest, cut)
+    assert svc.client.post(path, content=cut.read_bytes(), headers=svc.owner_hdr).status_code \
+        == 409
+    assert not landed.exists()
+
+    delta.build(whole, fingerprint.diff(held, held), held.digest, held.digest, cut)
+    r = svc.client.post(path, content=cut.read_bytes(), headers=svc.owner_hdr)
+    assert r.status_code == 200 and r.json()["bytes"] == uploads.export_path(svc.owner).stat().st_size
+    assert not landed.exists()
+
+
+def test_a_copy_uploaded_by_an_older_install_takes_no_delta(svc, tmp_path):
+    """The fixture's upload has no stamp, as one from before changes-only uploads has none."""
+    held = fingerprint.of_copy(svc.export)
+    cut = tmp_path / "push.delta"
+    delta.build(svc.export, fingerprint.diff(held, held), held.digest, held.digest, cut)
+    before = _sha(uploads.export_path(svc.owner))
+
+    r = svc.client.post(f"/v1/upload/{svc.owner}/delta", content=cut.read_bytes(),
+                        headers=svc.owner_hdr)
+    assert r.status_code == 409 and "records no digest" in r.json()["detail"]
+    assert _sha(uploads.export_path(svc.owner)) == before
+
+
+def test_a_leftover_journal_never_meets_a_new_upload(svc):
+    """A patch killed mid-commit leaves the old file's rollback journal. Beside a new file,
+    SQLite would play the old pages into it on the next writable open, so a whole upload clears
+    it before its rename."""
+    journal = uploads.export_path(svc.owner).with_name(f"{svc.owner}.db-journal")
+    journal.write_bytes(b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7" + b"\x00" * 4096)
+
+    r = svc.client.post(f"/v1/upload/{svc.owner}", content=svc.export.read_bytes(),
+                        headers=svc.owner_hdr)
+    assert r.status_code == 200
+    assert not journal.exists()
+    assert _sha(uploads.export_path(svc.owner)) == _sha(svc.export)

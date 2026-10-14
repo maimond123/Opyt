@@ -2,7 +2,7 @@
 tests/ingestion/test_x_lists.py
 
 Offline tests for the X Lists candidate-signal scraper. No live network: the two
-GraphQL ops were captured live (2026-07-09) and the fixtures below are trimmed-but-
+GraphQL ops were captured live and the fixtures below are trimmed-but-
 faithful copies of those real responses. We pin the parts that must hold regardless of
 X's session state:
   - owned-only filter (skip the ListToFollow/suggested module AND any subscribed list
@@ -10,7 +10,7 @@ X's session state:
   - member extraction incl. the bio outbound URL (the entity-resolution attestation
     seed),
   - cross-list dedup with UNION of list names, and viewer self-exclusion,
-  - graphql_get tolerating a partial `errors` array when `data` is present.
+  - `XClient.graphql_get` tolerating a partial `errors` array when `data` is present.
 """
 
 from __future__ import annotations
@@ -20,10 +20,15 @@ import types
 
 import pytest
 
-from pipeline.ingestion import x_lists as xl
-from pipeline.ingestion import x_graphql_core as core
+import pipeline.platforms.x.records as x_records
+from pipeline.curation import x_collectors
+from pipeline.platforms.x import collections as xl
+from pipeline.platforms.x.local import LocalXTransport
+from pipeline.platforms.x.request import XClient
+from tests.ingestion.page_walk import walk
+from tests.ingestion.x_client_fake import FakeXClient
 
-VIEWER = "1861260702494957568"   # David's rest_id (owner of the "Research" list)
+VIEWER = "1861260702494957568"   # the viewer's rest_id (owner of the "Research" list)
 
 
 # ── Fixtures: trimmed real captures ──────────────────────────────────────────
@@ -48,7 +53,7 @@ def _mgmt_timeline() -> dict:
             "clientEventInfo": {"component": "suggest_owned_subscribed_list",
                                 "details": {"timelinesDetails": {"injectionType": "OwnedSubscribedList"}}},
             "items": [
-                _list("2075260793176592514", "Research", "Private", 6, VIEWER),
+                _list("1000000000000000001", "Research", "Private", 6, VIEWER),
                 _list("555000", "Someone Else's List", "Public", 10, "999888"),
             ]}},
         {"entryId": "cursor-bottom-x", "content": {
@@ -91,15 +96,14 @@ def _members_timeline() -> dict:
 # ── owned-only filter ────────────────────────────────────────────────────────
 
 def test_parse_owned_lists_keeps_only_viewer_owned():
-    lists, cursor = xl._parse_owned_lists(_mgmt_timeline(), VIEWER)
-    assert [l["id"] for l in lists] == ["2075260793176592514"]   # only Research
+    lists, _observed = xl._parse_owned_lists(_mgmt_timeline(), VIEWER)
+    assert [l["id"] for l in lists] == ["1000000000000000001"]   # only Research
     assert lists[0]["name"] == "Research"
     assert lists[0]["mode"] == "Private"                          # private is included
-    assert cursor == "CURSOR_MGMT_NEXT"
 
 
 def test_parse_owned_lists_excludes_suggested_and_subscribed():
-    lists, _ = xl._parse_owned_lists(_mgmt_timeline(), VIEWER)
+    lists, _observed = xl._parse_owned_lists(_mgmt_timeline(), VIEWER)
     names = {l["name"] for l in lists}
     assert "NYC-News-and-info" not in names        # suggested (ListToFollow) dropped
     assert "Someone Else's List" not in names       # subscribed (owner != viewer) dropped
@@ -107,14 +111,14 @@ def test_parse_owned_lists_excludes_suggested_and_subscribed():
 
 def test_parse_owned_lists_no_owned_returns_empty():
     # A viewer who owns none of these lists gets nothing (not a crash).
-    lists, _ = xl._parse_owned_lists(_mgmt_timeline(), "000nonexistent")
+    lists, _observed = xl._parse_owned_lists(_mgmt_timeline(), "000nonexistent")
     assert lists == []
 
 
 # ── member extraction ────────────────────────────────────────────────────────
 
 def test_parse_members_extracts_users_and_site():
-    members, cursor = xl._parse_members(_members_timeline())
+    members = x_records.parse_members(_members_timeline())
     by_handle = {m["handle"]: m for m in members}
     assert set(by_handle) == {"NousResearch", "karpathy", "sama"}
     # bio outbound URL is the attestation seed for entity resolution
@@ -123,11 +127,10 @@ def test_parse_members_extracts_users_and_site():
     assert by_handle["NousResearch"]["i_follow"] is True
     assert by_handle["sama"]["i_follow"] is False
     assert by_handle["sama"]["display_name"] == "Sam Altman"
-    assert cursor == "0|123"                            # bottom cursor, not the top one
 
 
 def _modern_user_result() -> dict:
-    """The shape X actually returns as of 2026-08-08 — captured live from `Following`.
+    """The shape X actually returns — captured live from `Following`.
     There is NO `legacy` blob: it was split into typed sub-objects. Trimmed to the keys
     the parser reads, with every value verbatim from the capture."""
     return {
@@ -156,7 +159,7 @@ def test_normalize_user_reads_the_modern_schema_not_legacy():
     other source, so both silently degraded to ""/0 for EVERY account — no exception, no
     log line. These two assertions are the tripwire: if X moves the fields again, this
     fails loudly instead of the pipeline quietly ingesting blanks."""
-    m = xl._normalize_user(_modern_user_result())
+    m = x_records.normalize_user(_modern_user_result())
     assert m["site"] == "https://alexzhang13.github.io/blog/2025/rlm", "bio link went blank"
     assert m["followers_count"] == 37190, "follower count went to 0"
     assert m["handle"] == "a1zhang"
@@ -169,7 +172,7 @@ def test_normalize_user_reads_the_modern_schema_not_legacy():
 def test_normalize_user_still_reads_legacy_when_present():
     """The legacy path stays as a fallback — other surfaces may still return it, and a
     partial rollback must not re-break the fields this commit just fixed."""
-    m = xl._normalize_user({
+    m = x_records.normalize_user({
         "__typename": "User", "rest_id": "1605",
         "core": {"screen_name": "sama", "name": "Sam Altman"},
         "legacy": {"description": "AI is cool i guess", "followers_count": 4242,
@@ -190,7 +193,7 @@ def test_aggregate_dedup_unions_list_names_and_excludes_self():
         "L1": [u("nous", "NousResearch"), u("kp", "karpathy"), u(VIEWER, "me")],
         "L2": [u("kp", "karpathy"), u("sama", "sama")],
     }
-    out = xl.aggregate_members(owned, members_by_list, VIEWER)
+    out = x_collectors.aggregate_members(owned, members_by_list, VIEWER)
     handles = [c["handle"] for c in out]
     assert VIEWER not in [c["user_id"] for c in out]     # self excluded
     # karpathy is in BOTH lists → ranks first (breadth), with both names unioned
@@ -228,8 +231,8 @@ def test_graphql_get_tolerates_partial_errors(monkeypatch):
     payload = {"data": {"viewer": {"ok": True}},
                "errors": [{"code": 214, "message": "decode fail on a suggested list"}]}
     _install_fake_cffi(monkeypatch, payload)
-    out = core.graphql_get("ListsManagementPageTimeline", "qid", {}, {}, {},
-                           tolerate_errors=True)
+    out = XClient(LocalXTransport({}, {})).graphql_get("ListsManagementPageTimeline", "qid", {},
+                                                       {}, tolerate_errors=True)
     assert out["data"]["viewer"]["ok"] is True          # data kept despite errors
 
 
@@ -237,7 +240,8 @@ def test_graphql_get_raises_on_errors_when_not_tolerated(monkeypatch):
     payload = {"data": None, "errors": [{"code": 32, "message": "bad auth"}]}
     _install_fake_cffi(monkeypatch, payload)
     with pytest.raises(RuntimeError):
-        core.graphql_get("Bookmarks", "qid", {}, {}, {}, tolerate_errors=False)
+        XClient(LocalXTransport({}, {})).graphql_get("Bookmarks", "qid", {}, {},
+                                                     tolerate_errors=False)
 
 
 # ── pagination termination (the bug the live run caught: X hands back a fresh, non-
@@ -251,7 +255,7 @@ def _mgmt_response(cursor_value: str, include_owned: bool) -> dict:
             "__typename": "TimelineTimelineModule",
             "clientEventInfo": {"details": {"timelinesDetails": {"injectionType": "OwnedSubscribedList"}}},
             "items": [{"item": {"itemContent": {"list": {
-                "id_str": "2075260793176592514", "name": "Research", "mode": "Private",
+                "id_str": "1000000000000000001", "name": "Research", "mode": "Private",
                 "member_count": 6, "user_results": {"result": {"rest_id": VIEWER}}}}}}]}})
     entries.append({"entryId": f"cursor-bottom-{cursor_value}", "content": {
         "__typename": "TimelineTimelineCursor", "cursorType": "Bottom", "value": cursor_value}})
@@ -272,29 +276,74 @@ def _members_response(cursor_value: str, user_ids: list[str]) -> dict:
         "timeline": {"instructions": [{"type": "TimelineAddEntries", "entries": entries}]}}}}}
 
 
-def test_fetch_owned_lists_terminates_on_advancing_cursor(monkeypatch):
+def test_owned_lists_pages_terminate_on_advancing_cursor(monkeypatch):
     calls = {"n": 0}
-    def fake_get(op, qid, variables, features, headers, **kw):
+    def fake_get(op, qid, variables, features, **kw):
         calls["n"] += 1
         # owned lists arrive only on page 1; every page returns a NEW cursor forever
         return _mgmt_response(f"cursor-{calls['n']}", include_owned=(calls["n"] == 1))
-    monkeypatch.setattr(xl.core, "resolve_query_id", lambda *a, **k: "qid")
-    monkeypatch.setattr(xl.core, "graphql_get", fake_get)
+    client = FakeXClient(fake_get)
 
-    lists = xl.fetch_owned_lists({}, {}, VIEWER)
-    assert [l["id"] for l in lists] == ["2075260793176592514"]
+    lists = walk(lambda cursor: xl.owned_lists_page(client, VIEWER, cursor))
+    assert [l["id"] for l in lists] == ["1000000000000000001"]
     assert calls["n"] <= 3          # terminates almost immediately, not ~200 → 429
 
 
-def test_fetch_list_members_terminates_and_dedups(monkeypatch):
+def test_list_members_pages_terminate_and_dedup(monkeypatch):
     calls = {"n": 0}
-    def fake_get(op, qid, variables, features, headers, **kw):
+    def fake_get(op, qid, variables, features, **kw):
         calls["n"] += 1
         # X repeats the SAME members with an ever-advancing cursor → must dedup + stop
         return _members_response(f"cursor-{calls['n']}", ["1318419526132862976", "33836629", "1605"])
-    monkeypatch.setattr(xl.core, "resolve_query_id", lambda *a, **k: "qid")
-    monkeypatch.setattr(xl.core, "graphql_get", fake_get)
+    client = FakeXClient(fake_get)
 
-    members = xl.fetch_list_members("L1", {}, {})
+    members = walk(lambda cursor: xl.list_members_page("L1", client, cursor))
     assert len(members) == 3         # deduped across pages, not 3×N
     assert calls["n"] <= 2           # page1: 3 new → page2: 0 new → stop
+
+
+# ── Query ids: no built-in List seed (B07) ───────────────────────────────────
+
+class _Sent(Exception):
+    pass
+
+
+def _qid_client(monkeypatch, discovered="fresh-id"):
+    """A real `XClient` whose discovery answers `discovered` and whose request records the query id
+    it was given, then stops the read."""
+    import pipeline.platforms.x.query_ids as query_ids
+    monkeypatch.setattr(query_ids, "qid_cache_get", lambda _op: None)
+    monkeypatch.setattr(query_ids, "qid_cache_put", lambda *_a: None)
+    client = XClient(types.SimpleNamespace(discover_query_id=lambda op, page_url: discovered))
+    sent: list[str] = []
+
+    def graphql_get(op, query_id, *a, **k):
+        sent.append(query_id)
+        raise _Sent()
+
+    monkeypatch.setattr(client, "graphql_get", graphql_get)
+    return client, sent
+
+
+@pytest.mark.parametrize("read", [lambda c: xl.owned_lists_page(c, VIEWER),
+                                  lambda c: xl.list_members_page("2075260793176592514", c)])
+def test_list_reads_use_a_discovered_query_id_not_a_built_in_seed(monkeypatch, read):
+    """B07: a fixed seed beat the cache forever, so clearing a rejected id on a 400/404 could never
+    replace it. With no override, the id comes from discovery (and so from the cache after it)."""
+    monkeypatch.delenv("X_LISTS_MGMT_QUERY_ID", raising=False)
+    monkeypatch.delenv("X_LIST_MEMBERS_QUERY_ID", raising=False)
+    client, sent = _qid_client(monkeypatch)
+    with pytest.raises(_Sent):
+        read(client)
+    assert sent == ["fresh-id"]
+
+
+@pytest.mark.parametrize("env, read", [
+    ("X_LISTS_MGMT_QUERY_ID", lambda c: xl.owned_lists_page(c, VIEWER)),
+    ("X_LIST_MEMBERS_QUERY_ID", lambda c: xl.list_members_page("2075260793176592514", c))])
+def test_an_explicit_list_query_id_override_stays_authoritative(monkeypatch, env, read):
+    monkeypatch.setenv(env, "override-id")
+    client, sent = _qid_client(monkeypatch)
+    with pytest.raises(_Sent):
+        read(client)
+    assert sent == ["override-id"]

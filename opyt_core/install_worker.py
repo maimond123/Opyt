@@ -2,20 +2,16 @@
 opyt_core/install_worker.py
 
 Installs the resident rail worker as a macOS LaunchAgent, so a local OPYT keeps ingesting
-without an MCP session open. The hosted equivalent is `gateway/deploy/opyt-worker.service`;
-both launch the same `opyt-worker` entry point against the same durable jobs database.
-Design record: `docs/plans/2026-09-06-persistent-rail-worker-migration.md`.
+without an MCP session open. It launches the `opyt-worker` entry point against the home's
+durable jobs database.
 
     opyt-install-worker
     opyt-install-worker --dry-run
     opyt-install-worker --uninstall
 
-**macOS only, deliberately.** Ruling F1 approves a LaunchAgent and the InterServer systemd
-service; a Linux user unit and a Windows scheduled task are not approved and are not written
-here, because an unverified resident service is worse than an honest absence. The worker core
-is portable and can be run by hand anywhere with `opyt-worker`.
+macOS only: local installs are macOS-only, and off macOS this command says so and does nothing.
 
-A LaunchAgent, not a LaunchDaemon: the worker runs as the user, reads that user's `$OPYT_HOME`,
+A LaunchAgent, not a LaunchDaemon: the worker runs as the user, reads that user's `~/.opyt`,
 and has nothing to do before login. It opens no socket and exposes no port — an MCP client
 reaches the tools through the stdio server, never through this process.
 """
@@ -28,7 +24,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from opyt_core.install_client import uvx_command
+from opyt_core.launcher import running_distribution
 from opyt_core.paths import opyt_home
 
 LABEL = "com.useopyt.worker"
@@ -36,87 +32,35 @@ PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 WORKER_LOG = "worker.log"
 
 
-def running_distribution() -> dict:
-    """WHICH COPY OF OPYT IS EXECUTING RIGHT NOW — `{"kind", "root", "launcher"}`.
+def agent_plist(launcher: list[str], log: Path) -> dict:
+    """The LaunchAgent definition, as the dict `plistlib` will write: `launcher` runs at login
+    and its output goes to `log`.
 
-    ⚠️ VERSION IS NOT IDENTITY, and that is the whole reason this exists. A checkout and the
-    published wheel report the SAME `version('opyt')`, so `uvx --from opyt==0.1.0a5 opyt-worker`
-    looks like the code in front of you and is not: on 2026-09-14 a worker installed from this
-    worktree launched the PyPI build against the same store, with an identical version string and
-    nothing anywhere saying the two differed. Two codebases on one database is a debugging
-    nightmare that presents as "the fix didn't work".
-
-    `source` when the running package sits in a tree with its own `pyproject.toml` — an editable
-    install, i.e. a checkout. `published` otherwise. The launcher follows: a checkout launches its
-    OWN console script, a published install goes through `uvx_command`.
-
-    The Distributable invariant is intact and this is not the case it bans. What 2026-08-29 removed
-    was a PUBLISHED install welding its config to a folder that could move; a source install is
-    already a folder, and pointing its worker anywhere else is what produces the mismatch above.
+    `KeepAlive` is unconditional, with a minute between attempts: a crash is indistinguishable
+    from outside, and the other repeatable exit (`WorkerAlreadyRunning`, a hand-run worker) should
+    be retried so the agent takes over when it stops.
     """
-    import opyt_core
-
-    root = Path(opyt_core.__file__).resolve().parent.parent
-    if (root / "pyproject.toml").exists():
-        script = Path(sys.executable).with_name("opyt-worker")
-        if script.exists():
-            return {"kind": "source", "root": str(root), "launcher": [str(script)]}
-        # An editable install whose console script is missing (a bare `pip install -e` gone
-        # sideways). Run the module through the SAME interpreter rather than silently reaching
-        # for a published build that is not this code.
-        return {"kind": "source", "root": str(root),
-                "launcher": [sys.executable, "-m", "pipeline.kb.rail_worker"]}
-    return {"kind": "published", "root": str(root), "launcher": uvx_command("opyt-worker")}
-
-
-def agent_plist() -> dict:
-    """The LaunchAgent definition, as the dict `plistlib` will write.
-
-    `KeepAlive` is unconditional, with a minute between attempts. Unconditional because the
-    case worth restarting — the worker or a rail child dying mid-pass — is indistinguishable
-    from the outside; a minute because the other repeatable exit is `WorkerAlreadyRunning`,
-    when someone is running `opyt-worker` by hand. That retry is not wasted: the agent takes
-    over the moment the hand-run worker stops. Its one line per minute goes to the worker log,
-    which is where a user looking for "why is nothing ingesting" already is.
-    """
-    dist = running_distribution()
     plist: dict = {
         "Label": LABEL,
-        # The SAME copy of opyt that is installing it — see `running_distribution`.
-        "ProgramArguments": dist["launcher"],
+        "ProgramArguments": launcher,
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 60,
-        "StandardOutPath": str(opyt_home() / WORKER_LOG),
-        "StandardErrorPath": str(opyt_home() / WORKER_LOG),
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
     }
-    # launchd starts an agent with almost no environment, so a data home chosen by this shell
-    # would otherwise be lost and the agent would schedule work for `~/.opyt` instead. Pinned
-    # only when it was chosen explicitly; the default stays derived at runtime.
-    if os.environ.get("OPYT_HOME"):
-        plist["EnvironmentVariables"] = {"OPYT_HOME": str(opyt_home())}
+    # No `EnvironmentVariables`, deliberately: a local install's data home is `~/.opyt`. Passing
+    # `$OPYT_HOME` here would split the worker and the MCP server onto two different stores.
     return plist
 
 
-def status() -> dict:
-    """Is the resident worker actually there? `{"supported", "installed", "loaded", "ran"}`.
+def agent_state() -> dict:
+    """The LaunchAgent as launchd sees it: `{"supported", "installed", "loaded", "disabled"}`,
+    plus what it would launch (`running_from`) and, when installed, what it does launch
+    (`agent_launches`). `pipeline.worker.liveness.status` adds whether anything is claiming the
+    work; that is the question every promise of background work asks.
 
-    ⚠️ ASK THIS BEFORE TELLING A USER THAT WORK CONTINUES ON ITS OWN. The worker is the ONLY
-    thing that launches rails (`rail_worker.RAILS`), so every "we'll finish this in the
-    background" sentence is a claim about this function. Those sentences were unconditional until
-    2026-09-13 and false on any from-source install: probing David's machine that day found no
-    LaunchAgent, no `launchctl` entry, no rail log, and two jobs sitting in `rail_jobs.db` with
-    `started_at` NULL since 13:50 — while `oracle`'s ingest result told him a rate-limited Oracle
-    "will continue automatically". A promise nothing keeps costs more than the missing feature,
-    because the user stops waiting for something that never starts.
-
-    `ran` is the separate, platform-independent evidence: a rail that has actually finished means
-    SOMETHING drains the queue — including a worker run by hand (`opyt-worker`), which is the
-    documented way to have one off macOS and which no plist check can see.
-
-    Fail-safe in both directions it can fail: an unreadable plist, launchctl, or jobs database
-    reports False rather than raising, so a probe that cannot answer under-promises instead of
-    breaking the tool call it was asked from.
+    Fail-safe: an unreadable plist or launchctl reports False rather than raising.
     """
     supported = sys.platform == "darwin"
     try:
@@ -129,10 +73,11 @@ def status() -> dict:
             loaded = _launchctl("print", f"{_domain()}/{LABEL}").returncode == 0
         except Exception:
             loaded = False
-    # WHAT IT WOULD LAUNCH, and what an installed one DOES launch. A worker running different
-    # code from the server that installed it is invisible without this, and it presents as a fix
-    # that did not take.
-    out = {"supported": supported, "installed": installed, "loaded": loaded, "ran": _any_rail_ran()}
+    # What it would launch and what an installed one does launch: a worker running different code
+    # from the server that installed it is otherwise invisible.
+    out = {"supported": supported, "installed": installed, "loaded": loaded,
+           # Read-only; `repair()` is the verb that acts on it.
+           "disabled": _disabled() if (supported and installed) else None}
     try:
         out["running_from"] = running_distribution()["kind"]
     except Exception:
@@ -145,18 +90,48 @@ def status() -> dict:
     return out
 
 
-def _any_rail_ran() -> bool:
-    """Has any rail job ever been claimed? Evidence that something drains the queue.
+def _disabled() -> bool | None:
+    """Is the label in launchd's persistent disable list? `None` when it cannot be read.
 
-    Deliberately "ever", not "recently": this separates a store that has never had a worker from
-    one whose worker is merely idle, and only the first needs saying out loud. A recency window
-    would need a threshold nothing can defend, and would nag a user whose rails are simply not due.
+    Separate from `loaded` because it is the one not-loaded reason that never clears on its own:
+    the flag survives reinstalls and reboots, and every later `bootstrap` fails with errno 5.
+    One click in Login Items sets it.
+
+    `print-disabled` lists the label when enabled too, so match the `=> disabled` tail.
     """
     try:
-        from pipeline.kb.rail_jobs import RailJobStore
-        return any(j.started_at is not None for j in RailJobStore().list_jobs())
+        res = _launchctl("print-disabled", _domain())
+        if res.returncode != 0:
+            return None
+        for line in res.stdout.splitlines():
+            if LABEL in line:
+                return line.strip().endswith("=> disabled")
+        return False          # absent from the list = never disabled
     except Exception:
-        return False
+        return None
+
+
+def repair(*, dry_run: bool = False) -> dict:
+    """Clear a sticky launchd disable and load the agent. No-op unless that is the exact fault.
+
+    Fires only when the agent is installed, not loaded, and measurably disabled, so it can never
+    resurrect an agent a user removed (`--uninstall` deletes the plist). Re-enables silently.
+    Called from `bootstrap.ensure_initialized` and `liveness.repair_or_report`.
+    """
+    if sys.platform != "darwin":
+        return {"status": "UNSUPPORTED"}
+    if not needs_repair(agent_state()):
+        return {"status": "NO_ACTION"}
+    if dry_run:
+        return {"status": "DRY_RUN_REPAIR", "would_run": f"enable {_domain()}/{LABEL}"}
+    loaded, detail = _load_agent()
+    return {"status": "REPAIRED" if loaded else "ERROR_LOAD", "detail": detail or None}
+
+
+def needs_repair(state: dict) -> bool:
+    """Is this the one fault `repair` fixes: installed, not loaded, and measurably disabled?
+    An unreadable disable list (`None`) is not a yes."""
+    return state["installed"] and not state["loaded"] and state.get("disabled") is True
 
 
 def _domain() -> str:
@@ -167,26 +142,45 @@ def _launchctl(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["launchctl", *args], capture_output=True, text=True)
 
 
+def _load_agent() -> tuple[bool, str]:
+    """Enable the label, then bootstrap the plist. Returns (loaded, launchd's message).
+
+    Enable first, unconditionally: a disabled label refuses to bootstrap, and `bootout` does not
+    clear a disable. Note `enable` takes a target (domain/label); `bootstrap` takes a domain plus
+    a path.
+    """
+    _launchctl("enable", f"{_domain()}/{LABEL}")
+    res = _launchctl("bootstrap", _domain(), str(PLIST_PATH))
+    return res.returncode == 0, (res.stderr or res.stdout).strip()
+
+
 def install(*, dry_run: bool = False) -> dict:
     """Write the agent and load it. Idempotent: an existing agent is replaced, not duplicated."""
-    plist = agent_plist()
+    # The same copy of opyt that is installing it. Raises FileNotFoundError, before anything is
+    # written, when a published install has no uvx.
+    log = opyt_home() / WORKER_LOG
+    plist = agent_plist(running_distribution()["launcher"], log)
     if dry_run:
         return {"status": "DRY_RUN", "path": str(PLIST_PATH), "would_write": plist}
 
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    opyt_home().mkdir(parents=True, exist_ok=True)      # launchd will not create the log's dir
+    log.parent.mkdir(parents=True, exist_ok=True)       # launchd will not create the log's dir
     existed = PLIST_PATH.exists()
     PLIST_PATH.write_bytes(plistlib.dumps(plist))
 
     # Bootout first, unconditionally: bootstrapping over a loaded label fails, and a label that
     # is not loaded is not an error worth reporting.
     _launchctl("bootout", f"{_domain()}/{LABEL}")
-    loaded = _launchctl("bootstrap", _domain(), str(PLIST_PATH))
-    if loaded.returncode != 0:
-        return {"status": "ERROR_LOAD", "path": str(PLIST_PATH),
-                "detail": (loaded.stderr or loaded.stdout).strip()}
+    loaded, detail = _load_agent()
+    if not loaded:
+        out = {"status": "ERROR_LOAD", "path": str(PLIST_PATH), "detail": detail}
+        # `cause` lets a host say something actionable instead of relaying errno 5.
+        if _disabled():
+            out["cause"] = "launchd_disabled"
+            out["remedy"] = f"launchctl enable {_domain()}/{LABEL}"
+        return out
     return {"status": "UPDATED" if existed else "INSTALLED", "path": str(PLIST_PATH),
-            "log": str(opyt_home() / WORKER_LOG)}
+            "log": str(log)}
 
 
 def uninstall(*, dry_run: bool = False) -> dict:
@@ -209,9 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if sys.platform != "darwin":
-        print("This installs a macOS LaunchAgent. On Linux, run `opyt-worker` from a systemd "
-              "user unit you manage; no unit is shipped, because none is verified yet.",
-              file=sys.stderr)
+        print("opyt-install-worker runs on macOS only.", file=sys.stderr)
         return 1
 
     try:

@@ -20,7 +20,11 @@ from datetime import datetime, timezone
 import pytest
 import requests
 
-from pipeline.ingestion.sources import substack as sub
+from pipeline.ingestion.utils import SyncAuthError
+from pipeline.platforms import connections
+from pipeline.platforms.substack import contracts as substack_contracts
+from pipeline.platforms.substack import local as substack_local
+from pipeline.platforms.substack import publication as substack_publication
 
 SINCE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -68,7 +72,7 @@ def _post(pid, date):
 
 def test_a_page_wholly_older_than_since_yields_no_posts(archive):
     session = archive([[_post(1, "2025-01-01T00:00:00Z")]])
-    assert sub._fetch_all_posts("https://carol.substack.com", since=SINCE) == []
+    assert substack_publication.fetch_all_posts("https://carol.substack.com", since=SINCE) == []
     assert len(session.gets) == 1          # the boundary page still STOPS the walk
 
 
@@ -76,7 +80,7 @@ def test_the_boundary_page_keeps_only_the_posts_at_or_after_since(archive):
     archive([[_post(3, "2026-03-01T00:00:00Z"),
               _post(2, "2026-02-01T00:00:00Z"),
               _post(1, "2025-12-31T00:00:00Z")]])
-    got = sub._fetch_all_posts("https://carol.substack.com", since=SINCE)
+    got = substack_publication.fetch_all_posts("https://carol.substack.com", since=SINCE)
     assert [p["id"] for p in got] == [3, 2]
 
 
@@ -84,33 +88,33 @@ def test_a_record_with_no_usable_date_survives_the_filter(archive):
     """Fail-safe, matching the existing stop rule: an unparseable date is not evidence the post is
     old, so dropping it would silently lose real posts."""
     archive([[_post(2, ""), _post(1, "not-a-date"), _post(0, "2025-01-01T00:00:00Z")]])
-    got = sub._fetch_all_posts("https://carol.substack.com", since=SINCE)
+    got = substack_publication.fetch_all_posts("https://carol.substack.com", since=SINCE)
     assert [p["id"] for p in got] == [2, 1]
 
 
 def test_without_since_every_page_is_returned_verbatim(archive):
     archive([[_post(2, "2026-02-01T00:00:00Z")], [_post(1, "2020-01-01T00:00:00Z")], []])
-    got = sub._fetch_all_posts("https://carol.substack.com")
+    got = substack_publication.fetch_all_posts("https://carol.substack.com")
     assert [p["id"] for p in got] == [2, 1]
 
 
 def test_a_json_object_instead_of_a_list_becomes_a_listing_error(archive):
-    session = archive([{"error": "rate limited"}] * sub._ARCHIVE_RETRIES)
-    with pytest.raises(sub.SubstackListingError):
-        sub._fetch_all_posts("https://carol.substack.com", since=SINCE)
-    assert len(session.gets) == sub._ARCHIVE_RETRIES   # retried as a transient listing failure
+    session = archive([{"error": "rate limited"}] * substack_publication._ARCHIVE_RETRIES)
+    with pytest.raises(substack_contracts.SubstackListingError):
+        substack_publication.fetch_all_posts("https://carol.substack.com", since=SINCE)
+    assert len(session.gets) == substack_publication._ARCHIVE_RETRIES   # retried as a transient listing failure
 
 
 def test_a_list_of_non_posts_becomes_a_listing_error(archive):
-    archive([["not-a-post"]] * sub._ARCHIVE_RETRIES)
-    with pytest.raises(sub.SubstackListingError):
-        sub._fetch_all_posts("https://carol.substack.com")
+    archive([["not-a-post"]] * substack_publication._ARCHIVE_RETRIES)
+    with pytest.raises(substack_contracts.SubstackListingError):
+        substack_publication.fetch_all_posts("https://carol.substack.com")
 
 
 def test_a_shape_error_that_clears_on_retry_is_not_fatal(archive):
     """The shape check joins the EXISTING retry loop rather than short-circuiting it."""
     archive([{"error": "rate limited"}, [_post(1, "2026-02-01T00:00:00Z")], []])
-    got = sub._fetch_all_posts("https://carol.substack.com")
+    got = substack_publication.fetch_all_posts("https://carol.substack.com")
     assert [p["id"] for p in got] == [1]
 
 
@@ -134,34 +138,34 @@ def _ready(monkeypatch, *, cookies=None, uid_side_effects):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(sub, "read_substack_cookies", lambda: cookies or {"substack.sid": "x"})
-    monkeypatch.setattr(sub, "own_user_id", _uid)
-    monkeypatch.setattr(sub.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(substack_local, "read_substack_cookies", lambda: cookies or {"substack.sid": "x"})
+    monkeypatch.setattr(substack_local, "own_user_id", _uid)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
     return calls
 
 
 def test_a_live_session_is_ready_on_the_first_try(monkeypatch):
     calls = _ready(monkeypatch, uid_side_effects=[12345])
-    assert sub.managed_substack_session_ready() is True
+    assert connections.managed_substack_session_ready() is True
     assert calls["n"] == 1                                  # no wasted retry once it answers
 
 
 def test_a_cleanly_signed_out_session_is_not_ready(monkeypatch):
     calls = _ready(monkeypatch, uid_side_effects=[None])
-    assert sub.managed_substack_session_ready(attempts=3) is False
+    assert connections.managed_substack_session_ready(attempts=3) is False
     assert calls["n"] == 3                                  # spent every attempt before concluding
 
 
 def test_a_presence_race_that_clears_on_retry_is_ready(monkeypatch):
     """The flush / write-lock race: the managed profile is momentarily unreadable, then settles.
     The retry is the whole point — one `SyncAuthError` must not become "you are not signed in"."""
-    calls = _ready(monkeypatch, uid_side_effects=[sub.SyncAuthError("no session yet"), 999])
-    assert sub.managed_substack_session_ready() is True
+    calls = _ready(monkeypatch, uid_side_effects=[SyncAuthError("no session yet"), 999])
+    assert connections.managed_substack_session_ready() is True
     assert calls["n"] == 2
 
 
 def test_a_transient_refusal_is_not_blamed_on_the_user(monkeypatch):
     """A Cloudflare/transport refusal is not a signed-out session. Reporting it as "not ready"
-    would tell a signed-in user to sign in again — the 2026-09-08 `own_user_id` trap."""
-    _ready(monkeypatch, uid_side_effects=[sub.SubstackListingError("HTTP 403")])
-    assert sub.managed_substack_session_ready() is True
+    would tell a signed-in user to sign in again — the `own_user_id` trap."""
+    _ready(monkeypatch, uid_side_effects=[substack_contracts.SubstackListingError("HTTP 403")])
+    assert connections.managed_substack_session_ready() is True

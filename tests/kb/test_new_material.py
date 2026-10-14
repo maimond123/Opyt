@@ -1,10 +1,10 @@
-"""The notice that ends the silence measured on 2026-09-15 — 1,004 atoms in the store and
-"anything else you want to add?" as the last thing OPYT said."""
+"""The notice that ends the silence after material lands, instead of OPYT's last word being
+"anything else you want to add?" over a store full of atoms."""
 import sqlite3
 
 import pytest
 
-from pipeline.kb import new_material
+from pipeline.retrieval import new_material
 
 
 @pytest.fixture
@@ -31,8 +31,8 @@ def test_an_empty_store_says_nothing(store):
 
 
 def test_the_first_call_after_material_lands_leads_with_it(store):
-    """THE MEASURED FAILURE, inverted. 1,001 of the 1,004 atoms were bookmarks, which never pass
-    through an ingest presentation — so the tour that existed could not have described them."""
+    """Bookmarks never pass through an ingest presentation (1,001 of a measured 1,004 atoms were
+    bookmarks), so only this notice can describe them."""
     _add(store, "x", "user-saved", 1001)
 
     notice = new_material.new_material_notice(store)
@@ -98,3 +98,37 @@ def test_an_unreadable_stamp_repeats_rather_than_swallows(store, tmp_path):
     (tmp_path / "material_announced.json").write_text("{not json")
 
     assert new_material.new_material_notice(store) is not None
+
+
+def test_an_import_still_running_says_so_with_its_numbers(store):
+    """Without the import numbers the notice fired on the first 53 of 1,050 bookmarks, and the
+    host told the user that was their library."""
+    _add(store, "x", "user-saved", 53)
+
+    notice = new_material.new_material_notice(store, importing={"x": (53, 1050)})
+
+    assert notice["in_your_library"] == [{
+        "material": "the X posts you saved yourself", "items": 53,
+        "still_importing": {"saved": 53, "offered_so_far": 1050}}]
+    assert "STILL IMPORTING" in notice["host_note"]
+
+
+def test_a_running_import_speaks_once_more_when_it_has_landed(store):
+    _add(store, "x", "user-saved", 53)
+    assert new_material.new_material_notice(store, importing={"x": (53, 1050)}) is not None
+    _add(store, "x", "user-saved", 400, start=53)
+    assert new_material.new_material_notice(store, importing={"x": (453, 1050)}) is None
+
+    _add(store, "x", "user-saved", 597, start=453)
+    final = new_material.new_material_notice(store, importing={})
+
+    assert final["in_your_library"] == [{"material": "the X posts you saved yourself",
+                                         "items": 1050}]
+    assert "STILL IMPORTING" not in final["host_note"]
+    assert new_material.new_material_notice(store, importing={}) is None
+
+
+def test_an_import_already_landed_speaks_once(store):
+    _add(store, "x", "user-saved", 12)
+    assert new_material.new_material_notice(store, importing={}) is not None
+    assert new_material.new_material_notice(store, importing={}) is None

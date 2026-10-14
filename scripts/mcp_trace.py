@@ -3,15 +3,8 @@
 scripts/mcp_trace.py
 A stdio pass-through that records the JSON-RPC traffic between an MCP client and an MCP server.
 
-WHY THIS EXISTS. Claude Desktop's own MCP log records that a `tools/call` happened and nothing
-about it: every entry reads `params { metadata: undefined }`. So a live onboarding test could be
-read only from screenshots, which is slow and loses the arguments — and the arguments are the
-thing under test. Which tool the host picked, and what it passed, is how you tell a bad tool
-description from a bad model turn.
-
-It sits in the client's config in place of the server, spawns the real server, and copies bytes
-both ways unchanged. Zero product code knows it is there — the alternative was a logging hook
-inside the server, which is production code that exists only to be observed.
+Claude Desktop's MCP log omits tool-call arguments; this records them. It sits in the client's
+config in place of the server, spawns the real server, and copies bytes both ways unchanged.
 
     "opyt-dev": {
       "command": "/path/to/venv/bin/python",
@@ -21,9 +14,8 @@ inside the server, which is production code that exists only to be observed.
       "env": {...unchanged...}
     }
 
-STDOUT IS THE PROTOCOL. Nothing but the server's own bytes may reach it — a stray print corrupts
-the stream and the client reports a disconnect with no cause. Every trace line goes to `--out`,
-and this file's own failures go to stderr, which the client already captures.
+Stdout is the protocol: nothing but the server's bytes may reach it. Trace lines go to `--out`,
+this file's own failures to stderr.
 
 Read a trace with:  python scripts/mcp_trace.py --read /tmp/opyt-trace.jsonl
 """
@@ -41,10 +33,8 @@ from pathlib import Path
 def _pump(src, dst, out_path: Path, direction: str, lock: threading.Lock) -> None:
     """Copy `src` to `dst` line by line, appending a trace record per line.
 
-    Line-oriented because MCP stdio frames are newline-delimited JSON. The copy is of the RAW
-    bytes: the trace is a side effect, and a parse failure must never alter what the other side
-    receives. That is why the write and flush happen before any decoding, and why a malformed
-    line is recorded as raw text rather than dropped.
+    MCP stdio frames are newline-delimited JSON. Raw bytes are forwarded before any decoding,
+    so a parse failure never alters what the other side receives.
     """
     for raw in iter(src.readline, b""):
         dst.write(raw)
@@ -67,8 +57,7 @@ def trace(out: Path, argv: list[str]) -> int:
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     lock = threading.Lock()
     threads = [
-        # `c2s` is what the host sent — the tool name and its arguments, the thing screenshots
-        # cannot show. `s2c` is what the server answered.
+        # `c2s`: what the host sent. `s2c`: what the server answered.
         threading.Thread(target=_pump, args=(sys.stdin.buffer, proc.stdin, out, "c2s", lock)),
         threading.Thread(target=_pump, args=(proc.stdout, sys.stdout.buffer, out, "s2c", lock)),
     ]
@@ -88,8 +77,7 @@ def _brief(value, width: int = 400) -> str:
 def read(path: Path, width: int) -> None:
     """Print the calls and their results. Requests are matched to responses by JSON-RPC id.
 
-    Only `tools/call` and its result are printed. The handshake and the list methods are noise
-    once the server is up, and printing them buries the one line a reader came for.
+    Only `tools/call` and its result are printed.
     """
     pending: dict = {}
     for line in path.read_text().splitlines():
