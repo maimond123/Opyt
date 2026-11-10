@@ -139,14 +139,15 @@ def page(items: list[dict], *, title: str, note: str | None, answer: str | None,
 
 def _answer(md: str, items: list[dict]) -> str:
     """The host's answer as a card above the sources. A link to a source on the page goes to its
-    card below, so each citation opens the source whole, here."""
+    card below, so each citation opens the source whole, here. It is item 0 to the comments, so
+    its text can be commented on like a source's."""
     on_page = {prose.url_key(i["source_url"]): f"#s{n}" for n, i in enumerate(items, 1)
                if i.get("source_url")}
     body, _ = prose.to_html(md, anchors=on_page)
     return f"""
-  <section class="answer" aria-label="Answer">
+  <section class="answer" id="s0" aria-label="Answer">
     <div class="head">{_ANSWER_GLYPH}<span>Answer</span></div>
-    {body}
+    <div class="body">{body}</div>
   </section>"""
 
 

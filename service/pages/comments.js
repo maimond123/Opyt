@@ -1,11 +1,11 @@
 // service/pages/comments.js — comments on a page of sources, for anyone holding its link.
 //
 // The service keeps the comments and answers JSON (`service/pages/comments.py`). Everything a
-// reader sees is drawn here. A comment is on a passage of one source, on a whole source, or a
-// reply to either. A passage is recorded as its text with the text around it, and found again in
-// the source's text as this browser holds it, so a highlight never depends on how the page was
-// drawn. On a wide screen a passage's comments sit in the right margin, level with it; on a
-// narrow one they open from the bottom.
+// reader sees is drawn here. A comment is on a passage of one source or of the answer (item 0),
+// on a whole source, or a reply to either. A passage is recorded as its text with the text around
+// it, and found again in the source's text as this browser holds it, so a highlight never depends
+// on how the page was drawn. On a wide screen a passage's comments sit in the right margin, level
+// with it; on a narrow one they open from the bottom.
 //
 // Nobody signs in. The name a reader types is kept in this browser (`opyt-name`), and so is the
 // key that lets them delete a comment they posted (`opyt-comment-keys`). If the comments cannot
@@ -138,12 +138,13 @@
     i = i < 0 ? text.indexOf(th.quote) : i + before.length;
     return i < 0 ? null : [i, i + th.quote.length];
   }
-  // The selection as something to comment on, or null: it has to be text inside one source.
+  // The selection as something to comment on, or null: it has to be text inside one source, or
+  // inside the answer (item 0).
   function selected() {
     var sel = window.getSelection();
     if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
     var range = sel.getRangeAt(0), top = range.commonAncestorContainer;
-    var b = (top.nodeType === 1 ? top : top.parentNode).closest(".item .body");
+    var b = (top.nodeType === 1 ? top : top.parentNode).closest(".item .body, .answer .body");
     if (!b) return null;
     var lead = document.createRange();
     lead.selectNodeContents(b);
@@ -153,7 +154,7 @@
     while (end > start && /\s/.test(text.charAt(end - 1))) end--;
     if (start === end || end - start > limits.quote) return null;
     return {
-      item: +b.closest(".item").id.slice(1), start: start, end: end, quote: text.slice(start, end),
+      item: +b.closest(".item, .answer").id.slice(1), start: start, end: end, quote: text.slice(start, end),
       prefix: text.slice(Math.max(0, start - CONTEXT), start), suffix: text.slice(end, end + CONTEXT), marks: []
     };
   }

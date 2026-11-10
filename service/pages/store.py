@@ -43,7 +43,7 @@ class Page(NamedTuple):
 class Comment(NamedTuple):
     id: str
     thread: str           # the id of the comment that started its thread: its own, for that one
-    item: int | None      # which source it is on, counted from 1; None on a reply
+    item: int | None      # which source it is on, counted from 1 (0 is the answer); None on a reply
     quote: str | None     # the passage; None for a whole source, and on a reply
     prefix: str | None    # the source's text just before the passage, and just after it: how
     suffix: str | None    # the page finds the passage again

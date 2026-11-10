@@ -101,7 +101,7 @@ def _there(n: int) -> list[store.Comment]:
     ({"name": "M" * (comments.MAX_NAME + 1), "body": "Hm.", "item": 1}, [], "name"),
     ({"name": "Maya", "body": "y" * (comments.MAX_BODY + 1), "item": 1}, [], "2,000"),
     ({"name": "Maya", "body": "Hm."}, [], "sources"),
-    ({"name": "Maya", "body": "Hm.", "item": 0}, [], "sources"),
+    ({"name": "Maya", "body": "Hm.", "item": 0}, [], "sources"),   # no answer on this page
     ({"name": "Maya", "body": "Hm.", "item": 3}, [], "sources"),
     ({"name": "Maya", "body": "Hm.", "item": 1, "quote": "q" * (comments.MAX_QUOTE + 1)}, [],
      "Select"),
@@ -109,7 +109,25 @@ def _there(n: int) -> list[store.Comment]:
 ])
 def test_a_comment_that_cannot_be_kept_is_refused_with_a_sentence(fields, there, says):
     with pytest.raises(comments.Refused, match=says):
-        comments._checked(fields, sources=2, there=there, comment_id="new", now=1.0)
+        comments._checked(fields, sources=2, answered=False, there=there, comment_id="new",
+                          now=1.0)
+
+
+def test_the_answer_is_item_0_and_only_a_page_with_an_answer_has_one():
+    on_answer = {"name": "Maya", "body": "Hm.", "item": 0, "quote": "Agents pay"}
+    kept_one = comments._checked(on_answer, sources=2, answered=True, there=[], comment_id="new",
+                                 now=1.0)
+    assert (kept_one.item, kept_one.quote) == (0, "Agents pay")
+    with pytest.raises(comments.Refused, match="answer"):
+        comments._checked(on_answer, sources=2, answered=False, there=[], comment_id="new",
+                          now=1.0)
+
+
+def test_a_passage_of_the_answer_is_commented_on_through_the_page(svc):
+    path = make.create(svc.owner, [POST], "Rollups", None, "Agents pay per call.",
+                       time.time())["path"]
+    said(svc, path, item=0, quote="pay per call")
+    assert [(c["item"], c["quote"]) for c in listed(svc, path)] == [(0, "pay per call")]
 
 
 def test_a_refused_comment_keeps_nothing(svc):

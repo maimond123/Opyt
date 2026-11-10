@@ -158,5 +158,11 @@ def test_the_answer_comes_before_the_sources_and_its_citations_jump_to_them():
         in out
 
 
+def test_the_answers_text_is_item_0_so_comments_can_find_it():
+    out = draw(post("hi"), answer="Agents pay per call.")
+    assert '<section class="answer" id="s0"' in out
+    assert '<div class="body"><div class="prose"><p>Agents pay per call.</p>' in out
+
+
 def test_a_page_with_no_answer_has_no_answer_card():
     assert 'class="answer"' not in draw(post("hi"))

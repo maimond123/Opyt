@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS page_comments (
   id         TEXT PRIMARY KEY,   -- random
   page_id    TEXT NOT NULL,
   thread     TEXT NOT NULL,      -- the id of the comment that started the thread: its own, for that one
-  item       INTEGER,            -- which source on the page, counted from 1; NULL on a reply
+  item       INTEGER,            -- which source on the page, counted from 1 (0 is the answer); NULL on a reply
   quote      TEXT,               -- the passage commented on; NULL for a whole source, and on a reply
   prefix     TEXT,               -- the source's text just before the passage
   suffix     TEXT,               -- and just after it

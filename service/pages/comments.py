@@ -3,10 +3,10 @@ service/pages/comments.py — the comments on a page of sources: reading them, a
 one's own down. Anyone holding the page's link does all three, from the page's own script
 (`comments.js`); the link is the only lock, as it is for reading.
 
-A comment is on a passage of one source, on a whole source, or a reply to either (`store.Comment`
-says how each is recorded). Nobody signs in, so a new comment comes back with a key, once. The
-browser that posted it keeps the key, and that key is all that deletes the comment before its page
-goes. Only the key's hash is stored.
+A comment is on a passage of one source or of the answer above them, on a whole source, or a
+reply to either (`store.Comment` says how each is recorded). Nobody signs in, so a new comment
+comes back with a key, once. The browser that posted it keeps the key, and that key is all that
+deletes the comment before its page goes. Only the key's hash is stored.
 
 Every check that can refuse a comment is `_checked`, which runs before anything is written.
 """
@@ -45,8 +45,8 @@ def post(page_id: str, fields: dict, now: float) -> dict | None:
     page = store.read(page_id, now)
     if page is None:
         return None
-    comment = _checked(fields, sources=len(page.items), there=store.comments(page_id),
-                       comment_id=secrets.token_urlsafe(9), now=now)
+    comment = _checked(fields, sources=len(page.items), answered=bool(page.answer),
+                       there=store.comments(page_id), comment_id=secrets.token_urlsafe(9), now=now)
     key = secrets.token_urlsafe(16)
     store.add_comment(page_id, comment, _sha(key))
     return {"comment": comment._asdict(), "key": key}
@@ -62,10 +62,10 @@ def delete(page_id: str, comment_id: str, key: str) -> bool:
     return True
 
 
-def _checked(fields: dict, *, sources: int, there: list[store.Comment], comment_id: str,
-             now: float) -> store.Comment:
-    """The comment these fields make on a page of `sources` sources that already holds `there`,
-    or `Refused`."""
+def _checked(fields: dict, *, sources: int, answered: bool, there: list[store.Comment],
+             comment_id: str, now: float) -> store.Comment:
+    """The comment these fields make on a page of `sources` sources, with an answer above them
+    when `answered`, that already holds `there`, or `Refused`."""
     name = " ".join((fields.get("name") or "").split())
     body = (fields.get("body") or "").strip()
     if not name:
@@ -84,8 +84,8 @@ def _checked(fields: dict, *, sources: int, there: list[store.Comment], comment_
             raise Refused("The comment you are replying to is gone.")
         return store.Comment(comment_id, thread, None, None, None, None, name, body, now)
     item = fields.get("item")
-    if not isinstance(item, int) or not 1 <= item <= sources:
-        raise Refused("A comment has to be on one of this page's sources.")
+    if not isinstance(item, int) or not (0 if answered else 1) <= item <= sources:
+        raise Refused("A comment has to be on the answer or one of this page's sources.")
     quote = fields.get("quote") or None
     if quote is None:
         return store.Comment(comment_id, comment_id, item, None, None, None, name, body, now)

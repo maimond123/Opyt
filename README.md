@@ -11,6 +11,8 @@
 
 [**Website**](https://useopyt.com) · [**Docs**](https://useopyt.com/docs.html) · [**Use cases**](https://useopyt.com/use-cases.html) · [**Compare**](https://useopyt.com/compare.html)
 
+<a href="https://useopyt.com/opyt-demo.mp4"><img src="https://useopyt.com/opyt-demo-play.jpg" alt="Watch the 90-second Opyt demo" width="720"></a>
+
 </div>
 
 ---
