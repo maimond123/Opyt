@@ -93,9 +93,18 @@ def test_a_record_with_no_usable_date_survives_the_filter(archive):
 
 
 def test_without_since_every_page_is_returned_verbatim(archive):
-    archive([[_post(2, "2026-02-01T00:00:00Z")], [_post(1, "2020-01-01T00:00:00Z")], []])
+    archive([{"posts": [_post(2, "2026-02-01T00:00:00Z")], "nextCursor": "c1"},
+             {"posts": [_post(1, "2020-01-01T00:00:00Z")]}])
     got = substack_publication.fetch_all_posts("https://carol.substack.com")
     assert [p["id"] for p in got] == [2, 1]
+
+
+def test_a_page_without_a_cursor_ends_the_walk(archive):
+    """No `nextCursor` means there is no next page to ask for: the walk stops, it does not guess
+    an offset (the endpoint refuses one)."""
+    session = archive([{"posts": [_post(2, "2026-02-01T00:00:00Z")]}])
+    got = substack_publication.fetch_all_posts("https://carol.substack.com")
+    assert [p["id"] for p in got] == [2] and len(session.gets) == 1
 
 
 def test_a_json_object_instead_of_a_list_becomes_a_listing_error(archive):
@@ -139,6 +148,16 @@ def test_the_archive_envelope_shape_is_read(archive):
              {"posts": []}])
     got = substack_publication.fetch_all_posts("https://carol.substack.com")
     assert [p["id"] for p in got] == [2, 1]
+
+
+def test_the_walk_follows_the_cursor_and_never_sends_an_offset(archive):
+    """The endpoint refuses `offset` with a 400 and pages by the envelope's `nextCursor`."""
+    session = archive([{"posts": [_post(2, "2026-02-01T00:00:00Z")], "nextCursor": "c1"},
+                        {"posts": [_post(1, "2020-01-01T00:00:00Z")]}])
+    got = substack_publication.fetch_all_posts("https://carol.substack.com")
+    assert [p["id"] for p in got] == [2, 1]
+    assert session.gets[0]["params"] == {"sort": "new", "limit": 25}
+    assert session.gets[1]["params"] == {"sort": "new", "limit": 25, "cursor": "c1"}
 
 
 # ── managed_substack_session_ready — validity, not presence ─────────────────────────

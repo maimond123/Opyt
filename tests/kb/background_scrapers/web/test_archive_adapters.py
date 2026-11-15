@@ -29,27 +29,51 @@ class Response:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-def test_substack_short_pages_continue_and_boundary_filters_before_admission(monkeypatch):
+def test_substack_pages_follow_the_cursor_and_boundary_filters_before_admission():
+    """The archive no longer pages by offset: it hands back `nextCursor`, and `offset` is refused
+    with a 400. The adapter must send the cursor and never an offset."""
     responses = [
-        Response([{"id": 1, "post_date": "2026-09-01T00:00:00Z"}]),
-        Response([{"id": 2, "post_date": "2026-08-01T00:00:00Z"},
-                  {"id": 3, "post_date": "2025-01-01T00:00:00Z"}])]
+        Response({"posts": [{"id": 1, "post_date": "2026-09-01T00:00:00Z"}], "nextCursor": "c1"}),
+        Response({"posts": [{"id": 2, "post_date": "2026-08-01T00:00:00Z"},
+                            {"id": 3, "post_date": "2025-01-01T00:00:00Z"}]})]
     calls = []
     session = SimpleNamespace(get=lambda url, **kw: calls.append(kw["params"]) or responses.pop(0))
     ctx = Context("web", {"substack_sessions": {SPEC["url"]: session}})
     spec = {**SPEC, "since": "2026-01-01T00:00:00Z"}
     adapter = Substack()
     first = adapter.page(spec, adapter.initial(spec), ctx)
-    assert first.cursors == [{"offset": 1}]
+    assert first.cursors == [{"cursor": "c1"}]
+    assert "offset" not in calls[0] and calls[0]["limit"] == 25
     second = adapter.page(spec, first.cursors[0], ctx)
     assert [key for key, _ in second.documents] == ["2"]
     assert second.cursors == [] and len(calls) == 2
+    assert calls[1]["cursor"] == "c1" and "offset" not in calls[1]
+
+
+def test_one_session_per_host_survives_every_page(monkeypatch):
+    """Cloudflare's cookie lives on the session, so the pages of one host must share one."""
+    made = []
+
+    class FakeSession:
+        def __init__(self):
+            made.append(self)
+
+        def get(self, url, **kw):
+            return Response({"posts": [{"id": 1, "post_date": "2026-09-01T00:00:00Z"}],
+                             "nextCursor": "c1"})
+
+    monkeypatch.setattr("pipeline.oracles.sources.archive.substack.requests.Session", FakeSession)
+    ctx = Context("web")
+    adapter = Substack()
+    adapter.page(SPEC, adapter.initial(SPEC), ctx)
+    adapter.page(SPEC, {"cursor": "c1"}, ctx)
+    assert len(made) == 1 and ctx.cache["substack_sessions"][SPEC["url"]] is made[0]
 
 
 def test_substack_error_object_cannot_mean_empty_archive():
     ctx = Context("web", {"substack_sessions": {SPEC["url"]: SimpleNamespace(get=lambda *a, **kw: Response({"error": "blocked"}))}})
     with pytest.raises(Exception, match="list of posts"):
-        Substack().page(SPEC, {"offset": 200}, ctx)
+        Substack().page(SPEC, {"cursor": "c1"}, ctx)
 
 
 def test_github_lists_one_page_and_filters_forks_and_untouched_repos(monkeypatch):

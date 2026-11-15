@@ -15,25 +15,33 @@ from pipeline.oracles.sources.archive.adapter import Adapter, Page
 
 class Substack(Adapter):
     def initial(self, spec):
-        return {"offset": 0}
+        return {"cursor": None}
 
     def host(self, spec, kind, data):
         return urlsplit(spec["url"]).hostname
 
     def page(self, spec, cursor, ctx):
         base = spec["url"].rstrip("/")
-        session = ctx.cache.setdefault("substack_sessions", {}).setdefault(base, requests.Session())
+        sessions = ctx.cache.setdefault("substack_sessions", {})
+        session = sessions.get(base)
+        if session is None:                       # one session per host, so its cookies persist
+            session = sessions[base] = requests.Session()
+        params = {"sort": "new", "limit": substack_publication.ARCHIVE_PAGE_SIZE}
+        if cursor.get("cursor"):
+            params["cursor"] = cursor["cursor"]
         response = request(session.get, f"{base}/api/v1/archive",
-                           params={"sort": "new", "offset": cursor["offset"], "limit": substack_publication.ARCHIVE_PAGE_SIZE},
+                           params=params,
                            headers={"User-Agent": substack_http.USER_AGENT}, timeout=30)
         response.raise_for_status()
-        batch = substack_publication.archive_posts(response.json())
+        payload = response.json()
+        batch = substack_publication.archive_posts(payload)
         if batch is None or not all(isinstance(p, dict) and p.get("id") for p in batch):
             raise substack_contracts.SubstackListingError("archive page was not a list of posts")
         since = parse_ts(spec.get("since"))
         documents = [(str(p["id"]), p) for p in batch if since is None or not substack_publication.older_than(p, since)]
         more = batch and not (since and substack_publication.older_than(batch[-1], since))
-        return Page(documents, [{"offset": cursor["offset"] + len(batch)}] if more else [])
+        next_cursor = substack_publication.archive_cursor(payload)
+        return Page(documents, [{"cursor": next_cursor}] if more and next_cursor else [])
 
     def document(self, conn, spec, data, ctx, hold):
         aid = f"substack:{data['id']}"

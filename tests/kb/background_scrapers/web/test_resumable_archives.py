@@ -54,8 +54,8 @@ def test_page_and_documents_resume_and_only_then_stamp(conn, archive, monkeypatc
     adapter = archive[2]
 
     def page(spec, cursor, ctx):
-        calls.append(cursor["offset"])
-        return Page([("1", {"id": 1}), ("2", {"id": 2})], [{"offset": 2}]) if cursor["offset"] == 0 else Page()
+        calls.append(cursor["cursor"])
+        return Page([("1", {"id": 1}), ("2", {"id": 2})], [{"cursor": "c2"}]) if cursor["cursor"] is None else Page()
 
     monkeypatch.setattr(adapter, "page", page)
     monkeypatch.setattr(adapter, "document", writer)
@@ -70,13 +70,13 @@ def test_page_and_documents_resume_and_only_then_stamp(conn, archive, monkeypatc
     assert registry.list_sources(conn)[0].last_pulled_at is None
     assert step(conn, archive).result == "ingested"
     assert registry.list_sources(conn)[0].last_pulled_at
-    assert calls == [0, 2]
+    assert calls == [None, "c2"]
     assert archive[1].next_unit(conn, utc_now()) is None
 
 
 def test_failed_later_listing_keeps_cursor_and_coverage_owed(conn, archive, monkeypatch):
     adapter = archive[2]
-    monkeypatch.setattr(adapter, "page", lambda s, c, ctx: Page(cursors=[{"offset": 1}]))
+    monkeypatch.setattr(adapter, "page", lambda s, c, ctx: Page(cursors=[{"cursor": "c1"}]))
     step(conn, archive)
     seen = []
 
@@ -91,7 +91,7 @@ def test_failed_later_listing_keeps_cursor_and_coverage_owed(conn, archive, monk
     asks.record_ask(conn, CID, web_from=windows.ALL_TIME)
     monkeypatch.setattr(adapter, "page", lambda s, c, ctx: seen.append(c) or Page())
     assert step(conn, archive).result == "listed"
-    assert seen == [{"offset": 1}, {"offset": 1}]
+    assert seen == [{"cursor": "c1"}, {"cursor": "c1"}]
 
 
 def test_a_document_that_did_not_land_stays_pending_without_repeating_listing(conn, archive,
