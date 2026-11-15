@@ -134,8 +134,11 @@ class SubstackSamples(PoolSource):
         pulls = probe_store.pull_states(conn)
         for cand in self._queue(conn):
             row = pulls.get(cand["who_id"])
-            if row is None or (row["status"] == probe_store.STATUS_FAILED
-                               and retries.may_run(row.get("retry_at"), row.get("failures"), now)):
+            # `sampling` is a parked candidate, not a finished one: a platform pause gives the
+            # charge back and parks the row there, and only `ok` and `empty` are final here.
+            if row is None or row["status"] == probe_store.STATUS_SAMPLING or (
+                    row["status"] == probe_store.STATUS_FAILED
+                    and retries.may_run(row.get("retry_at"), row.get("failures"), now)):
                 item = Item(PROBE_ROWS, (cand["who_id"],), PROBE_ROWS.read(row), PLATFORM,
                             kind=retries.BLIP, own_site=own_site(PLATFORM, cand["url"]))
                 yield Unit(f"substack_samples:{cand['who_id']}", cand, item=item,
