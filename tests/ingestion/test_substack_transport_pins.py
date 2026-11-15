@@ -107,8 +107,37 @@ def test_public_get_sends_no_session_cookie_and_keeps_an_optional_referer(monkey
 def test_public_get_refusal_keeps_its_public_read_error(monkeypatch):
     install_curl_get(monkeypatch, lambda *_args, **_kwargs: Response(status=403, text="blocked"))
 
+    # retries=1: this asserts the refusal's shape, not the wait before it.
     with pytest.raises(substack_contracts.SubstackPublicReadError, match="HTTP 403"):
-        substack_http.public_get_json("https://substack.com/public", {})
+        substack_http.public_get_json("https://substack.com/public", {}, retries=1)
+
+
+def test_public_get_retries_a_cloudflare_refusal(monkeypatch):
+    """The same URL answers 403 and then 200 on a later try, so one refusal is not a dead read."""
+    responses = [Response(status=403, text="blocked"), Response(body={"ok": True})]
+    calls, sleeps = [], []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return responses.pop(0)
+
+    install_curl_get(monkeypatch, get)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    assert substack_http.public_get_json("https://pub.substack.com/api/v1/archive", {},
+                                         retries=3, backoff=0.25) == {"ok": True}
+    assert len(calls) == 2
+    assert sleeps == [0.25]
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({"posts": [{"id": 1}], "nextCursor": None}, [{"id": 1}]),
+    ([{"id": 1}], [{"id": 1}]),
+    ({"error": "rate limited"}, None),
+    ("oops", None),
+])
+def test_archive_posts_reads_both_shapes(payload, expected):
+    assert substack_publication.archive_posts(payload) == expected
 
 
 @pytest.mark.parametrize("html, expected", [
@@ -220,6 +249,13 @@ def test_publication_id_and_recommendations_use_public_reads(monkeypatch):
         ("https://pub.substack.com/api/v1/archive", {"sort": "new", "limit": 1}, None),
         (f"{substack_publication._RECOMMENDATIONS_ENDPOINT}/23", {"limit": 99}, "https://substack.com/"),
     ]
+
+
+def test_publication_id_reads_the_archive_envelope(monkeypatch):
+    """The archive answers `{"posts": [...]}` now; the id comes out of the first post."""
+    monkeypatch.setattr(substack_http, "public_get_json",
+                        lambda *_a, **_k: {"posts": [{"publication_id": 23}], "nextCursor": None})
+    assert substack_publication.fetch_publication_id("https://pub.substack.com/") == 23
 
 
 @pytest.mark.parametrize("body, expected", [

@@ -58,6 +58,20 @@ _RECOMMENDATIONS_ENDPOINT = "https://substack.com/api/v1/recommendations/from"
 _RECOMMENDATIONS_LIMIT = 99
 
 
+def archive_posts(payload) -> list | None:
+    """The archive endpoint's posts, in either shape it has answered with.
+
+    It used to answer with a bare list and now answers with an envelope — `{"posts": [...],
+    "nextCursor": ...}` — so the posts are read from whichever shape arrived. None when the body
+    is neither shape.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("posts"), list):
+        return payload["posts"]
+    return None
+
+
 def older_than(post: dict, since: datetime) -> bool:
     """Does this archive record definitely predate `since`? Only a parsed date can say so: a
     missing, unparseable or naive `post_date` returns False, so the record is retained."""
@@ -110,11 +124,11 @@ def fetch_all_posts(
                     payload = resp.json()
                     # A wrong-shaped 200 is treated like a failed page: retried, then a listing
                     # error.
-                    if not isinstance(payload, list) or not all(
-                            isinstance(post, dict) for post in payload):
+                    posts = archive_posts(payload)
+                    if posts is None or not all(isinstance(post, dict) for post in posts):
                         raise ValueError(f"archive page was not a list of posts "
                                          f"(got {type(payload).__name__})")
-                    batch = payload
+                    batch = posts
                     break
                 except Exception as e:
                     last = e
@@ -203,9 +217,10 @@ def fetch_publication_id(publication_url: str) -> int:
     """
     data = substack_http.public_get_json(f"{publication_url.rstrip('/')}/api/v1/archive",
                             {"sort": "new", "limit": 1})
-    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+    posts = archive_posts(data)
+    if not posts or not isinstance(posts[0], dict):
         raise SubstackPublicReadError(f"archive at {publication_url} carried no post record")
-    pub_id = data[0].get("publication_id")
+    pub_id = posts[0].get("publication_id")
     if not isinstance(pub_id, int):
         raise SubstackPublicReadError(f"archive at {publication_url} carried no publication_id")
     return pub_id

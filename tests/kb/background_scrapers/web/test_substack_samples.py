@@ -94,6 +94,14 @@ def test_a_failed_get_writes_nothing_and_waits_to_retry(candidate, archive, web_
     assert src.next_unit(candidate, NOW) is None
 
 
+def test_a_sample_reads_the_archive_envelope(candidate, archive, web_loop):
+    """The archive answers `{"posts": [...]}` now; the sample reads the posts out of it."""
+    archive.append({"posts": [_post(1, "On rollups", bylines=[_byline("NineWrites")])]})
+    src = ss.SubstackSamples()
+    unit = src.next_unit(candidate, NOW)
+    assert web_loop.run_unit(candidate, src, unit).result == "ok"
+    assert probe_store.count_probe_atoms(candidate, "substack:nine") == 1
+
 
 def test_a_candidate_on_their_own_domain_is_their_own_site(candidate):
     """Its dead domain is charged to them and never counts as Substack failing."""
