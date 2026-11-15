@@ -103,6 +103,16 @@ def test_a_sample_reads_the_archive_envelope(candidate, archive, web_loop):
     assert probe_store.count_probe_atoms(candidate, "substack:nine") == 1
 
 
+def test_a_candidate_parked_in_sampling_is_offered_again(candidate):
+    """A platform pause gives the charge back and parks the row in `sampling`. Only `ok` and
+    `empty` are final for this source, so a parked candidate must still be offered."""
+    probe_store.init_probe_schema(candidate)
+    probe_store.record_retry(candidate, "substack:nine", probe_store.STATUS_SAMPLING,
+                             retry_at=None, failures=None, detail=None)
+    unit = ss.SubstackSamples().next_unit(candidate, NOW)
+    assert unit is not None and unit.payload["who_id"] == "substack:nine"
+
+
 def test_a_candidate_on_their_own_domain_is_their_own_site(candidate):
     """Its dead domain is charged to them and never counts as Substack failing."""
     assert ss.SubstackSamples().next_unit(candidate, NOW).item.own_site is False
