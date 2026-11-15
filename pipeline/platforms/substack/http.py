@@ -1,9 +1,12 @@
 """Substack's HTTP reads: as the signed-in subscriber (managed session cookies), or anonymously.
 
-The policy every Substack request shares lives here once: the Chrome TLS fingerprint, the user
-agent, the session cookie header, which hosts honor that cookie, and the retry for Substack's
-intermittent Cloudflare 403. Callers choose authenticated or anonymous; a read that does not need
-the session must not spend it.
+The policy every Substack request shares lives here once: the user agent, the session cookie
+header, which hosts honor that cookie, and the retry for Substack's intermittent Cloudflare 403.
+Callers choose authenticated or anonymous; a read that does not need the session must not spend it.
+
+The transport is curl_cffi WITHOUT a browser impersonation: Cloudflare answers the `chrome120`
+fingerprint on a publication's own host with a 403 challenge page, while the plain curl TLS is
+answered normally.
 """
 
 import re
@@ -32,8 +35,8 @@ def session_cookie_applies(base: str) -> bool:
 
 
 def authed_get_json(url: str, params: dict, cookies: dict):
-    """GET as the logged-in subscriber: Chrome TLS fingerprint + the session Cookie
-    header. Used for full paid-post bodies and the subscription list."""
+    """GET as the logged-in subscriber: the session Cookie header. Used for full paid-post bodies
+    and the subscription list."""
     # Optional transport: import-only callers do not require it.
     from curl_cffi import requests as cffi_requests
     resp = host_request(cffi_requests.get,
@@ -44,7 +47,6 @@ def authed_get_json(url: str, params: dict, cookies: dict):
             "User-Agent": USER_AGENT,
             "Cookie": build_cookie_header(cookies),
         },
-        impersonate="chrome120",
         timeout=30,
     )
     resp.raise_for_status()
@@ -73,8 +75,7 @@ def authed_get_json_retry(url: str, params: dict, cookies: dict, *, referer: str
                     "User-Agent": USER_AGENT,
                     "Referer": referer,
                     "Cookie": build_cookie_header(cookies),
-                },
-                impersonate="chrome120", timeout=30,
+                }, timeout=30,
             )
             if resp.status_code == 200 and resp.text.strip():
                 return resp.json()
@@ -91,9 +92,9 @@ def public_get_json(url: str, params: dict, *, referer: str | None = None,
     session's share of the Cloudflare 403 window.
 
     Cloudflare's challenge on a publication's own host comes in bursts: a host answers a couple of
-    reads and then refuses every request for about half a minute — 403 or 400, interchangeably.
-    So the read waits out that window and tries again before it calls the publication unreadable.
-    Raises the last refusal if every attempt fails — the caller decides the fail-safe.
+    reads and then refuses every request for about half a minute. So the read waits out that
+    window and tries again before it calls the publication unreadable. Raises the last refusal if
+    every attempt fails — the caller decides the fail-safe.
     """
     # Optional transport: import-only callers do not require it.
     from curl_cffi import requests as cffi_requests
@@ -103,7 +104,7 @@ def public_get_json(url: str, params: dict, *, referer: str | None = None,
     last: Exception | None = None
     for attempt in range(retries):
         resp = host_request(cffi_requests.get, url, params=params, headers=headers,
-                                 impersonate="chrome120", timeout=30)
+                                 timeout=30)
         if resp.status_code == 200 and resp.text.strip():
             return resp.json()
         last = SubstackPublicReadError(f"HTTP {resp.status_code} from {url}")

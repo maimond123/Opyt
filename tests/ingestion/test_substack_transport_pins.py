@@ -56,7 +56,9 @@ def test_authenticated_get_uses_the_managed_cookie_and_json_response(monkeypatch
     assert url == "https://substack.com/list"
     assert kwargs["params"] == {"cursor": "c"}
     assert kwargs["headers"]["Cookie"] == "substack.sid=session"
-    assert kwargs["impersonate"] == "chrome120"
+    # No browser impersonation: Cloudflare answers the `chrome120` fingerprint with a 403
+    # challenge page, while the plain curl TLS is answered normally.
+    assert "impersonate" not in kwargs
     assert response.calls == 1
 
 
@@ -149,6 +151,17 @@ def test_own_user_id_reads_only_the_embedded_account_id(monkeypatch, html, expec
     install_curl_get(monkeypatch, lambda *_args, **_kwargs: response)
 
     assert substack_local.own_user_id({"substack.sid": "s"}) == expected
+
+
+def test_the_reader_page_read_carries_no_browser_impersonation(monkeypatch):
+    """The inbox preload read goes out on the same transport as every other Substack read: a
+    `chrome120` fingerprint is answered with a Cloudflare challenge page instead of the page."""
+    calls = []
+    install_curl_get(monkeypatch, lambda url, **kwargs: calls.append(kwargs) or Response(
+        text='<script>_preloads = JSON.parse("{\\"user\\":{\\"id\\":42}}")</script>'))
+
+    assert substack_local.own_user_id({"substack.sid": "s"}) == 42
+    assert "impersonate" not in calls[0]
 
 
 @pytest.mark.parametrize("html", [

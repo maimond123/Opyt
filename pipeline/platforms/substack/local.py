@@ -115,7 +115,7 @@ def own_user_id(cookies: dict) -> int | None:
         resp = host_request(cffi_requests.get,
             "https://substack.com/inbox",
             headers={"User-Agent": substack_http.USER_AGENT, "Cookie": build_cookie_header(cookies)},
-            impersonate="chrome120", timeout=30,
+            timeout=30,
         )
     except Exception as e:
         raise SubstackListingError(f"reader page unreachable: {e}") from e
