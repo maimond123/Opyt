@@ -47,6 +47,10 @@ FETCH_DELAY = 2  # seconds between API pages
 # the offset by what arrived, and treat only an empty page as the end.
 ARCHIVE_PAGE_SIZE = 50
 _ARCHIVE_RETRIES = 3
+# Seconds between a failed archive page and the next try. Cloudflare's refusal window on a
+# publication's host lasts about half a minute, so the wait has to reach that far — the
+# inter-page `FETCH_DELAY` is far too short to cross it.
+_ARCHIVE_BACKOFF = 12
 # Runaway backstop for the offset loop — at 50/page this is 25k
 # posts, far past any real publication.
 _ARCHIVE_MAX_PAGES = 500
@@ -136,7 +140,7 @@ def fetch_all_posts(
                         # Intermittent Cloudflare 403 that a retry clears; escalating backoff
                         # covers both transient failure and throttling.
                         log(f"    [warn] archive page failed (attempt {attempt + 1}): {e}")
-                        time.sleep(FETCH_DELAY * (attempt + 1))
+                        time.sleep(_ARCHIVE_BACKOFF * (attempt + 1))
             if batch is None:
                 raise SubstackListingError(
                     f"archive listing stopped at offset={offset} after {_ARCHIVE_RETRIES} "
