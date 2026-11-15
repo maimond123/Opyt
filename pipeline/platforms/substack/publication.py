@@ -42,16 +42,16 @@ def archive_progress(page: list[dict], last_date: object, since: datetime | None
 
 FETCH_DELAY = 2  # seconds between API pages
 
-# Archive page size. Substack does not return what you ask for — pages come back short of the
-# requested limit but are still contiguous, so a short page is not the end of the archive. Advance
-# the offset by what arrived, and treat only an empty page as the end.
-ARCHIVE_PAGE_SIZE = 50
+# Archive page size. The endpoint caps `limit` at 25 — a larger one is refused with a 400 — and
+# pages come back short of the requested limit but are still contiguous, so a short page is not
+# the end of the archive.
+ARCHIVE_PAGE_SIZE = 25
 _ARCHIVE_RETRIES = 3
 # Seconds between a failed archive page and the next try. Cloudflare's refusal window on a
 # publication's host lasts about half a minute, so the wait has to reach that far — the
 # inter-page `FETCH_DELAY` is far too short to cross it.
 _ARCHIVE_BACKOFF = 12
-# Runaway backstop for the offset loop — at 50/page this is 25k
+# Runaway backstop for the walk — at 25/page this is 12.5k
 # posts, far past any real publication.
 _ARCHIVE_MAX_PAGES = 500
 
@@ -73,6 +73,19 @@ def archive_posts(payload) -> list | None:
         return payload
     if isinstance(payload, dict) and isinstance(payload.get("posts"), list):
         return payload["posts"]
+    return None
+
+
+def archive_cursor(payload) -> str | None:
+    """The cursor for the next archive page, if the envelope carries one.
+
+    The endpoint no longer pages by offset: it hands back `nextCursor`, which goes into the
+    next request's `cursor` parameter. `offset` is refused with a 400.
+    """
+    if isinstance(payload, dict):
+        cursor = payload.get("nextCursor")
+        if isinstance(cursor, str) and cursor:
+            return cursor
     return None
 
 
@@ -98,14 +111,15 @@ def fetch_all_posts(
     fetch_full_post).
 
     `since` filters as well as bounds: records that definitely predate it are dropped
-    (`older_than`), while the raw page decides when to stop. The walk runs on one
+    (`older_than`), while the raw page decides when to stop. The walk follows the envelope's
+    `nextCursor`, because the endpoint no longer pages by offset. It runs on one
     `requests.Session` so Cloudflare's `__cf_bm` cookie persists across pages.
 
     Raises `SubstackListingError` when a page cannot be fetched, or is not a list of post records,
     after `_ARCHIVE_RETRIES`."""
     base = substack_url.rstrip("/")
     all_posts = []
-    offset = 0
+    cursor: str | None = None
     headers = {"User-Agent": substack_http.USER_AGENT}
     if cookies and substack_http.session_cookie_applies(base):
         headers["Cookie"] = build_cookie_header(cookies)
@@ -113,14 +127,18 @@ def fetch_all_posts(
     session = requests.Session()
     try:
         for _page in range(_ARCHIVE_MAX_PAGES):
-            log(f"  Fetching archive offset={offset} ...")
+            log(f"  Fetching archive cursor={cursor or 'first'} ...")
+            params = {"sort": "new", "limit": ARCHIVE_PAGE_SIZE}
+            if cursor:
+                params["cursor"] = cursor
             batch = None
+            next_cursor: str | None = None
             last: Exception | None = None
             for attempt in range(_ARCHIVE_RETRIES):
                 try:
                     resp = session.get(
                         f"{base}/api/v1/archive",
-                        params={"sort": "new", "offset": offset, "limit": ARCHIVE_PAGE_SIZE},
+                        params=params,
                         headers=headers,
                         timeout=30,
                     )
@@ -133,6 +151,7 @@ def fetch_all_posts(
                         raise ValueError(f"archive page was not a list of posts "
                                          f"(got {type(payload).__name__})")
                     batch = posts
+                    next_cursor = archive_cursor(payload)
                     break
                 except Exception as e:
                     last = e
@@ -143,8 +162,8 @@ def fetch_all_posts(
                         time.sleep(_ARCHIVE_BACKOFF * (attempt + 1))
             if batch is None:
                 raise SubstackListingError(
-                    f"archive listing stopped at offset={offset} after {_ARCHIVE_RETRIES} "
-                    f"attempts ({len(all_posts)} posts listed so far): {last}"
+                    f"archive listing stopped at cursor={cursor or 'first'} after "
+                    f"{_ARCHIVE_RETRIES} attempts ({len(all_posts)} posts listed so far): {last}"
                 ) from last
 
             last_date = batch[-1].get("post_date", "") if batch else None
@@ -155,16 +174,18 @@ def fetch_all_posts(
             # `since` means on/after, so the boundary page that straddles the date is filtered.
             all_posts.extend(post for post in batch
                              if since is None or not older_than(post, since))
-            offset += len(batch)     # advance by what arrived (unfiltered): the API under-fills
 
             # Stop from the raw page's oldest post, independently of the filtered records kept.
             if progress == "finish":
                 break
             if progress == "limit":
                 raise SubstackListingError(
-                    f"archive listing exceeded {_ARCHIVE_MAX_PAGES} pages at offset={offset} — "
+                    f"archive listing exceeded {_ARCHIVE_MAX_PAGES} pages — "
                     f"the endpoint never returned an empty page"
                 )
+            if not next_cursor:
+                break                     # no cursor left: the archive ends here
+            cursor = next_cursor
             time.sleep(FETCH_DELAY)
     finally:
         session.close()

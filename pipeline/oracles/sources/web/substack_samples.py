@@ -155,7 +155,7 @@ class SubstackSamples(PoolSource):
         cand = unit.payload
         probe_store.init_probe_schema(conn)         # a failed GET's charge lands on its table
         posts = archive_posts(public_get_json(f"{cand['url']}/api/v1/archive",
-                                {"sort": "new", "offset": 0, "limit": POSTS})) or []
+                                {"sort": "new", "limit": POSTS})) or []
         atoms = sample_atoms(posts, cand["who_id"])
         seen = probe_store.load_probe_hashes(conn, cand["who_id"])
         changed = []
