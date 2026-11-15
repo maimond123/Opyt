@@ -4,6 +4,7 @@ Every reader here reads the session's cookies on this machine (`read_substack_co
 """
 
 import json
+import re
 import time
 
 from pipeline.host_access import request as host_request
@@ -71,6 +72,30 @@ def session_ready(*, attempts: int, delay: float) -> bool:
     return False
 
 
+def _preloads(html: str):
+    """The reader page's preloads JSON, in either shape the page has used.
+
+    It used to inline them — `window._preloads = JSON.parse("{...}")` — and now reads them from
+    a tag: `JSON.parse(document.querySelector('script#preloads-json[type="application/json"]')
+    .textContent)`. None when neither shape is there.
+    """
+    tag = re.search(r'<script[^>]*id="preloads-json"[^>]*>(.*?)</script>', html, re.S)
+    if tag:
+        try:
+            return json.loads(tag.group(1).strip())
+        except Exception:
+            pass
+    marker = html.find("_preloads")
+    call = html.find("JSON.parse(", marker) if marker >= 0 else -1
+    quote = html.find('"', call) if call >= 0 else -1
+    if quote < 0:
+        return None
+    try:
+        return json.loads(json.JSONDecoder().raw_decode(html, quote)[0])
+    except Exception:
+        return None
+
+
 def own_user_id(cookies: dict) -> int | None:
     """The logged-in user's own numeric id — needed to key the subscriber-lists call.
 
@@ -97,15 +122,9 @@ def own_user_id(cookies: dict) -> int | None:
     if resp.status_code != 200:
         raise SubstackListingError(f"reader page refused: HTTP {resp.status_code}")
     html = resp.text
-    marker = html.find("_preloads")
-    call = html.find("JSON.parse(", marker) if marker >= 0 else -1
-    quote = html.find('"', call) if call >= 0 else -1
-    if quote < 0:
-        raise SubstackListingError("reader page carries no _preloads JSON.parse — the shape changed")
-    try:
-        data = json.loads(json.JSONDecoder().raw_decode(html, quote)[0])
-    except Exception as e:
-        raise SubstackListingError(f"could not decode the reader page preloads: {e}") from e
+    data = _preloads(html)
+    if data is None:
+        raise SubstackListingError("reader page carries no _preloads JSON — the shape changed")
     return substack_account.preload_user(data)
 
 
