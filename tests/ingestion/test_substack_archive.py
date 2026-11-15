@@ -118,6 +118,20 @@ def test_a_shape_error_that_clears_on_retry_is_not_fatal(archive):
     assert [p["id"] for p in got] == [1]
 
 
+def test_a_refused_page_waits_long_enough_to_cross_the_block_window(monkeypatch):
+    """Cloudflare's refusal window is about half a minute, so the retry cannot wait the 2s
+    inter-page delay — it would land straight back inside the block."""
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    monkeypatch.setattr(requests, "Session", lambda: _Session(
+        [{"error": "rate limited"}] * substack_publication._ARCHIVE_RETRIES))
+    with pytest.raises(substack_contracts.SubstackListingError):
+        substack_publication.fetch_all_posts("https://carol.substack.com")
+    assert sleeps == [substack_publication._ARCHIVE_BACKOFF,
+                      substack_publication._ARCHIVE_BACKOFF * 2]
+    assert sum(sleeps) >= 30   # the last attempt comes after the whole wait
+
+
 def test_the_archive_envelope_shape_is_read(archive):
     """The endpoint answers `{"posts": [...], "nextCursor": ...}` now; the posts come out of it."""
     archive([{"posts": [_post(2, "2026-02-01T00:00:00Z")], "nextCursor": "c1"},
