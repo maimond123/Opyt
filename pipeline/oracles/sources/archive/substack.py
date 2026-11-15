@@ -27,8 +27,8 @@ class Substack(Adapter):
                            params={"sort": "new", "offset": cursor["offset"], "limit": substack_publication.ARCHIVE_PAGE_SIZE},
                            headers={"User-Agent": substack_http.USER_AGENT}, timeout=30)
         response.raise_for_status()
-        batch = response.json()
-        if not isinstance(batch, list) or not all(isinstance(p, dict) and p.get("id") for p in batch):
+        batch = substack_publication.archive_posts(response.json())
+        if batch is None or not all(isinstance(p, dict) and p.get("id") for p in batch):
             raise substack_contracts.SubstackListingError("archive page was not a list of posts")
         since = parse_ts(spec.get("since"))
         documents = [(str(p["id"]), p) for p in batch if since is None or not substack_publication.older_than(p, since)]

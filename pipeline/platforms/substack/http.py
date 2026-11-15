@@ -85,16 +85,28 @@ def authed_get_json_retry(url: str, params: dict, cookies: dict, *, referer: str
     raise last or RuntimeError("authed fetch failed after retries")
 
 
-def public_get_json(url: str, params: dict, *, referer: str | None = None):
+def public_get_json(url: str, params: dict, *, referer: str | None = None,
+                    retries: int = 3, backoff: float = 12.0):
     """GET a public Substack JSON route with no cookie at all, so the read does not spend the
-    session's share of the Cloudflare 403 window."""
+    session's share of the Cloudflare 403 window.
+
+    Cloudflare's challenge on a publication's own host comes in bursts: a host answers a couple of
+    reads and then refuses every request for about half a minute — 403 or 400, interchangeably.
+    So the read waits out that window and tries again before it calls the publication unreadable.
+    Raises the last refusal if every attempt fails — the caller decides the fail-safe.
+    """
     # Optional transport: import-only callers do not require it.
     from curl_cffi import requests as cffi_requests
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if referer:
         headers["Referer"] = referer
-    resp = host_request(cffi_requests.get, url, params=params, headers=headers,
-                             impersonate="chrome120", timeout=30)
-    if resp.status_code != 200 or not resp.text.strip():
-        raise SubstackPublicReadError(f"HTTP {resp.status_code} from {url}")
-    return resp.json()
+    last: Exception | None = None
+    for attempt in range(retries):
+        resp = host_request(cffi_requests.get, url, params=params, headers=headers,
+                                 impersonate="chrome120", timeout=30)
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.json()
+        last = SubstackPublicReadError(f"HTTP {resp.status_code} from {url}")
+        if attempt < retries - 1:
+            time.sleep(backoff * (attempt + 1))
+    raise last or SubstackPublicReadError(f"HTTP 0 from {url}")

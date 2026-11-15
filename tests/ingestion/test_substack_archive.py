@@ -118,6 +118,15 @@ def test_a_shape_error_that_clears_on_retry_is_not_fatal(archive):
     assert [p["id"] for p in got] == [1]
 
 
+def test_the_archive_envelope_shape_is_read(archive):
+    """The endpoint answers `{"posts": [...], "nextCursor": ...}` now; the posts come out of it."""
+    archive([{"posts": [_post(2, "2026-02-01T00:00:00Z")], "nextCursor": "c1"},
+             {"posts": [_post(1, "2020-01-01T00:00:00Z")]},
+             {"posts": []}])
+    got = substack_publication.fetch_all_posts("https://carol.substack.com")
+    assert [p["id"] for p in got] == [2, 1]
+
+
 # ── managed_substack_session_ready — validity, not presence ─────────────────────────
 #
 # The onboarding "done" gate turns on this. Its whole reason for existing over

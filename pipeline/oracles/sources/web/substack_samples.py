@@ -29,6 +29,7 @@ from pipeline.oracles.sources.timeline import samples
 from pipeline.oracles.sources.timeline.scouting import PROBE_ROWS
 from pipeline.oracles.sources.web.platform import QUOTA, own_site
 from pipeline.platforms.substack.http import public_get_json
+from pipeline.platforms.substack.publication import archive_posts
 from pipeline.timeparse import parse_ts
 from pipeline.worker.quota_loop import retries
 from pipeline.worker.quota_loop.source import SCOUTING, Changed, Item, Outcome, PoolSource, Unit
@@ -150,9 +151,8 @@ class SubstackSamples(PoolSource):
     def fetch(self, conn, unit: Unit, ctx) -> Sampled:
         cand = unit.payload
         probe_store.init_probe_schema(conn)         # a failed GET's charge lands on its table
-        posts = public_get_json(f"{cand['url']}/api/v1/archive",
-                                {"sort": "new", "offset": 0, "limit": POSTS})
-        posts = posts if isinstance(posts, list) else []
+        posts = archive_posts(public_get_json(f"{cand['url']}/api/v1/archive",
+                                {"sort": "new", "offset": 0, "limit": POSTS})) or []
         atoms = sample_atoms(posts, cand["who_id"])
         seen = probe_store.load_probe_hashes(conn, cand["who_id"])
         changed = []
